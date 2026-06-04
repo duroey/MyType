@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let permissionGuideModel = PermissionGuideModel()
     /// Computed dynamically per recording based on audio device topology.
     private var floatingBarController: FloatingBarController?
+    private var focusWakeupController: FocusWakeupController?
     private let hotkeyManager = HotkeyManager()
     private let session = RecognitionSession()
 
@@ -88,6 +89,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 历史记录字数迁移（用 session 自带的 historyStore，迁移后 UI 能刷新）
         Task { await session.historyStore.migrateCharacterCounts() }
         let appState = self.appState
+        let focusWakeupController = FocusWakeupController(appState: appState, session: session)
+        self.focusWakeupController = focusWakeupController
 
         SoundFeedback.warmUp()
         AudioKeepAliveManager.syncState()
@@ -100,6 +103,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             await session.setOnAudioLevel { level in
                 appState.audioLevel.current = level
+            }
+        }
+        Task {
+            await session.setOnAutoStop {
+                Task { @MainActor in
+                    appState.stopRecording()
+                }
             }
         }
 
@@ -138,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         if await session.stoppedByMaxDuration {
                             appState.processingLabelOverride = L("已达最大时长", "Max duration reached")
                         }
+                        self.focusWakeupController?.sessionDidFinish()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
                     case .processingLabelOverride(let label):
@@ -147,10 +158,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.hotkeyManager.isProcessing = true
                     case .finalized(let text, let injection):
                         appState.finalize(text: text, outcome: injection)
+                        self.focusWakeupController?.sessionDidFinish()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
                     case .error(let error):
                         appState.showError(self.userFacingMessage(for: error))
+                        self.focusWakeupController?.sessionDidFinish()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
                     }
@@ -209,6 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.startHotkeyWithRetry()
+            self.focusWakeupController?.start()
         }
 
         // Show setup wizard on first launch
@@ -308,6 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     NSLog("[Type4Me] >>> HOTKEY: Record START (mode: %@)", effectiveMode.name)
                     DebugFileLogger.log("hotkey record start mode=\(effectiveMode.name)")
                     Task { @MainActor in
+                        self.focusWakeupController?.pauseForManualRecording()
                         self.appState.currentMode = effectiveMode
                         self.appState.startRecording()
                     }

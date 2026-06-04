@@ -155,6 +155,14 @@ actor RecognitionSession {
         onAudioLevel = handler
     }
 
+    /// Sets a callback fired immediately before focus auto-stop finalizes recording.
+    ///
+    /// Args:
+    ///   handler: Callback used by the UI layer to switch from recording to processing.
+    func setOnAutoStop(_ handler: @escaping @Sendable () -> Void) {
+        onAutoStop = handler
+    }
+
     // MARK: - Session generation (prevents zombie tasks after forceReset)
 
     private var sessionGeneration: Int = 0
@@ -204,6 +212,11 @@ actor RecognitionSession {
     private var finalTranscriptCont: CheckedContinuation<String?, Never>?
     /// Continuation resumed when first non-empty streaming text arrives (for short-recording wait).
     private var firstStreamingTextCont: CheckedContinuation<Bool, Never>?
+    private var onAutoStop: (@Sendable () -> Void)?
+    private var autoStopOnSilence = false
+    private var autoStopHadSpeech = false
+    private var autoStopSilenceStart: ContinuousClock.Instant?
+    private var autoStopRMSWindow: [Float] = []
 
     // MARK: - Toggle
 
@@ -220,7 +233,12 @@ actor RecognitionSession {
 
     // MARK: - Start
 
-    func startRecording(mode: ProcessingMode = .direct) async {
+    /// Starts a recognition session.
+    ///
+    /// Args:
+    ///   mode: Processing mode used for the current recording.
+    ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
+    func startRecording(mode: ProcessingMode = .direct, autoStopOnSilence: Bool = false) async {
         if state == .finishing || state == .injecting || state == .postProcessing {
             NSLog("[Session] startRecording: blocked, current session still processing (state=%@)", String(describing: state))
             DebugFileLogger.log("startRecording blocked: still processing state=\(state)")
@@ -263,6 +281,10 @@ actor RecognitionSession {
         injectionAborted = false
         pendingLLMError = nil
         lastStreamingError = nil
+        self.autoStopOnSilence = autoStopOnSilence
+        autoStopHadSpeech = false
+        autoStopSilenceStart = nil
+        autoStopRMSWindow = []
         state = .starting
 
         // Load credentials for selected provider
@@ -464,10 +486,11 @@ actor RecognitionSession {
         var chunkCount = bufferedChunks.count
         let failureFlag = self.uploadFailureFlag
         audioEngine.onAudioChunk = { [weak self] data in
-            guard self != nil else { return }
+            guard let self else { return }
             if failureFlag?.failed == true { return }
             chunkCount += 1
             chunkContinuation.yield(data)
+            Task { await self.handleAutoStopAudioChunk(data, expectedGeneration: expectedGeneration) }
         }
 
         // Catch any chunks that arrived between drain and callback switch
@@ -574,6 +597,7 @@ actor RecognitionSession {
                 warmUpASRConnection()
             }
             resetSpeculativeLLM()
+            resetAutoStopState()
             SystemVolumeManager.restore()
             return
         }
@@ -611,6 +635,7 @@ actor RecognitionSession {
                         warmUpASRConnection()
                     }
                     resetSpeculativeLLM()
+                    resetAutoStopState()
                     SystemVolumeManager.restore()
                     return
                 }
@@ -855,6 +880,7 @@ actor RecognitionSession {
                     warmUpASRConnection()
                 }
                 resetSpeculativeLLM()
+                resetAutoStopState()
                 SystemVolumeManager.restore()
                 logger.info("Session complete, routed agent text \(finalText.count) chars")
                 return
@@ -1050,6 +1076,7 @@ actor RecognitionSession {
             warmUpASRConnection()
         }
         resetSpeculativeLLM()
+        resetAutoStopState()
         SystemVolumeManager.restore()
         logger.info("Session complete, injected \(effectiveText.count) chars")
     }
@@ -1303,6 +1330,91 @@ actor RecognitionSession {
         speculativeLLMText = ""
     }
 
+    /// Clears state used by focus wakeup silence auto-stop.
+    private func resetAutoStopState() {
+        autoStopOnSilence = false
+        autoStopHadSpeech = false
+        autoStopSilenceStart = nil
+        autoStopRMSWindow = []
+    }
+
+    /// Updates focus auto-stop state from one live audio chunk.
+    ///
+    /// Args:
+    ///   data: PCM16 little-endian audio bytes captured during the active recording.
+    ///   expectedGeneration: Session generation captured when the audio callback was installed.
+    private func handleAutoStopAudioChunk(_ data: Data, expectedGeneration: Int) async {
+        guard expectedGeneration == sessionGeneration,
+              autoStopOnSilence,
+              state == .recording else {
+            return
+        }
+
+        let rms = Self.rms16(data)
+        let defaults = UserDefaults.standard
+        let windowFrames = max(
+            1,
+            defaults.object(forKey: "tf_focusAutoStopRMSWindowFrames") == nil
+                ? 50
+                : defaults.integer(forKey: "tf_focusAutoStopRMSWindowFrames")
+        )
+        let threshold = Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
+        let timeout = defaults.object(forKey: "tf_focusAutoStopSilenceSeconds") == nil
+            ? 0.9
+            : defaults.double(forKey: "tf_focusAutoStopSilenceSeconds")
+
+        autoStopRMSWindow.append(rms)
+        if autoStopRMSWindow.count > windowFrames {
+            autoStopRMSWindow.removeFirst(autoStopRMSWindow.count - windowFrames)
+        }
+        guard autoStopRMSWindow.count >= min(windowFrames, 2) else { return }
+
+        let avg = autoStopRMSWindow.reduce(0, +) / Float(autoStopRMSWindow.count)
+        if avg >= threshold {
+            autoStopHadSpeech = true
+            autoStopSilenceStart = nil
+            return
+        }
+
+        guard autoStopHadSpeech else { return }
+        let now = ContinuousClock.now
+        if autoStopSilenceStart == nil {
+            autoStopSilenceStart = now
+            return
+        }
+
+        guard let silenceStart = autoStopSilenceStart,
+              now - silenceStart >= .milliseconds(Int(timeout * 1000)) else {
+            return
+        }
+
+        DebugFileLogger.log("focus wakeup: auto stop silence avg=\(Int(avg)) threshold=\(Int(threshold)) timeout=\(timeout)s")
+        autoStopOnSilence = false
+        onAutoStop?()
+        await stopRecording()
+    }
+
+    /// Calculates RMS from PCM16 audio bytes.
+    ///
+    /// Args:
+    ///   data: PCM16 little-endian audio bytes.
+    ///
+    /// Returns:
+    ///   Root mean square amplitude in Int16 sample units.
+    private static func rms16(_ data: Data) -> Float {
+        let sampleCount = data.count / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else { return 0 }
+        var sum: Float = 0
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return }
+            for index in 0..<sampleCount {
+                let value = Float(base[index])
+                sum += value * value
+            }
+        }
+        return sqrt(sum / Float(sampleCount))
+    }
+
     // MARK: - Timeout Helper
 
     /// Run a @Sendable closure off-actor with a hard deadline.
@@ -1510,6 +1622,7 @@ actor RecognitionSession {
         maxDurationTask?.cancel()
         maxDurationTask = nil
         resetSpeculativeLLM()
+        resetAutoStopState()
 
         audioEngine.stop()
         audioEngine.onAudioChunk = nil
