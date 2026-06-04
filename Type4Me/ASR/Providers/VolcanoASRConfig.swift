@@ -13,8 +13,9 @@ struct VolcanoASRConfig: ASRProviderConfig, Sendable {
     static let resourceIdAuto = "auto"
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "appKey", label: "App ID", placeholder: "APPID", isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "accessKey", label: "Access Token", placeholder: L("访问令牌", "Access token"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "apiKey", label: "API Key", placeholder: L("新版控制台 API Key", "New console API Key"), isSecure: true, isOptional: true, defaultValue: ""),
+        CredentialField(key: "appKey", label: "App ID", placeholder: "APPID", isSecure: false, isOptional: true, defaultValue: ""),
+        CredentialField(key: "accessKey", label: "Access Token", placeholder: L("访问令牌", "Access token"), isSecure: true, isOptional: true, defaultValue: ""),
         CredentialField(
             key: "resourceId",
             label: L("识别模型", "Model"),
@@ -30,15 +31,18 @@ struct VolcanoASRConfig: ASRProviderConfig, Sendable {
         ),
     ]}
 
+    let apiKey: String?
     let appKey: String
     let accessKey: String
     let resourceId: String
     let uid: String
 
     init?(credentials: [String: String]) {
-        guard let appKey = credentials["appKey"], !appKey.isEmpty,
-              let accessKey = credentials["accessKey"], !accessKey.isEmpty
-        else { return nil }
+        let apiKey = credentials["apiKey"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let appKey = credentials["appKey"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let accessKey = credentials["accessKey"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !apiKey.isEmpty || (!appKey.isEmpty && !accessKey.isEmpty) else { return nil }
+        self.apiKey = apiKey.isEmpty ? nil : apiKey
         self.appKey = appKey
         self.accessKey = accessKey
         let raw = credentials["resourceId"] ?? Self.resourceIdAuto
@@ -54,10 +58,14 @@ struct VolcanoASRConfig: ASRProviderConfig, Sendable {
     }
 
     func toCredentials() -> [String: String] {
-        ["appKey": appKey, "accessKey": accessKey, "resourceId": resourceId]
+        var values = ["appKey": appKey, "accessKey": accessKey, "resourceId": resourceId]
+        if let apiKey {
+            values["apiKey"] = apiKey
+        }
+        return values
     }
 
     var isValid: Bool {
-        !appKey.isEmpty && !accessKey.isEmpty
+        apiKey?.isEmpty == false || (!appKey.isEmpty && !accessKey.isEmpty)
     }
 }

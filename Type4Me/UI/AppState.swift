@@ -101,7 +101,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         ProcessingMode(
             id: directId,
             name: L("快速模式", "Quick Mode"), prompt: "", isBuiltin: true,
-            hotkeyCode: 62, hotkeyModifiers: 0, hotkeyStyle: .toggle
+            hotkeyCode: 61, hotkeyModifiers: 0, hotkeyStyle: .toggle
         )
     }
 
@@ -607,7 +607,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             prompt: "",
             isBuiltin: false,
             processingLabel: L("启动中", "Launching"),
-            hotkeyCode: 23, hotkeyModifiers: 524288, hotkeyStyle: .toggle
+            hotkeyCode: 54, hotkeyModifiers: 0, hotkeyStyle: .toggle
         )
     }
 

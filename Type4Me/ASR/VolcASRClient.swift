@@ -67,8 +67,12 @@ actor VolcASRClient: SpeechRecognizer {
         var request = URLRequest(url: targetURL)
         if !isCloudProxy {
             // Direct connection: inject vendor credentials
-            request.setValue(volcConfig.appKey, forHTTPHeaderField: "X-Api-App-Key")
-            request.setValue(volcConfig.accessKey, forHTTPHeaderField: "X-Api-Access-Key")
+            if let apiKey = volcConfig.apiKey, !apiKey.isEmpty {
+                request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
+            } else {
+                request.setValue(volcConfig.appKey, forHTTPHeaderField: "X-Api-App-Key")
+                request.setValue(volcConfig.accessKey, forHTTPHeaderField: "X-Api-Access-Key")
+            }
             request.setValue(volcConfig.resourceId, forHTTPHeaderField: "X-Api-Resource-Id")
             request.setValue(connectId, forHTTPHeaderField: "X-Api-Connect-Id")
         }
