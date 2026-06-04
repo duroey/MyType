@@ -123,6 +123,16 @@ struct ModeStorage {
             UserDefaults.standard.set(true, forKey: agentSeedKey)
         }
 
+        // One-time seed of agentRouterMode for existing installs.
+        let agentRouterSeedKey = "tf_agentRouterModeSeeded"
+        if !UserDefaults.standard.bool(forKey: agentRouterSeedKey) {
+            if !result.contains(where: { $0.id == ProcessingMode.agentRouterModeId }) {
+                result.append(ProcessingMode.agentRouterMode)
+                try? save(result)
+            }
+            UserDefaults.standard.set(true, forKey: agentRouterSeedKey)
+        }
+
         return result
     }
 

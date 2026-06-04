@@ -818,6 +818,48 @@ actor RecognitionSession {
             // Apply snippet replacements before LLM (e.g. "我的邮箱" → actual email)
             finalText = SnippetStorage.applyEffective(to: finalText, bundleId: targetBundleId)
 
+            if currentMode.id == ProcessingMode.agentRouterModeId {
+                state = .postProcessing
+                let launchResult = AgentLauncherService.shared.handle(finalText)
+                let launcherText = launchResult.message
+                onASREvent?(.processingResult(text: launcherText))
+                onASREvent?(.finalized(text: launcherText, injection: .inserted))
+
+                let recordId = UUID().uuidString
+                let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+                let status: String
+                if launchResult.launched {
+                    status = "agent_launched"
+                } else if launchResult.project == nil {
+                    status = "agent_no_match"
+                } else {
+                    status = "agent_launch_failed"
+                }
+                await historyStore.insert(HistoryRecord(
+                    id: recordId,
+                    createdAt: Date(),
+                    durationSeconds: duration,
+                    rawText: rawText,
+                    processingMode: currentMode.name,
+                    processedText: nil,
+                    finalText: launcherText,
+                    status: status,
+                    characterCount: launcherText.count,
+                    asrProvider: activeProvider.displayName
+                ))
+
+                if sessionGeneration == myGeneration, state != .idle {
+                    state = .idle
+                    hasEmittedReadyForCurrentSession = false
+                    currentTranscript = .empty
+                    warmUpASRConnection()
+                }
+                resetSpeculativeLLM()
+                SystemVolumeManager.restore()
+                logger.info("Session complete, routed agent text \(finalText.count) chars")
+                return
+            }
+
             // Short text exemption (for non-streaming providers, 语音润色 only)
             if needsLLM && earlyLLMTask == nil && currentMode.id == ProcessingMode.formalWritingId {
                 let exemptionThreshold = Int(UserDefaults.standard.string(forKey: "tf_shortTextExemption") ?? "0") ?? 0

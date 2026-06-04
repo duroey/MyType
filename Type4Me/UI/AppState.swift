@@ -131,6 +131,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     private static let defaultTranslateId = UUID(uuidString: "87AF4048-83C3-4306-8AF8-1E52DB7CA2F5")!
     private static let commandModeId = UUID(uuidString: "A3B1D9E7-6F42-4C8A-B5E0-9D3F7A2C1E84")!
     static let agentModeId = UUID(uuidString: "C4E8F2A1-9B3D-4A7E-8F5C-1D2E3F4A5B6C")!
+    static let agentRouterModeId = UUID(uuidString: "E62B9046-7D93-44BD-9CE2-0E0D1454A6B4")!
 
     static let legacyFormalWritingPromptTemplate = """
     你是一个语音转文字的润色工具。你的任务是让语音识别的文本变得可读，同时最大程度保留说话人的原始语气和表达风格。
@@ -599,8 +600,19 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
+    static var agentRouterMode: ProcessingMode {
+        ProcessingMode(
+            id: agentRouterModeId,
+            name: L("Agent 路由", "Agent Router"),
+            prompt: "",
+            isBuiltin: false,
+            processingLabel: L("启动中", "Launching"),
+            hotkeyCode: 23, hotkeyModifiers: 524288, hotkeyStyle: .toggle
+        )
+    }
+
     static var builtins: [ProcessingMode] { [.direct, .formalWriting] }
-    static var defaults: [ProcessingMode] { [.direct, .formalWriting, .promptOptimize, .translate, .agentMode, .commandMode] }
+    static var defaults: [ProcessingMode] { [.direct, .formalWriting, .promptOptimize, .translate, .agentMode, .agentRouterMode, .commandMode] }
 }
 
 // MARK: - Audio Level (isolated from @Observable to avoid high-frequency view invalidation)

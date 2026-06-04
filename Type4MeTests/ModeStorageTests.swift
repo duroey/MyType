@@ -28,6 +28,10 @@ final class ModeStorageTests: XCTestCase {
         XCTAssertEqual(loaded, ProcessingMode.defaults)
     }
 
+    func testDefaultsIncludeAgentRouterMode() {
+        XCTAssertTrue(ProcessingMode.defaults.contains { $0.id == ProcessingMode.agentRouterModeId })
+    }
+
     func testLoadMigratesLegacyBuiltinModesToDeletableModes() throws {
         let storage = ModeStorage(fileURL: testURL)
         let legacyModes = [
