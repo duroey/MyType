@@ -163,6 +163,14 @@ actor RecognitionSession {
         onAutoStop = handler
     }
 
+    /// Sets a callback fired when a focus RMS start is cancelled as a false start.
+    ///
+    /// Args:
+    ///   handler: Callback used by the UI layer to hide the recording surface.
+    func setOnAutoCancel(_ handler: @escaping @Sendable () -> Void) {
+        onAutoCancel = handler
+    }
+
     // MARK: - Session generation (prevents zombie tasks after forceReset)
 
     private var sessionGeneration: Int = 0
@@ -213,10 +221,17 @@ actor RecognitionSession {
     /// Continuation resumed when first non-empty streaming text arrives (for short-recording wait).
     private var firstStreamingTextCont: CheckedContinuation<Bool, Never>?
     private var onAutoStop: (@Sendable () -> Void)?
+    private var onAutoCancel: (@Sendable () -> Void)?
     private var autoStopOnSilence = false
     private var autoStopHadSpeech = false
     private var autoStopSilenceStart: ContinuousClock.Instant?
     private var autoStopRMSWindow: [Float] = []
+    private var autoStopEffectiveThreshold: Float = 0
+    private var autoStopLoggedSpeechSource = false
+    private var autoStopFalseStartTask: Task<Void, Never>?
+    private static let autoStopASRThresholdRatio: Float = 0.65
+    private static let autoStopMinASRThreshold: Float = 80
+    private static let autoStopASRNoiseMargin: Float = 80
 
     // MARK: - Toggle
 
@@ -285,6 +300,8 @@ actor RecognitionSession {
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
         autoStopRMSWindow = []
+        autoStopEffectiveThreshold = Self.autoStopConfiguredThreshold()
+        autoStopLoggedSpeechSource = false
         state = .starting
 
         // Load credentials for selected provider
@@ -512,6 +529,9 @@ actor RecognitionSession {
             try? await Task.sleep(for: .seconds(maxRecordingDuration))
             guard let self, !Task.isCancelled else { return }
             await self.autoStopIfRecording()
+        }
+        if autoStopOnSilence {
+            scheduleAutoStopFalseStart(expectedGeneration: expectedGeneration)
         }
     }
 
@@ -1336,6 +1356,47 @@ actor RecognitionSession {
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
         autoStopRMSWindow = []
+        autoStopEffectiveThreshold = 0
+        autoStopLoggedSpeechSource = false
+        autoStopFalseStartTask?.cancel()
+        autoStopFalseStartTask = nil
+    }
+
+    /// Starts the focus false-start timer used by RMS-triggered recordings.
+    ///
+    /// Args:
+    ///   expectedGeneration: Session generation that must still be active when the timer fires.
+    private func scheduleAutoStopFalseStart(expectedGeneration: Int) {
+        autoStopFalseStartTask?.cancel()
+        let timeout = Self.focusFalseStartTimeout()
+        guard timeout > 0 else { return }
+        autoStopFalseStartTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(timeout * 1000)))
+            guard let self, !Task.isCancelled else { return }
+            await self.cancelAutoStopFalseStartIfNeeded(
+                expectedGeneration: expectedGeneration,
+                timeout: timeout
+            )
+        }
+    }
+
+    /// Cancels a focus RMS recording when ASR never returns text.
+    ///
+    /// Args:
+    ///   expectedGeneration: Session generation captured when the false-start timer was armed.
+    ///   timeout: Timeout in seconds used for logging.
+    private func cancelAutoStopFalseStartIfNeeded(expectedGeneration: Int, timeout: Double) async {
+        guard expectedGeneration == sessionGeneration,
+              autoStopOnSilence,
+              state == .recording else {
+            return
+        }
+        let transcriptText = currentTranscript.displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard transcriptText.isEmpty else { return }
+        DebugFileLogger.log("focus wakeup: false start cancelled after \(timeout)s without ASR text")
+        autoStopOnSilence = false
+        onAutoCancel?()
+        await cancelRecording()
     }
 
     /// Updates focus auto-stop state from one live audio chunk.
@@ -1358,7 +1419,9 @@ actor RecognitionSession {
                 ? 50
                 : defaults.integer(forKey: "tf_focusAutoStopRMSWindowFrames")
         )
-        let threshold = Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
+        if autoStopEffectiveThreshold <= 0 {
+            autoStopEffectiveThreshold = Self.autoStopConfiguredThreshold()
+        }
         let timeout = defaults.object(forKey: "tf_focusAutoStopSilenceSeconds") == nil
             ? 0.9
             : defaults.double(forKey: "tf_focusAutoStopSilenceSeconds")
@@ -1370,13 +1433,38 @@ actor RecognitionSession {
         guard autoStopRMSWindow.count >= min(windowFrames, 2) else { return }
 
         let avg = autoStopRMSWindow.reduce(0, +) / Float(autoStopRMSWindow.count)
-        if avg >= threshold {
-            autoStopHadSpeech = true
+        let transcriptText = currentTranscript.displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasASRText = !transcriptText.isEmpty
+        if !autoStopHadSpeech {
+            if avg >= autoStopEffectiveThreshold {
+                autoStopHadSpeech = true
+                if !autoStopLoggedSpeechSource {
+                    DebugFileLogger.log(
+                        "focus wakeup: first speech avg=\(Int(avg)) threshold=\(Int(autoStopEffectiveThreshold))"
+                    )
+                    autoStopLoggedSpeechSource = true
+                }
+            } else if hasASRText {
+                autoStopHadSpeech = true
+                autoStopEffectiveThreshold = Self.adaptAutoStopThresholdFromASR(
+                    avg: avg,
+                    currentThreshold: autoStopEffectiveThreshold
+                )
+                if !autoStopLoggedSpeechSource {
+                    DebugFileLogger.log(
+                        "focus wakeup: ASR text marks speech avg=\(Int(avg)) threshold=\(Int(autoStopEffectiveThreshold))"
+                    )
+                    autoStopLoggedSpeechSource = true
+                }
+            }
+        }
+
+        guard autoStopHadSpeech else { return }
+        if avg >= autoStopEffectiveThreshold {
             autoStopSilenceStart = nil
             return
         }
 
-        guard autoStopHadSpeech else { return }
         let now = ContinuousClock.now
         if autoStopSilenceStart == nil {
             autoStopSilenceStart = now
@@ -1384,14 +1472,52 @@ actor RecognitionSession {
         }
 
         guard let silenceStart = autoStopSilenceStart,
-              now - silenceStart >= .milliseconds(Int(timeout * 1000)) else {
+              now - silenceStart >= .milliseconds(Int(timeout * 1000)),
+              hasASRText else {
             return
         }
 
-        DebugFileLogger.log("focus wakeup: auto stop silence avg=\(Int(avg)) threshold=\(Int(threshold)) timeout=\(timeout)s")
+        DebugFileLogger.log("focus wakeup: auto stop silence avg=\(Int(avg)) threshold=\(Int(autoStopEffectiveThreshold)) timeout=\(timeout)s")
         autoStopOnSilence = false
         onAutoStop?()
         await stopRecording()
+    }
+
+    /// Reads the configured fallback RMS threshold for silence auto-stop.
+    ///
+    /// Returns:
+    ///   Configured threshold, preserving the historical fallback of 500.
+    private static func autoStopConfiguredThreshold() -> Float {
+        let defaults = UserDefaults.standard
+        return Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
+    }
+
+    /// Reads the focus false-start timeout.
+    ///
+    /// Returns:
+    ///   Timeout in seconds, preserving the Python MyType default of 3 seconds.
+    private static func focusFalseStartTimeout() -> Double {
+        let defaults = UserDefaults.standard
+        return defaults.object(forKey: "tf_focusFalseStartTimeoutSeconds") == nil
+            ? 3.0
+            : defaults.double(forKey: "tf_focusFalseStartTimeoutSeconds")
+    }
+
+    /// Adapts the RMS stop threshold after ASR has confirmed speech text.
+    ///
+    /// Args:
+    ///   avg: Current sliding-window RMS.
+    ///   currentThreshold: Current effective RMS threshold.
+    ///
+    /// Returns:
+    ///   A threshold no higher than the current value, matching the Python MyType logic.
+    private static func adaptAutoStopThresholdFromASR(avg: Float, currentThreshold: Float) -> Float {
+        let adapted = max(
+            Self.autoStopASRNoiseMargin,
+            avg * Self.autoStopASRThresholdRatio,
+            Self.autoStopMinASRThreshold
+        )
+        return min(currentThreshold, adapted)
     }
 
     /// Calculates RMS from PCM16 audio bytes.

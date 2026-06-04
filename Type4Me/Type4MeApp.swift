@@ -112,6 +112,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        Task {
+            await session.setOnAutoCancel {
+                Task { @MainActor in
+                    appState.cancel()
+                    focusWakeupController.sessionDidFinish()
+                }
+            }
+        }
 
         Task {
             await session.setOnASREvent { event in
