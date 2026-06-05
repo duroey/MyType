@@ -10,7 +10,7 @@ struct CloudSettingsCard: View, SettingsCardHelpers {
     @State private var errorMessage: String?
 
     var body: some View {
-        settingsGroupCard(L("Type4Me Cloud", "Type4Me Cloud"), icon: "cloud.fill") {
+        settingsGroupCard(L("mytype Cloud", "mytype Cloud"), icon: "cloud.fill") {
             if auth.isLoggedIn {
                 loggedInContent
             } else {
@@ -123,8 +123,8 @@ struct CloudSettingsCard: View, SettingsCardHelpers {
     @ViewBuilder
     private var loginContent: some View {
         Text(L(
-            "登录后即可使用 Type4Me Cloud 语音识别和文本处理服务。免费体验 2000 字。",
-            "Sign in to use Type4Me Cloud for voice recognition and text processing. 2000 characters free."
+            "登录后即可使用 mytype Cloud 语音识别和文本处理服务。免费体验 2000 字。",
+            "Sign in to use mytype Cloud for voice recognition and text processing. 2000 characters free."
         ))
         .font(.system(size: 12))
         .foregroundStyle(TF.settingsTextTertiary)

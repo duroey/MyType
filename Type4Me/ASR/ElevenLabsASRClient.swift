@@ -23,7 +23,7 @@ enum ElevenLabsASRError: Error, LocalizedError {
 
 actor ElevenLabsASRClient: SpeechRecognizer {
 
-    private let logger = Logger(subsystem: "com.type4me.asr", category: "ElevenLabsASRClient")
+    private let logger = Logger(subsystem: "com.mytype.asr", category: "ElevenLabsASRClient")
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?

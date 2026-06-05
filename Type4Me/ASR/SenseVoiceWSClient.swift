@@ -6,7 +6,7 @@ import os
 /// This client is only used for Qwen3 final calibration.
 actor SenseVoiceWSClient: SpeechRecognizer {
 
-    private let logger = Logger(subsystem: "com.type4me.asr", category: "SenseVoiceWS")
+    private let logger = Logger(subsystem: "com.mytype.asr", category: "SenseVoiceWS")
 
     private var eventContinuation: AsyncStream<RecognitionEvent>.Continuation?
     private var _events: AsyncStream<RecognitionEvent>?

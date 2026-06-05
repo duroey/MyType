@@ -5,14 +5,14 @@ import os
 /// Runs on app startup and after hotword edits in Settings.
 enum VolcHotwordSyncManager {
 
-    private static let logger = Logger(subsystem: "com.type4me.hotwords", category: "VolcHotwordSync")
+    private static let logger = Logger(subsystem: "com.mytype.hotwords", category: "VolcHotwordSync")
 
     // UserDefaults keys
     private static let tableIDKey = "tf_volcBoostingTableID"
     private static let builtinVersionKey = "tf_volcBuiltinVersion"
     private static let dirtyKey = "tf_volcHotwordsDirty"
 
-    private static let tableName = "type4me-hotwords"
+    private static let tableName = "mytype-hotwords"
 
     // MARK: - Public
 

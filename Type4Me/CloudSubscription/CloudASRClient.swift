@@ -10,7 +10,7 @@ enum CloudASRError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider: return "CloudASRClient requires CloudASRConfig"
-        case .notAuthenticated: return "Please log in to Type4Me Cloud"
+        case .notAuthenticated: return "Please log in to mytype Cloud"
         case .invalidRegion: return "Could not determine region"
         }
     }
@@ -18,11 +18,11 @@ enum CloudASRError: Error, LocalizedError {
 
 /// Cloud ASR client that delegates to the appropriate upstream client
 /// (VolcASRClient for China, SonioxASRClient for overseas) but routes
-/// traffic through the Type4Me Cloud proxy.
+/// traffic through the mytype Cloud proxy.
 actor CloudASRClient: SpeechRecognizer {
 
     private let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "CloudASRClient"
     )
 

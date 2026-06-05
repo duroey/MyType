@@ -45,7 +45,7 @@ struct PermissionGuideView: View {
         .onDisappear { model.dismissDragOverlay() }
         // Poll state while the guide is on screen. AX is covered by the
         // drag-overlay's own 0.5s poll, but microphone state can change
-        // from System Settings *without* Type4Me becoming active (user
+        // from System Settings *without* mytype becoming active (user
         // never switches back), so the normal `didBecomeActive` refresh
         // misses it. 1s poll is lightweight and makes the cards light up
         // as soon as the user toggles the switch, without requiring a
@@ -66,8 +66,8 @@ struct PermissionGuideView: View {
             }
 
             Text(L(
-                "请授权以下权限,以允许 Type4Me 使用你的麦克风并监听快捷键和完成输入",
-                "Please grant the permissions below so Type4Me can use your microphone and listen for hotkeys to type for you."
+                "请授权以下权限,以允许 mytype 使用你的麦克风并监听快捷键和完成输入",
+                "Please grant the permissions below so mytype can use your microphone and listen for hotkeys to type for you."
             ))
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(textPrimary)
@@ -94,7 +94,7 @@ struct PermissionGuideView: View {
     @ViewBuilder
     private var launchButton: some View {
         Button(action: dismissGuide) {
-            Text(L("启动 Type4Me", "Launch Type4Me"))
+            Text(L("启动 mytype", "Launch mytype"))
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
@@ -111,7 +111,7 @@ struct PermissionGuideView: View {
 
     /// Close the guide window, surface the Settings window as the user's
     /// next destination (so "launch" produces a visible window instead of
-    /// silently parking the app in the menu bar), and bring Type4Me to the
+    /// silently parking the app in the menu bar), and bring mytype to the
     /// front.
     private func dismissGuide() {
         model.dismissDragOverlay()

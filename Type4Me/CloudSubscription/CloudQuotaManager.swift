@@ -13,7 +13,7 @@ final class CloudQuotaManager: ObservableObject {
     @Published private(set) var weekChars: Int = 0
     @Published private(set) var totalChars: Int = 0
 
-    private let logger = Logger(subsystem: "com.type4me.app", category: "CloudQuota")
+    private let logger = Logger(subsystem: "com.mytype.app", category: "CloudQuota")
     private var lastFetched: Date?
 
     private init() {

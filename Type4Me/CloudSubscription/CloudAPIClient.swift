@@ -26,7 +26,7 @@ final class CloudAPIClient {
     static let shared = CloudAPIClient()
 
     let deviceID: String
-    private let logger = Logger(subsystem: "com.type4me.app", category: "CloudAPI")
+    private let logger = Logger(subsystem: "com.mytype.app", category: "CloudAPI")
 
     private init() {
         deviceID = DeviceIdentifier.deviceID

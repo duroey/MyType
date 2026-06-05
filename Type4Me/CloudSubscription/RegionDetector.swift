@@ -5,7 +5,7 @@ import os
 /// Respects manual override via UserDefaults key `tf_cloud_region_override`.
 enum RegionDetector {
 
-    private static let logger = Logger(subsystem: "com.type4me.app", category: "Region")
+    private static let logger = Logger(subsystem: "com.mytype.app", category: "Region")
 
     /// Detect and persist the best region. Returns immediately if manually overridden.
     static func detect() async -> CloudRegion {

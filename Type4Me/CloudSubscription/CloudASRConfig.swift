@@ -3,7 +3,7 @@ import Foundation
 struct CloudASRConfig: ASRProviderConfig, Sendable {
 
     static var provider: ASRProvider { .cloud }
-    static var displayName: String { "Type4Me Cloud" }
+    static var displayName: String { "mytype Cloud" }
 
     // No credential fields — auth is handled by CloudAuthManager
     static var credentialFields: [CredentialField] { [] }

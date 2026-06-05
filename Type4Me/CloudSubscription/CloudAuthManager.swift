@@ -1,4 +1,4 @@
-// Type4Me/Auth/CloudAuthManager.swift
+// mytype/Auth/CloudAuthManager.swift
 
 import Foundation
 import os
@@ -18,7 +18,7 @@ final class CloudAuthManager: ObservableObject, Sendable {
     @Published private(set) var username: String?
     @Published private(set) var loginMethod: LoginMethod?
 
-    private let logger = Logger(subsystem: "com.type4me.app", category: "CloudAuth")
+    private let logger = Logger(subsystem: "com.mytype.app", category: "CloudAuth")
 
     // JWT stored in UserDefaults — security is enforced by device binding,
     // not token expiry. See docs/plans/2026-04-04-account-page-design.md
@@ -179,7 +179,7 @@ enum CloudAuthError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notConfigured: return "Type4Me Cloud is not configured"
+        case .notConfigured: return "mytype Cloud is not configured"
         case .invalidCode: return "Invalid or expired verification code"
         case .serverError(let msg): return "Server error: \(msg)"
         }

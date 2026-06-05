@@ -6,16 +6,12 @@ actor ModelManager {
 
     static let shared = ModelManager()
 
-    private let logger = Logger(subsystem: "com.type4me.models", category: "ModelManager")
+    private let logger = Logger(subsystem: "com.mytype.models", category: "ModelManager")
 
     // MARK: - Paths
 
     static var defaultModelsDir: String {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first!
-        return appSupport
-            .appendingPathComponent("Type4Me", isDirectory: true)
+        return AppIdentity.appSupportDirectory()
             .appendingPathComponent("models", isDirectory: true)
             .path
     }
@@ -73,8 +69,10 @@ actor ModelManager {
         }
         // Dev mode: check if qwen3-asr-server dir exists in project
         let home = NSHomeDirectory()
-        let devPath = (home as NSString).appendingPathComponent("projects/type4me/qwen3-asr-server/server.py")
-        return FileManager.default.fileExists(atPath: devPath)
+        let mytypeDevPath = (home as NSString).appendingPathComponent("projects/mytype/qwen3-asr-server/server.py")
+        if FileManager.default.fileExists(atPath: mytypeDevPath) { return true }
+        let legacyDevPath = (home as NSString).appendingPathComponent("projects/type4me/qwen3-asr-server/server.py")
+        return FileManager.default.fileExists(atPath: legacyDevPath)
     }
 
     // MARK: - Auxiliary Model Types (punctuation, offline, etc.)

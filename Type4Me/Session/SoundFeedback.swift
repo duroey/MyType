@@ -44,7 +44,7 @@ enum SoundFeedback {
     }
 
     /// All mutable state is accessed exclusively on this serial queue.
-    private static let soundQueue = DispatchQueue(label: "com.type4me.sound")
+    private static let soundQueue = DispatchQueue(label: "com.mytype.sound")
     nonisolated(unsafe) private static var hasWarmedUp = false
 
     /// Pre-prepared AVAudioPlayer instances keyed by label (used for keep-alive, primer).
@@ -453,8 +453,7 @@ enum SoundFeedback {
         if let url = Bundle.main.url(forResource: filename, withExtension: "wav", subdirectory: "Sounds") {
             return url
         }
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Type4Me", isDirectory: true)
+        let appSupport = AppIdentity.appSupportDirectory()
             .appendingPathComponent("Sounds", isDirectory: true)
         let url = appSupport.appendingPathComponent("\(filename).wav")
         return FileManager.default.fileExists(atPath: url.path) ? url : nil

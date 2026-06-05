@@ -11,7 +11,7 @@ enum CloudLLMError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notAuthenticated: return "Please log in to Type4Me Cloud"
+        case .notAuthenticated: return "Please log in to mytype Cloud"
         case .quotaExhausted: return "Free quota exhausted"
         case .networkError: return "Network error"
         case .serverError(let code): return "Server error (\(code))"
@@ -21,11 +21,11 @@ enum CloudLLMError: Error, LocalizedError {
     }
 }
 
-/// LLM client that proxies requests through the Type4Me Cloud backend.
+/// LLM client that proxies requests through the mytype Cloud backend.
 /// The backend handles API keys and upstream provider selection.
 actor CloudLLMClient: LLMClient {
 
-    private let logger = Logger(subsystem: "com.type4me.app", category: "CloudLLM")
+    private let logger = Logger(subsystem: "com.mytype.app", category: "CloudLLM")
 
     func warmUp(baseURL: String) async {
         // No warmup needed — proxy handles connection pooling

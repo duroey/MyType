@@ -2,13 +2,10 @@ import Foundation
 
 enum DebugFileLogger {
 
-    private static let queue = DispatchQueue(label: "com.type4me.debug-file-logger")
+    private static let queue = DispatchQueue(label: "com.mytype.debug-file-logger")
 
     static var logURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Type4Me", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("debug.log")
+        AppIdentity.appSupportDirectory().appendingPathComponent("debug.log")
     }
 
     static func startSession() {

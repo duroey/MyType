@@ -22,7 +22,7 @@ enum AppleASRError: Error, LocalizedError {
 
 actor AppleASRClient: SpeechRecognizer {
 
-    private let logger = Logger(subsystem: "com.type4me.asr", category: "AppleASRClient")
+    private let logger = Logger(subsystem: "com.mytype.asr", category: "AppleASRClient")
     private var recognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?

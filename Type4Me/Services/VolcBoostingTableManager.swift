@@ -9,7 +9,7 @@ actor VolcBoostingTableManager {
 
     static let shared = VolcBoostingTableManager()
 
-    private let logger = Logger(subsystem: "com.type4me.hotwords", category: "VolcBoostingTableManager")
+    private let logger = Logger(subsystem: "com.mytype.hotwords", category: "VolcBoostingTableManager")
 
     private let host = "open.volcengineapi.com"
     private let region = "cn-north-1"
@@ -173,7 +173,7 @@ actor VolcBoostingTableManager {
         fields: [String: String],
         fileContent: String
     ) async throws -> Data {
-        let boundary = "----Type4MeBoundary\(UUID().uuidString)"
+        let boundary = "----mytypeBoundary\(UUID().uuidString)"
         var parts: [String] = []
 
         // Action and Version as form fields

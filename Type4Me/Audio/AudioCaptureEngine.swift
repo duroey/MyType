@@ -26,6 +26,9 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     static let chunkDurationMs: Int = 200
     static let samplesPerChunk: Int = 3200
     static let chunkByteSize: Int = 6400
+    static let frameDurationMs: Int = 20
+    static let samplesPerFrame: Int = 320
+    static let frameByteSize: Int = 640
     static let targetFormat: AVAudioFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: 16000,
@@ -78,6 +81,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     // MARK: - Public
 
     var onAudioChunk: ((Data) -> Void)?
+    var onAudioFrame: ((Data) -> Void)?
     var onAudioLevel: ((Float) -> Void)?
 
     // MARK: - Private
@@ -86,9 +90,10 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     private let stateLock = NSLock()
     private let bufferLock = NSLock()
     private var buffer = Data()
+    private var frameBuffer = Data()
     private var accumulatedAudio = Data()
     private var converter: AVAudioConverter?
-    private let outputQueue = DispatchQueue(label: "com.type4me.audiocapture")
+    private let outputQueue = DispatchQueue(label: "com.mytype.audiocapture")
     private let outputQueueKey = DispatchSpecificKey<UInt8>()
     private let outputQueueTag: UInt8 = 1
     private var activeOutput: AVCaptureAudioDataOutput?
@@ -145,6 +150,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         // Reset state
         bufferLock.lock()
         buffer = Data()
+        frameBuffer = Data()
         accumulatedAudio = Data()
         bufferLock.unlock()
         converter = nil
@@ -195,6 +201,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         bufferLock.lock()
         converter = nil
         onAudioChunk = nil
+        onAudioFrame = nil
         onAudioLevel = nil
         bufferLock.unlock()
         levelCounter = 0
@@ -278,7 +285,9 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
 
         bufferLock.lock()
         accumulatedAudio.append(chunk)
+        frameBuffer.append(chunk)
         buffer.append(chunk)
+        emitFullFrames()
         emitFullChunks()
         bufferLock.unlock()
     }
@@ -297,6 +306,18 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
             let chunk = buffer.prefix(Self.chunkByteSize)
             buffer.removeFirst(Self.chunkByteSize)
             onAudioChunk?(Data(chunk))
+        }
+    }
+
+    /// Emits all complete 20ms PCM frames from the frame buffer.
+    ///
+    /// The callback mirrors Python MyType's `block_ms=20` capture path so wakeup
+    /// and silence detection use the same temporal resolution as the old app.
+    private func emitFullFrames() {
+        while frameBuffer.count >= Self.frameByteSize {
+            let frame = frameBuffer.prefix(Self.frameByteSize)
+            frameBuffer.removeFirst(Self.frameByteSize)
+            onAudioFrame?(Data(frame))
         }
     }
 

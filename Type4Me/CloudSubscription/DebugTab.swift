@@ -1,6 +1,6 @@
 // Developer-only diagnostics panel.
-// Hidden by default. Enable with: defaults write com.type4me.app tf_debug_panel -bool true
-// Disable with: defaults delete com.type4me.app tf_debug_panel
+// Hidden by default. Enable with: defaults write com.mytype.app tf_debug_panel -bool true
+// Disable with: defaults delete com.mytype.app tf_debug_panel
 
 import SwiftUI
 import os
@@ -16,7 +16,7 @@ struct DebugTab: View, SettingsCardHelpers {
     @State private var pinging = false
     @State private var currentRegion = CloudConfig.currentRegion
 
-    private let logger = Logger(subsystem: "com.type4me.app", category: "DebugTab")
+    private let logger = Logger(subsystem: "com.mytype.app", category: "DebugTab")
 
     var body: some View {
         SettingsSectionHeader(

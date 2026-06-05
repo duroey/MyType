@@ -21,7 +21,7 @@ enum OpenAIASRError: Error, LocalizedError {
 /// Accumulates audio during recording, then transcribes in one shot on endAudio().
 actor OpenAIASRClient: SpeechRecognizer {
 
-    private let logger = Logger(subsystem: "com.type4me.asr", category: "OpenAIASRClient")
+    private let logger = Logger(subsystem: "com.mytype.asr", category: "OpenAIASRClient")
 
     private var config: OpenAIASRConfig?
     private var audioBuffer = Data()

@@ -6,7 +6,7 @@ import os
 enum SonioxAsyncClient {
 
     private static let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "SonioxAsyncClient"
     )
 

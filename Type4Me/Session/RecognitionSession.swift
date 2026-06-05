@@ -58,7 +58,7 @@ actor RecognitionSession {
     private var asrClient: (any SpeechRecognizer)?
 
     private let logger = Logger(
-        subsystem: "com.type4me.session",
+        subsystem: "com.mytype.session",
         category: "RecognitionSession"
     )
 
@@ -232,6 +232,8 @@ actor RecognitionSession {
     private static let autoStopASRThresholdRatio: Float = 0.65
     private static let autoStopMinASRThreshold: Float = 80
     private static let autoStopASRNoiseMargin: Float = 80
+    private static let autoStopRMSNoiseMargin: Float = 120
+    private static let autoStopMinRMSThreshold: Float = 120
 
     // MARK: - Toggle
 
@@ -253,7 +255,12 @@ actor RecognitionSession {
     /// Args:
     ///   mode: Processing mode used for the current recording.
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
-    func startRecording(mode: ProcessingMode = .direct, autoStopOnSilence: Bool = false) async {
+    ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
+    func startRecording(
+        mode: ProcessingMode = .direct,
+        autoStopOnSilence: Bool = false,
+        initialAudioChunks: [Data] = []
+    ) async {
         if state == .finishing || state == .injecting || state == .postProcessing {
             NSLog("[Session] startRecording: blocked, current session still processing (state=%@)", String(describing: state))
             DebugFileLogger.log("startRecording blocked: still processing state=\(state)")
@@ -277,7 +284,7 @@ actor RecognitionSession {
                 SoundFeedback.playError()
                 state = .idle
                 onASREvent?(.error(NSError(
-                    domain: "Type4Me", code: -10,
+                    domain: "mytype", code: -10,
                     userInfo: [NSLocalizedDescriptionKey: L("免费额度已用完", "Free quota exhausted")]
                 )))
                 onASREvent?(.completed)
@@ -300,7 +307,7 @@ actor RecognitionSession {
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
         autoStopRMSWindow = []
-        autoStopEffectiveThreshold = Self.autoStopConfiguredThreshold()
+        autoStopEffectiveThreshold = Self.autoStopEffectiveThreshold()
         autoStopLoggedSpeechSource = false
         state = .starting
 
@@ -319,7 +326,7 @@ actor RecognitionSession {
                 NSLog("[Session] Failed to create default config for %@!", provider.rawValue)
                 SoundFeedback.playError()
                 state = .idle
-                onASREvent?(.error(NSError(domain: "Type4Me", code: -1, userInfo: [NSLocalizedDescriptionKey: L("本地模型未配置", "Local model not configured")])))
+                onASREvent?(.error(NSError(domain: "mytype", code: -1, userInfo: [NSLocalizedDescriptionKey: L("本地模型未配置", "Local model not configured")])))
                 onASREvent?(.completed)
                 return
             }
@@ -328,7 +335,7 @@ actor RecognitionSession {
                 NSLog("[Session] Required local models not downloaded for %@", provider.rawValue)
                 SoundFeedback.playError()
                 state = .idle
-                onASREvent?(.error(NSError(domain: "Type4Me", code: -3, userInfo: [NSLocalizedDescriptionKey: L("请先下载识别模型", "Please download ASR models first")])))
+                onASREvent?(.error(NSError(domain: "mytype", code: -3, userInfo: [NSLocalizedDescriptionKey: L("请先下载识别模型", "Please download ASR models first")])))
                 onASREvent?(.completed)
                 return
             }
@@ -354,7 +361,7 @@ actor RecognitionSession {
             NSLog("[Session] No ASR credentials found for provider=%@!", provider.rawValue)
             SoundFeedback.playError()
             state = .idle
-            onASREvent?(.error(NSError(domain: "Type4Me", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")])))
+            onASREvent?(.error(NSError(domain: "mytype", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")])))
             onASREvent?(.completed)
             return
         }
@@ -365,7 +372,7 @@ actor RecognitionSession {
             NSLog("[Session] No client implementation for provider=%@", provider.rawValue)
             SoundFeedback.playError()
             state = .idle
-            onASREvent?(.error(NSError(domain: "Type4Me", code: -2, userInfo: [NSLocalizedDescriptionKey: L("\(provider.displayName) 暂不支持", "\(provider.displayName) not yet supported")])))
+            onASREvent?(.error(NSError(domain: "mytype", code: -2, userInfo: [NSLocalizedDescriptionKey: L("\(provider.displayName) 暂不支持", "\(provider.displayName) not yet supported")])))
             onASREvent?(.completed)
             return
         }
@@ -402,6 +409,16 @@ actor RecognitionSession {
         // This eliminates the ~1s perceived latency from connect().
 
         let audioBuffer = AudioChunkBuffer()
+        var queuedInitialBytes = 0
+        for chunk in initialAudioChunks {
+            audioBuffer.append(chunk)
+            queuedInitialBytes += chunk.count
+        }
+        if !initialAudioChunks.isEmpty {
+            DebugFileLogger.log(
+                "focus wakeup: queued pre-roll chunks=\(initialAudioChunks.count) bytes=\(queuedInitialBytes)"
+            )
+        }
 
         speechDetected = false
         let levelHandler = self.onAudioLevel
@@ -418,6 +435,9 @@ actor RecognitionSession {
         audioEngine.onAudioChunk = { [weak self] data in
             guard self != nil else { return }
             audioBuffer.append(data)
+        }
+        audioEngine.onAudioFrame = { [weak self] data in
+            Task { await self?.handleAutoStopAudioFrame(data, expectedGeneration: myGeneration) }
         }
 
         do {
@@ -441,7 +461,7 @@ actor RecognitionSession {
         markReadyIfNeeded()
         DebugFileLogger.log("session entered recording state (buffering, ASR connecting)")
 
-        // Volume lowered in Type4MeApp .ready handler
+        // Volume lowered in the app .ready handler
 
         // ── Phase 2: Connect ASR (audio is already recording) ──
 
@@ -460,6 +480,7 @@ actor RecognitionSession {
             SoundFeedback.playError()
             audioEngine.stop()
             audioEngine.onAudioChunk = nil
+            audioEngine.onAudioFrame = nil
             audioEngine.onAudioLevel = nil
             await client.disconnect()
             self.asrClient = nil
@@ -502,12 +523,10 @@ actor RecognitionSession {
         // Switch callback from buffer to live pipeline
         var chunkCount = bufferedChunks.count
         let failureFlag = self.uploadFailureFlag
-        audioEngine.onAudioChunk = { [weak self] data in
-            guard let self else { return }
+        audioEngine.onAudioChunk = { data in
             if failureFlag?.failed == true { return }
             chunkCount += 1
             chunkContinuation.yield(data)
-            Task { await self.handleAutoStopAudioChunk(data, expectedGeneration: expectedGeneration) }
         }
 
         // Catch any chunks that arrived between drain and callback switch
@@ -560,6 +579,22 @@ actor RecognitionSession {
             return
         }
         DebugFileLogger.log("cancelRecording: discarding session from state=\(state)")
+        SystemVolumeManager.restore()
+        await forceReset()
+    }
+
+    /// Cancels the current session from any non-idle pipeline phase.
+    ///
+    /// Use this for user-initiated hard cancellation, such as Escape, where the
+    /// intended behavior is to discard the session rather than finish ASR,
+    /// clipboard injection, or LLM post-processing.
+    func cancelCurrentSession() async {
+        guard state != .idle else {
+            DebugFileLogger.log("cancelCurrentSession: ignored because state is idle")
+            return
+        }
+        DebugFileLogger.log("cancelCurrentSession: discarding session from state=\(state)")
+        injectionAborted = true
         SystemVolumeManager.restore()
         await forceReset()
     }
@@ -1399,12 +1434,12 @@ actor RecognitionSession {
         await cancelRecording()
     }
 
-    /// Updates focus auto-stop state from one live audio chunk.
+    /// Updates focus auto-stop state from one 20ms live audio frame.
     ///
     /// Args:
-    ///   data: PCM16 little-endian audio bytes captured during the active recording.
+    ///   data: PCM16 little-endian 20ms audio frame captured during recording.
     ///   expectedGeneration: Session generation captured when the audio callback was installed.
-    private func handleAutoStopAudioChunk(_ data: Data, expectedGeneration: Int) async {
+    private func handleAutoStopAudioFrame(_ data: Data, expectedGeneration: Int) async {
         guard expectedGeneration == sessionGeneration,
               autoStopOnSilence,
               state == .recording else {
@@ -1420,11 +1455,9 @@ actor RecognitionSession {
                 : defaults.integer(forKey: "tf_focusAutoStopRMSWindowFrames")
         )
         if autoStopEffectiveThreshold <= 0 {
-            autoStopEffectiveThreshold = Self.autoStopConfiguredThreshold()
+            autoStopEffectiveThreshold = Self.autoStopEffectiveThreshold()
         }
-        let timeout = defaults.object(forKey: "tf_focusAutoStopSilenceSeconds") == nil
-            ? 0.9
-            : defaults.double(forKey: "tf_focusAutoStopSilenceSeconds")
+        let timeout = Self.focusAutoStopSilenceSeconds()
 
         autoStopRMSWindow.append(rms)
         if autoStopRMSWindow.count > windowFrames {
@@ -1483,11 +1516,18 @@ actor RecognitionSession {
         await stopRecording()
     }
 
-    /// Reads the configured fallback RMS threshold for silence auto-stop.
+    /// Resolves the effective RMS threshold for focus silence auto-stop.
     ///
     /// Returns:
-    ///   Configured threshold, preserving the historical fallback of 500.
-    private static func autoStopConfiguredThreshold() -> Float {
+    ///   A bottom-noise-derived threshold when calibrated, otherwise the
+    ///   configured fallback threshold.
+    private static func autoStopEffectiveThreshold() -> Float {
+        if let snapshot = NoiseFloorStore.snapshot() {
+            return max(
+                snapshot.noiseFloor + Self.autoStopRMSNoiseMargin,
+                Self.autoStopMinRMSThreshold
+            )
+        }
         let defaults = UserDefaults.standard
         return Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
     }
@@ -1503,6 +1543,20 @@ actor RecognitionSession {
             : defaults.double(forKey: "tf_focusFalseStartTimeoutSeconds")
     }
 
+    /// Reads the focus auto-submit silence duration.
+    ///
+    /// Returns:
+    ///   A bounded silence duration in seconds. The default matches the current
+    ///   Python-derived behavior while preventing corrupt settings from causing
+    ///   immediate or excessively delayed submission.
+    private static func focusAutoStopSilenceSeconds() -> Double {
+        let defaults = UserDefaults.standard
+        let raw = defaults.object(forKey: "tf_focusAutoStopSilenceSeconds") == nil
+            ? 0.9
+            : defaults.double(forKey: "tf_focusAutoStopSilenceSeconds")
+        return min(max(raw, 0.3), 5.0)
+    }
+
     /// Adapts the RMS stop threshold after ASR has confirmed speech text.
     ///
     /// Args:
@@ -1512,8 +1566,9 @@ actor RecognitionSession {
     /// Returns:
     ///   A threshold no higher than the current value, matching the Python MyType logic.
     private static func adaptAutoStopThresholdFromASR(avg: Float, currentThreshold: Float) -> Float {
+        let noiseFloor = NoiseFloorStore.snapshot()?.noiseFloor ?? 0
         let adapted = max(
-            Self.autoStopASRNoiseMargin,
+            noiseFloor + Self.autoStopASRNoiseMargin,
             avg * Self.autoStopASRThresholdRatio,
             Self.autoStopMinASRThreshold
         )

@@ -44,7 +44,7 @@ enum GenerationError: LocalizedError {
             return L("无法解析 LLM 返回结果", "Failed to parse LLM response")
         #if HAS_CLOUD_SUBSCRIPTION
         case .paidOnly:
-            return L("此功能需要 Type4Me Cloud 付费订阅", "This feature requires a paid Type4Me Cloud subscription")
+            return L("此功能需要 mytype Cloud 付费订阅", "This feature requires a paid mytype Cloud subscription")
         #endif
         }
     }
@@ -54,7 +54,7 @@ enum GenerationError: LocalizedError {
 
 actor ASRVariantGenerator {
 
-    private let logger = Logger(subsystem: "com.type4me.llm", category: "ASRVariantGenerator")
+    private let logger = Logger(subsystem: "com.mytype.llm", category: "ASRVariantGenerator")
 
     // MARK: - Main entry
 

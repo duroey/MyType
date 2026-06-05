@@ -3,7 +3,7 @@ import os
 
 actor DoubaoChatClient: LLMClient {
 
-    private let logger = Logger(subsystem: "com.type4me.llm", category: "DoubaoChatClient")
+    private let logger = Logger(subsystem: "com.mytype.llm", category: "DoubaoChatClient")
     private let provider: LLMProvider
 
     init(provider: LLMProvider = .doubao) {

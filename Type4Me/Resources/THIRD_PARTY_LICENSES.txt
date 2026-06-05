@@ -1,7 +1,7 @@
 Third-Party Software Licenses
 ==============================
 
-Type4Me includes the following open-source software:
+mytype includes the following open-source software:
 
 ---
 

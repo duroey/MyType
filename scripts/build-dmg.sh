@@ -3,13 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && /bin/pwd -P)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)"
-APP_NAME="Type4Me"
+APP_NAME="mytype"
 APP_VERSION="${APP_VERSION:-1.9.3}"
 VARIANT="${VARIANT:-pure}"     # pure, official, or local
 ARCH="${ARCH:-}"               # arm64 or universal (default: universal for pure/official, arm64 for local)
 DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist}"
 VOLUME_NAME="${VOLUME_NAME:-$APP_NAME}"
-STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/type4me-dmg.XXXXXX")"
+STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mytype-dmg.XXXXXX")"
 
 # Variant validation
 case "$VARIANT" in
@@ -131,7 +131,7 @@ hdiutil create \
 DMG_SIZE=$(du -h "$DMG_PATH" | cut -f1)
 
 # Notarize and staple if Developer ID signing was used
-NOTARY_PROFILE="${NOTARY_PROFILE:-type4me-notary}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-mytype-notary}"
 if [ "$SIGNED_WITH_DEVID" = "1" ]; then
     echo ""
     echo "=== Notarizing DMG ==="

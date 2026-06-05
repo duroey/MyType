@@ -46,6 +46,12 @@ enum TF {
         dark:  (0.42, 0.70, 0.42)
     )
 
+    /// Focus armed: saturated blue, visually separate from recording green and processing purple.
+    static let focusWaiting = adaptiveColor(
+        light: (0.00, 0.36, 1.00),
+        dark:  (0.00, 0.40, 1.00)
+    )
+
     // MARK: Settings Palette
 
     static let settingsBg = Color(red: 0.95, green: 0.92, blue: 0.88)
@@ -80,6 +86,8 @@ enum TF {
     static let barWidthCompact: CGFloat = 200
     static let barHeight: CGFloat = 52
     static let barBottomOffset: CGFloat = 48
+    static let focusIndicatorTopOffset: CGFloat = 8
+    static let focusIndicatorNotchSideOffset: CGFloat = 108
 
     // MARK: Transcript Popup (hover preview above bar)
 

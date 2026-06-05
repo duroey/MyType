@@ -23,8 +23,7 @@ actor SenseVoiceServerManager {
     /// Write effective hotwords (builtin + user) to hotwords.txt for Qwen3 server.
     nonisolated static func syncHotwordsFile() {
         let words = HotwordStorage.loadEffective()
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("Type4Me")
+        let dir = AppIdentity.appSupportDirectory()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("hotwords.txt")
         let content = words.joined(separator: "\n")
@@ -53,7 +52,7 @@ actor SenseVoiceServerManager {
         set { _portLock.withLock { $0 = newValue } }
     }
 
-    private let logger = Logger(subsystem: "com.type4me.sensevoice", category: "ServerManager")
+    private let logger = Logger(subsystem: "com.mytype.sensevoice", category: "ServerManager")
 
     private var qwen3Process: Process?
     private(set) var qwen3Port: Int?
@@ -245,8 +244,7 @@ actor SenseVoiceServerManager {
     // MARK: - PID File Management
 
     private static var pidFileURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return dir.appendingPathComponent("Type4Me/server-pids.txt")
+        AppIdentity.appSupportDirectory().appendingPathComponent("server-pids.txt")
     }
 
     /// Save current managed PIDs to disk so we can clean up after a crash.
@@ -348,9 +346,7 @@ actor SenseVoiceServerManager {
         logger.info("Qwen3-ASR model: \(modelPath)")
 
         // Hotwords file
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let hotwordsPath = appSupport
-            .appendingPathComponent("Type4Me")
+        let hotwordsPath = AppIdentity.appSupportDirectory()
             .appendingPathComponent("hotwords.txt")
         let hotwordsFile = FileManager.default.fileExists(atPath: hotwordsPath.path) ? hotwordsPath.path : ""
 
@@ -375,9 +371,7 @@ actor SenseVoiceServerManager {
             return b.path
         }
         // 2. App Support (user-downloaded)
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let userModel = appSupport
-            .appendingPathComponent("Type4Me")
+        let userModel = AppIdentity.appSupportDirectory()
             .appendingPathComponent("Models/Qwen3-ASR")
         if FileManager.default.fileExists(atPath: userModel.path) {
             return userModel.path
@@ -403,9 +397,13 @@ actor SenseVoiceServerManager {
             }
         }
         let home = NSHomeDirectory()
-        let fallback = (home as NSString).appendingPathComponent("projects/type4me/\(name)")
-        if FileManager.default.fileExists(atPath: (fallback as NSString).appendingPathComponent("server.py")) {
-            return fallback
+        let mytypeFallback = (home as NSString).appendingPathComponent("projects/mytype/\(name)")
+        if FileManager.default.fileExists(atPath: (mytypeFallback as NSString).appendingPathComponent("server.py")) {
+            return mytypeFallback
+        }
+        let legacyFallback = (home as NSString).appendingPathComponent("projects/type4me/\(name)")
+        if FileManager.default.fileExists(atPath: (legacyFallback as NSString).appendingPathComponent("server.py")) {
+            return legacyFallback
         }
         return nil
     }

@@ -5,14 +5,13 @@ enum KeychainService {
 
     private static let lock = NSLock()
     private static var cachedCredentials: [String: Any]?
-    private static let keychainScalarService = "com.type4me.scalar"
-    private static let keychainGroupedService = "com.type4me.grouped"
+    private static let keychainScalarService = "com.mytype.scalar"
+    private static let keychainGroupedService = "com.mytype.grouped"
+    private static let legacyKeychainScalarService = "com.type4me.scalar"
+    private static let legacyKeychainGroupedService = "com.type4me.grouped"
 
     private static var credentialsURL: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Type4Me", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("credentials.json")
+        AppIdentity.appSupportDirectory().appendingPathComponent("credentials.json")
     }
 
     // MARK: - Core read/write (now supports nested objects)
@@ -49,8 +48,22 @@ enum KeychainService {
         try saveSecureString(value, service: keychainScalarService, account: key)
     }
 
+    /// Loads a scalar secret from the current keychain service.
+    ///
+    /// Args:
+    ///   key: Secret account name.
+    ///
+    /// Returns:
+    ///   The secret value, falling back to the legacy Type4Me keychain service when needed.
     static func load(key: String) -> String? {
-        loadSecureString(service: keychainScalarService, account: key)
+        if let value = loadSecureString(service: keychainScalarService, account: key) {
+            return value
+        }
+        guard let legacy = loadSecureString(service: legacyKeychainScalarService, account: key) else {
+            return nil
+        }
+        try? saveSecureString(legacy, service: keychainScalarService, account: key)
+        return legacy
     }
 
     @discardableResult
@@ -368,13 +381,24 @@ enum KeychainService {
         try saveSecureData(data, service: keychainGroupedService, account: account)
     }
 
+    /// Loads grouped secure values from the current keychain service.
+    ///
+    /// Args:
+    ///   account: Grouped credential account name.
+    ///
+    /// Returns:
+    ///   Secure values, copied from the legacy Type4Me keychain service when the new service is empty.
     private static func loadSecureValues(account: String) -> [String: String] {
-        guard let data = loadSecureData(service: keychainGroupedService, account: account),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else {
+        if let data = loadSecureData(service: keychainGroupedService, account: account),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            return object
+        }
+        guard let legacyData = loadSecureData(service: legacyKeychainGroupedService, account: account),
+              let legacyObject = try? JSONSerialization.jsonObject(with: legacyData) as? [String: String] else {
             return [:]
         }
-        return object
+        try? saveSecureData(legacyData, service: keychainGroupedService, account: account)
+        return legacyObject
     }
 
     private static func saveSecureData(_ data: Data, service: String, account: String) throws {
@@ -414,9 +438,22 @@ enum KeychainService {
         return result as? Data
     }
 
+    /// Deletes one keychain value and its matching legacy fallback.
+    ///
+    /// Args:
+    ///   service: Keychain service name.
+    ///   account: Keychain account name.
+    ///
+    /// Returns:
+    ///   `true` when the current-service deletion succeeds or the item is already absent.
     @discardableResult
     private static func deleteSecureValue(service: String, account: String) -> Bool {
         let status = SecItemDelete(keychainQuery(service: service, account: account) as CFDictionary)
+        if service == keychainScalarService {
+            _ = SecItemDelete(keychainQuery(service: legacyKeychainScalarService, account: account) as CFDictionary)
+        } else if service == keychainGroupedService {
+            _ = SecItemDelete(keychainQuery(service: legacyKeychainGroupedService, account: account) as CFDictionary)
+        }
         return status == errSecSuccess || status == errSecItemNotFound
     }
 
@@ -489,14 +526,22 @@ enum KeychainService {
 
     // MARK: - Application Support Directory Migration
 
-    /// Merge ~/Library/Application Support/TypeFlow/ files into Type4Me/ (one-time, from old project name).
+    /// Merge legacy app support files into mytype.
+    ///
+    /// This preserves current files and leaves old directories in place for rollback builds.
+    private static func migrateAppSupportDirectory() {
+        AppIdentity.migrateLegacySupportDirectories()
+        migrateTypeFlowSupportDirectory()
+    }
+
+    /// Merge ~/Library/Application Support/TypeFlow/ files into mytype/ (one-time, from old project name).
     /// Uses file-level merge instead of directory rename, because other init code may create
     /// the new directory before this migration runs.
-    private static func migrateAppSupportDirectory() {
+    private static func migrateTypeFlowSupportDirectory() {
         let fm = FileManager.default
         let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let oldDir = appSupport.appendingPathComponent("TypeFlow", isDirectory: true)
-        let newDir = appSupport.appendingPathComponent("Type4Me", isDirectory: true)
+        let newDir = AppIdentity.appSupportDirectory()
 
         // Old directory must exist and contain real data (credentials.json is the marker)
         guard fm.fileExists(atPath: oldDir.appendingPathComponent("credentials.json").path) else { return }
@@ -520,7 +565,7 @@ enum KeychainService {
         }
 
         if movedCount > 0 {
-            NSLog("[KeychainService] Migrated %d files from TypeFlow → Type4Me", movedCount)
+            NSLog("[KeychainService] Migrated %d files from TypeFlow → mytype", movedCount)
         }
 
         // Clean up old directory if empty
@@ -531,13 +576,21 @@ enum KeychainService {
 
     // MARK: - UserDefaults Migration (old bundle ID)
 
-    /// Copy tf_ keys from old com.typeflow.app UserDefaults to current domain.
-    /// One-time: skips if already migrated (marker key present).
+    /// Copies `tf_` keys from legacy bundle identifiers into the current domain.
     private static func migrateUserDefaults() {
-        let marker = "tf_migratedFromTypeFlow"
+        migrateUserDefaults(from: "com.typeflow.app", marker: "tf_migratedFromTypeFlow")
+        migrateUserDefaults(from: "com.type4me.app", marker: "tf_migratedFromType4Me")
+    }
+
+    /// Copies missing `tf_` keys from one legacy UserDefaults suite.
+    ///
+    /// Args:
+    ///   suiteName: Legacy bundle identifier to read from.
+    ///   marker: Current-domain marker used to avoid repeated migration.
+    private static func migrateUserDefaults(from suiteName: String, marker: String) {
         guard !UserDefaults.standard.bool(forKey: marker) else { return }
 
-        guard let oldDefaults = UserDefaults(suiteName: "com.typeflow.app") else { return }
+        guard let oldDefaults = UserDefaults(suiteName: suiteName) else { return }
         let oldDict = oldDefaults.dictionaryRepresentation()
         let tfKeys = oldDict.keys.filter { $0.hasPrefix("tf_") }
 
@@ -557,7 +610,7 @@ enum KeychainService {
 
         UserDefaults.standard.set(true, forKey: marker)
         if count > 0 {
-            NSLog("[KeychainService] Migrated %d UserDefaults keys from com.typeflow.app", count)
+            NSLog("[KeychainService] Migrated %d UserDefaults keys from %@", count, suiteName)
         }
     }
 }

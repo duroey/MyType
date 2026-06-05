@@ -9,10 +9,10 @@ import os
 /// the caller (Bluetooth audio devices can stall AudioObject*PropertyData for seconds).
 enum SystemVolumeManager {
 
-    private static let logger = Logger(subsystem: "com.type4me.volume", category: "SystemVolumeManager")
+    private static let logger = Logger(subsystem: "com.mytype.volume", category: "SystemVolumeManager")
 
     /// Dedicated serial queue for CoreAudio property access.
-    private static let queue = DispatchQueue(label: "com.type4me.volume.coreaudio", qos: .userInitiated)
+    private static let queue = DispatchQueue(label: "com.mytype.volume.coreaudio", qos: .userInitiated)
 
     /// The volume level saved before lowering, protected for cross-thread access.
     private static let savedVolume = OSAllocatedUnfairLock<Float?>(initialState: nil)

@@ -2,7 +2,7 @@ import Foundation
 import SQLite3
 
 extension Notification.Name {
-    static let historyStoreDidChange = Notification.Name("Type4Me.historyStoreDidChange")
+    static let historyStoreDidChange = Notification.Name("mytype.historyStoreDidChange")
 }
 
 actor HistoryStore {
@@ -14,11 +14,7 @@ actor HistoryStore {
         if let path {
             dbPath = path
         } else {
-            let appSupport = FileManager.default.urls(
-                for: .applicationSupportDirectory, in: .userDomainMask
-            ).first!.appendingPathComponent("Type4Me", isDirectory: true)
-            try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
-            dbPath = appSupport.appendingPathComponent("history.db").path
+            dbPath = AppIdentity.appSupportDirectory().appendingPathComponent("history.db").path
         }
 
         if sqlite3_open(dbPath, &db) == SQLITE_OK {

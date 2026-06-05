@@ -669,7 +669,7 @@ struct SmartCorrectionSheet: View {
         }
         HotwordStorage.save(currentHotwords)
 
-        if let url = URL(string: "type4me://reload-vocabulary") {
+        if let url = URL(string: "mytype://reload-vocabulary") {
             NSWorkspace.shared.open(url)
         }
 

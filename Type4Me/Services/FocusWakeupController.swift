@@ -11,11 +11,18 @@ final class FocusWakeupController {
 
     private struct Config {
         let enabled: Bool
-        let startThreshold: Float
+        let startNoiseMargin: Float
+        let minStartRMSThreshold: Float
+        let startThresholdFloor: Float
+        let fallbackStartThreshold: Float
         let rmsWindowFrames: Int
         let speechFrames: Int
+        let preRollFrames: Int
         let rearmDelay: TimeInterval
+        let rearmQuietFrames: Int
+        let quietRMSThreshold: Float
         let pollInterval: TimeInterval
+        let noFrameReopen: TimeInterval
 
         /// Loads focus wakeup settings from UserDefaults.
         ///
@@ -28,11 +35,22 @@ final class FocusWakeupController {
                 : defaults.bool(forKey: "tf_focusWakeupEnabled")
             return Config(
                 enabled: enabled,
-                startThreshold: Float(defaults.object(forKey: "tf_focusStartThreshold") as? Double ?? 300),
+                startNoiseMargin: Float(defaults.object(forKey: "tf_focusStartNoiseMargin") as? Double ?? 160),
+                minStartRMSThreshold: Float(defaults.object(forKey: "tf_focusMinStartRMSThreshold") as? Double ?? 160),
+                startThresholdFloor: Float(defaults.object(forKey: "tf_focusStartThresholdFloor") as? Double ?? 300),
+                fallbackStartThreshold: Float(
+                    defaults.object(forKey: "tf_focusStartThreshold") as? Double
+                        ?? defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double
+                        ?? 500
+                ),
                 rmsWindowFrames: max(1, defaults.integerOrDefault("tf_focusRMSWindowFrames", defaultValue: 10)),
-                speechFrames: max(1, defaults.integerOrDefault("tf_focusSpeechFrames", defaultValue: 2)),
+                speechFrames: max(1, defaults.integerOrDefault("tf_focusSpeechFrames", defaultValue: 4)),
+                preRollFrames: max(0, defaults.integerOrDefault("tf_focusPreRollFrames", defaultValue: 25)),
                 rearmDelay: defaults.doubleOrDefault("tf_focusRearmDelay", defaultValue: 0.8),
-                pollInterval: defaults.doubleOrDefault("tf_focusPollInterval", defaultValue: 0.35)
+                rearmQuietFrames: max(1, defaults.integerOrDefault("tf_focusRearmQuietFrames", defaultValue: 25)),
+                quietRMSThreshold: Float(defaults.object(forKey: "tf_focusQuietRMSThreshold") as? Double ?? 250),
+                pollInterval: defaults.doubleOrDefault("tf_focusPollInterval", defaultValue: 0.35),
+                noFrameReopen: defaults.doubleOrDefault("tf_focusNoFrameReopen", defaultValue: 1.0)
             )
         }
     }
@@ -47,7 +65,10 @@ final class FocusWakeupController {
     private var isManualRecordingPaused = false
     private var rearmBlockedUntil = Date.distantPast
     private var rmsWindow: [Float] = []
+    private var preRollFrames: [Data] = []
     private var consecutiveSpeechFrames = 0
+    private var consecutiveQuietFrames = 0
+    private var lastFrameAt: Date?
     private var config = Config.load()
 
     /// Creates a controller for focus-based automatic dictation.
@@ -81,7 +102,7 @@ final class FocusWakeupController {
     func stop() {
         timer?.invalidate()
         timer = nil
-        stopAudioMonitoring()
+        stopAudioMonitoring(hideWaiting: true)
         currentFocus = nil
         isFocusRecording = false
     }
@@ -112,7 +133,7 @@ final class FocusWakeupController {
                 DebugFileLogger.log("focus wakeup: editable focus lost")
             }
             currentFocus = nil
-            stopAudioMonitoring()
+            stopAudioMonitoring(hideWaiting: true)
             return
         }
 
@@ -122,6 +143,8 @@ final class FocusWakeupController {
             startAudioMonitoring()
         } else if !isMonitoringAudio {
             startAudioMonitoring()
+        } else {
+            recoverStaleAudioMonitoringIfNeeded()
         }
     }
 
@@ -129,9 +152,12 @@ final class FocusWakeupController {
     private func startAudioMonitoring() {
         guard !isMonitoringAudio else { return }
         rmsWindow = []
+        preRollFrames = []
         consecutiveSpeechFrames = 0
+        consecutiveQuietFrames = 0
+        lastFrameAt = nil
         monitorAudio.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
-        monitorAudio.onAudioChunk = { [weak self] data in
+        monitorAudio.onAudioFrame = { [weak self] data in
             Task { @MainActor in
                 self?.handleMonitorAudio(data)
             }
@@ -139,7 +165,8 @@ final class FocusWakeupController {
         do {
             try monitorAudio.start()
             isMonitoringAudio = true
-            DebugFileLogger.log("focus wakeup: local RMS monitor started")
+            appState?.showFocusWaiting()
+            DebugFileLogger.log("focus wakeup: local RMS monitor started threshold=\(Int(effectiveStartThreshold()))")
         } catch {
             DebugFileLogger.log("focus wakeup: local RMS monitor failed \(error)")
             isMonitoringAudio = false
@@ -147,12 +174,21 @@ final class FocusWakeupController {
     }
 
     /// Stops the local microphone monitor and clears pending RMS state.
-    private func stopAudioMonitoring() {
+    ///
+    /// Args:
+    ///   hideWaiting: Whether a visible focus-waiting bar should be hidden.
+    private func stopAudioMonitoring(hideWaiting: Bool = false) {
         guard isMonitoringAudio else { return }
         monitorAudio.stop()
         isMonitoringAudio = false
         rmsWindow = []
+        preRollFrames = []
         consecutiveSpeechFrames = 0
+        consecutiveQuietFrames = 0
+        lastFrameAt = nil
+        if hideWaiting, appState?.barPhase == .focusWaiting {
+            appState?.cancel()
+        }
         DebugFileLogger.log("focus wakeup: local RMS monitor stopped")
     }
 
@@ -162,6 +198,12 @@ final class FocusWakeupController {
     ///   data: PCM16 little-endian audio bytes captured from the selected microphone.
     private func handleMonitorAudio(_ data: Data) {
         guard currentFocus != nil, !isFocusRecording, !isManualRecordingPaused else { return }
+        lastFrameAt = Date()
+        preRollFrames.append(data)
+        if preRollFrames.count > config.preRollFrames {
+            preRollFrames.removeFirst(preRollFrames.count - config.preRollFrames)
+        }
+
         let rms = Self.rms16(data)
         rmsWindow.append(rms)
         if rmsWindow.count > config.rmsWindowFrames {
@@ -170,20 +212,32 @@ final class FocusWakeupController {
         guard rmsWindow.count >= min(config.rmsWindowFrames, 2) else { return }
 
         let avg = rmsWindow.reduce(0, +) / Float(rmsWindow.count)
-        if avg >= config.startThreshold {
+        if avg <= config.quietRMSThreshold {
+            consecutiveQuietFrames += 1
+        } else {
+            consecutiveQuietFrames = 0
+        }
+
+        let threshold = effectiveStartThreshold()
+        if avg >= threshold {
             consecutiveSpeechFrames += 1
         } else {
             consecutiveSpeechFrames = 0
         }
 
         guard consecutiveSpeechFrames >= config.speechFrames else { return }
-        DebugFileLogger.log("focus wakeup: RMS triggered avg=\(Int(avg)) threshold=\(Int(config.startThreshold))")
-        startFocusRecording()
+        let initialFrames = preRollFrames
+        DebugFileLogger.log("focus wakeup: RMS triggered avg=\(Int(avg)) threshold=\(Int(threshold)) preRollFrames=\(initialFrames.count)")
+        startFocusRecording(initialFrames: initialFrames)
     }
 
     /// Starts an automatic direct dictation session for the current editable focus.
-    private func startFocusRecording() {
+    ///
+    /// Args:
+    ///   initialFrames: PCM16 20ms frames captured immediately before RMS trigger.
+    private func startFocusRecording(initialFrames: [Data]) {
         guard !isFocusRecording else { return }
+        let initialChunks = Self.chunkAudioFrames(initialFrames)
         stopAudioMonitoring()
         isFocusRecording = true
 
@@ -198,30 +252,76 @@ final class FocusWakeupController {
             }
             appState?.currentMode = mode
             appState?.startRecording()
-            await session.startRecording(mode: mode, autoStopOnSilence: true)
+            await session.startRecording(
+                mode: mode,
+                autoStopOnSilence: true,
+                initialAudioChunks: initialChunks
+            )
         }
     }
 
-    /// Finds the current frontmost editable focus, excluding Type4Me itself.
+    /// Restarts the RMS monitor when AVCapture stopped delivering frames.
+    private func recoverStaleAudioMonitoringIfNeeded() {
+        guard isMonitoringAudio, config.noFrameReopen > 0 else { return }
+        guard let lastFrameAt else { return }
+        let idle = Date().timeIntervalSince(lastFrameAt)
+        guard idle >= config.noFrameReopen else { return }
+        DebugFileLogger.log("focus wakeup: monitor stale for \(String(format: "%.2f", idle))s, reopening")
+        stopAudioMonitoring()
+        startAudioMonitoring()
+    }
+
+    /// Resolves the RMS threshold used to enter a focus-triggered recording.
     ///
     /// Returns:
-    ///   A focus signature when an editable element can receive dictated text.
+    ///   A bottom-noise-derived threshold when calibrated, otherwise the
+    ///   configured fallback threshold.
+    private func effectiveStartThreshold() -> Float {
+        if let snapshot = NoiseFloorStore.snapshot() {
+            return max(
+                snapshot.noiseFloor + config.startNoiseMargin,
+                config.minStartRMSThreshold,
+                config.startThresholdFloor
+            )
+        }
+        return max(config.fallbackStartThreshold, config.minStartRMSThreshold)
+    }
+
+    /// Coalesces 20ms pre-roll frames into ASR-sized chunks.
+    ///
+    /// Args:
+    ///   frames: PCM16 20ms frames from the local RMS monitor.
+    ///
+    /// Returns:
+    ///   PCM chunks no larger than the standard 200ms ASR chunk, with a final
+    ///   partial chunk kept when the pre-roll length is not exactly divisible.
+    private static func chunkAudioFrames(_ frames: [Data]) -> [Data] {
+        var pending = Data()
+        var chunks: [Data] = []
+        for frame in frames {
+            pending.append(frame)
+            while pending.count >= AudioCaptureEngine.chunkByteSize {
+                chunks.append(Data(pending.prefix(AudioCaptureEngine.chunkByteSize)))
+                pending.removeFirst(AudioCaptureEngine.chunkByteSize)
+            }
+        }
+        if !pending.isEmpty {
+            chunks.append(pending)
+        }
+        return chunks
+    }
+
+    /// Finds the current frontmost editable focus, excluding mytype itself.
+    ///
+    /// Returns:
+    ///   A focus signature only when the actual AX-focused element is editable.
     private func currentEditableFocus() -> FocusSignature? {
         guard let frontmost = NSWorkspace.shared.frontmostApplication else { return nil }
         guard frontmost.bundleIdentifier != Bundle.main.bundleIdentifier else { return nil }
         let pid = frontmost.processIdentifier
         let app = AXUIElementCreateApplication(pid)
-
-        if let element = copyFocusedElement(from: app),
-           let signature = editableSignature(for: element, pid: pid) {
-            return signature
-        }
-        if let window = copyElementAttribute(app, attribute: kAXFocusedWindowAttribute),
-           let descendant = findEditableDescendant(window),
-           let signature = editableSignature(for: descendant, pid: pid) {
-            return signature
-        }
-        return nil
+        guard let element = copyFocusedElement(from: app) else { return nil }
+        return editableSignature(for: element, pid: pid)
     }
 
     /// Copies the focused UI element from an accessibility application object.
@@ -269,35 +369,6 @@ final class FocusWakeupController {
             ?? stringAttribute(element, kAXDescriptionAttribute)
             ?? ""
         return FocusSignature(pid: pid, role: subrole.isEmpty ? role : "\(role):\(subrole)", identity: identity)
-    }
-
-    /// Searches a focused window subtree for an editable descendant.
-    ///
-    /// Args:
-    ///   root: Root accessibility element to search.
-    ///   depth: Current recursion depth used to bound traversal cost.
-    ///
-    /// Returns:
-    ///   The first editable descendant found within the depth limit.
-    private func findEditableDescendant(_ root: AXUIElement, depth: Int = 0) -> AXUIElement? {
-        guard depth < 6 else { return nil }
-        let role = stringAttribute(root, kAXRoleAttribute) ?? ""
-        let subrole = stringAttribute(root, kAXSubroleAttribute) ?? ""
-        if isEditableRole(role: role, subrole: subrole) {
-            return root
-        }
-
-        var childrenRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(root, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children = childrenRef as? [AXUIElement] else {
-            return nil
-        }
-        for child in children {
-            if let match = findEditableDescendant(child, depth: depth + 1) {
-                return match
-            }
-        }
-        return nil
     }
 
     /// Reads a string accessibility attribute.

@@ -2,19 +2,19 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && /bin/pwd -P)"
-APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/Type4Me.app}"
-APP_NAME="Type4Me"
+APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/mytype.app}"
+APP_NAME="mytype"
 APP_EXECUTABLE="Type4Me"
 APP_ICON_NAME="AppIcon"
-APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.type4me.app}"
+APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.mytype.app}"
 APP_VERSION="${APP_VERSION:-1.9.3}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 VARIANT="${VARIANT:-cloud}"    # cloud or local
 ARCH="${ARCH:-universal}"      # arm64 or universal
-MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-Type4Me 需要访问麦克风以录制语音并将其转换为文本。}"
-SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-Type4Me 需要语音识别权限以将你的语音转写为文字。}"
-APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-Type4Me 需要辅助功能权限来注入转写文字到其他应用}"
+MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-mytype 需要访问麦克风以录制语音并将其转换为文本。}"
+SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-mytype 需要语音识别权限以将你的语音转写为文字。}"
+APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-mytype 需要辅助功能权限来注入转写文字到其他应用}"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
 
 ENTITLEMENTS="$PROJECT_DIR/entitlements.plist"
@@ -107,7 +107,7 @@ cat >"$INFO_PLIST" <<EOF
             <string>${APP_BUNDLE_ID}</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>type4me</string>
+                <string>mytype</string>
             </array>
         </dict>
     </array>
@@ -125,7 +125,10 @@ if [ "$VARIANT" = "local" ]; then
     mkdir -p "$MODELS_DIR"
 
     # SenseVoice int8 model (~229MB)
-    SHERPA_SV_MODEL="$HOME/Library/Application Support/Type4Me/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+    SHERPA_SV_MODEL="$HOME/Library/Application Support/mytype/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+    if [ ! -d "$SHERPA_SV_MODEL" ]; then
+        SHERPA_SV_MODEL="$HOME/Library/Application Support/Type4Me/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+    fi
     if [ -d "$SHERPA_SV_MODEL" ]; then
         echo "Bundling sherpa-onnx SenseVoice int8 model..."
         cp -R "$SHERPA_SV_MODEL" "$MODELS_DIR/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
@@ -136,7 +139,10 @@ if [ "$VARIANT" = "local" ]; then
     fi
 
     # Silero VAD model (~0.6MB)
-    SILERO_VAD_MODEL="$HOME/Library/Application Support/Type4Me/models/silero_vad"
+    SILERO_VAD_MODEL="$HOME/Library/Application Support/mytype/models/silero_vad"
+    if [ ! -d "$SILERO_VAD_MODEL" ]; then
+        SILERO_VAD_MODEL="$HOME/Library/Application Support/Type4Me/models/silero_vad"
+    fi
     if [ -d "$SILERO_VAD_MODEL" ]; then
         echo "Bundling Silero VAD model..."
         cp -R "$SILERO_VAD_MODEL" "$MODELS_DIR/silero_vad"

@@ -2,7 +2,7 @@ import SwiftUI
 
 // MARK: - Recording Sheet Target
 
-private struct RecordingTarget: Identifiable {
+struct RecordingTarget: Identifiable {
     let id: UUID
     let name: String
     let currentStyle: ProcessingMode.HotkeyStyle
@@ -416,7 +416,7 @@ private struct ModeDropDelegate: DropDelegate {
 
 // MARK: - Hotkey Recording Sheet
 
-private struct HotkeyRecordingSheet: View {
+struct HotkeyRecordingSheet: View {
 
     let target: RecordingTarget
     let checkConflict: (Int?, UInt64?) -> ProcessingMode?

@@ -41,7 +41,7 @@ enum AssemblyAIASRError: Error, LocalizedError {
 
 actor AssemblyAIASRClient: SpeechRecognizer {
     private let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "AssemblyAIASRClient"
     )
 

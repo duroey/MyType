@@ -22,6 +22,81 @@ enum AgentLauncherTerminal: String, CaseIterable, Sendable {
     case alacritty
     case wezterm
     case terminal
+
+    var displayName: String {
+        switch self {
+        case .ghostty:
+            return "Ghostty"
+        case .warp:
+            return "Warp"
+        case .iterm2:
+            return "iTerm2"
+        case .kitty:
+            return "Kitty"
+        case .alacritty:
+            return "Alacritty"
+        case .wezterm:
+            return "WezTerm"
+        case .terminal:
+            return "Terminal.app"
+        }
+    }
+
+    private var applicationPaths: [String] {
+        switch self {
+        case .ghostty:
+            return ["/Applications/Ghostty.app"]
+        case .warp:
+            return ["/Applications/Warp.app"]
+        case .iterm2:
+            return ["/Applications/iTerm.app"]
+        case .kitty:
+            return ["/Applications/kitty.app", "/Applications/Kitty.app"]
+        case .alacritty:
+            return ["/Applications/Alacritty.app"]
+        case .wezterm:
+            return ["/Applications/WezTerm.app"]
+        case .terminal:
+            return ["/System/Applications/Utilities/Terminal.app"]
+        }
+    }
+
+    /// Returns whether this terminal is installed.
+    ///
+    /// Args:
+    ///   fileManager: File manager used to check application paths.
+    ///
+    /// Returns:
+    ///   `true` when the app exists, with Terminal.app always available as fallback.
+    func isInstalled(fileManager: FileManager = .default) -> Bool {
+        if self == .terminal {
+            return true
+        }
+        return applicationPaths.contains { fileManager.fileExists(atPath: $0) }
+    }
+
+    /// Resolves the application path to launch.
+    ///
+    /// Args:
+    ///   fileManager: File manager used to prefer an installed path.
+    ///
+    /// Returns:
+    ///   The first installed app path, or the primary known path.
+    func applicationPath(fileManager: FileManager = .default) -> String {
+        applicationPaths.first(where: { fileManager.fileExists(atPath: $0) }) ?? applicationPaths[0]
+    }
+
+    /// Lists installed terminals in launcher priority order.
+    ///
+    /// Args:
+    ///   fileManager: File manager used to check application paths.
+    ///
+    /// Returns:
+    ///   Installed terminal identifiers, always including Terminal.app.
+    static func available(fileManager: FileManager = .default) -> [AgentLauncherTerminal] {
+        let found = allCases.filter { $0.isInstalled(fileManager: fileManager) }
+        return found.contains(.terminal) ? found : found + [.terminal]
+    }
 }
 
 final class AgentLauncherService: @unchecked Sendable {
@@ -31,7 +106,8 @@ final class AgentLauncherService: @unchecked Sendable {
     private let cacheURL: URL
     private let fileManager: FileManager
     private let processRunner: @Sendable ([String]) throws -> Void
-    private let scoreCutoff = 55
+    private let scoreCutoff = 70
+    private let projectCacheRefreshInterval: TimeInterval = 3600
 
     /// Creates a launcher service for routing spoken project names to terminal agents.
     ///
@@ -54,11 +130,7 @@ final class AgentLauncherService: @unchecked Sendable {
         if let cacheURL {
             self.cacheURL = cacheURL
         } else {
-            let supportURL = homeDirectory
-                .appendingPathComponent("Library", isDirectory: true)
-                .appendingPathComponent("Application Support", isDirectory: true)
-                .appendingPathComponent("Type4Me", isDirectory: true)
-            self.cacheURL = supportURL.appendingPathComponent("agent-projects.json")
+            self.cacheURL = AppIdentity.appSupportDirectory().appendingPathComponent("agent-projects.json")
         }
     }
 
@@ -224,8 +296,18 @@ final class AgentLauncherService: @unchecked Sendable {
         return projects
     }
 
+    /// Reads the cached project index when it is still fresh.
+    ///
+    /// Args:
+    ///   None.
+    ///
+    /// Returns:
+    ///   Cached projects, or `nil` when the cache is missing, stale, or invalid.
     private func readCachedProjects() -> [AgentLauncherProject]? {
         guard fileManager.fileExists(atPath: cacheURL.path),
+              let attributes = try? fileManager.attributesOfItem(atPath: cacheURL.path),
+              let modifiedAt = attributes[.modificationDate] as? Date,
+              Date().timeIntervalSince(modifiedAt) < projectCacheRefreshInterval,
               let data = try? Data(contentsOf: cacheURL) else {
             return nil
         }
@@ -406,7 +488,7 @@ final class AgentLauncherService: @unchecked Sendable {
         switch terminal {
         case .ghostty:
             try processRunner([
-                "/usr/bin/open", "-na", "/Applications/Ghostty.app",
+                "/usr/bin/open", "-na", terminal.applicationPath(fileManager: fileManager),
                 "--args", "-e", "/bin/zsh", "-ilc", "\(command); exec $SHELL"
             ])
         case .iterm2:
@@ -428,7 +510,7 @@ final class AgentLauncherService: @unchecked Sendable {
             """)
         case .kitty, .alacritty, .wezterm:
             try processRunner([
-                "/usr/bin/open", "-na", terminalAppPath(for: terminal),
+                "/usr/bin/open", "-na", terminal.applicationPath(fileManager: fileManager),
                 "--args", "-e", "/bin/zsh", "-ilc", "\(command); exec $SHELL"
             ])
         case .terminal:
@@ -453,31 +535,7 @@ final class AgentLauncherService: @unchecked Sendable {
     }
 
     private func terminalExists(_ terminal: AgentLauncherTerminal) -> Bool {
-        switch terminal {
-        case .terminal:
-            return true
-        default:
-            return fileManager.fileExists(atPath: terminalAppPath(for: terminal))
-        }
-    }
-
-    private func terminalAppPath(for terminal: AgentLauncherTerminal) -> String {
-        switch terminal {
-        case .ghostty:
-            return "/Applications/Ghostty.app"
-        case .warp:
-            return "/Applications/Warp.app"
-        case .iterm2:
-            return "/Applications/iTerm.app"
-        case .kitty:
-            return "/Applications/kitty.app"
-        case .alacritty:
-            return "/Applications/Alacritty.app"
-        case .wezterm:
-            return "/Applications/WezTerm.app"
-        case .terminal:
-            return "/System/Applications/Utilities/Terminal.app"
-        }
+        terminal.isInstalled(fileManager: fileManager)
     }
 
     private func runAppleScript(_ source: String) throws {

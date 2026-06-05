@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 // MARK: - Panel Subclass
 
 /// A non-activating floating panel that rides underneath the System Settings
-/// window, carrying a draggable representation of Type4Me.app so the user
+/// window, carrying a draggable representation of mytype.app so the user
 /// can drop it directly into the Accessibility list.
 ///
 /// Shadow is painted entirely inside the SwiftUI content (via a soft shadow
@@ -41,7 +41,7 @@ final class PermissionDragPanel: NSPanel {
 /// The visual content of the drag overlay. The app icon is wrapped in a
 /// SwiftUI `.onDrag` so any file-drop target (including the System Settings
 /// Accessibility list) receives a `public.file-url` pointing at the live
-/// `Type4Me.app` bundle. macOS's TCC registration treats a dropped app
+/// `mytype.app` bundle. macOS's TCC registration treats a dropped app
 /// bundle the same as adding it via the "+" button, which is why this
 /// shortcut works.
 private struct PermissionDragOverlayView: View {
@@ -93,7 +93,7 @@ private struct PermissionDragOverlayView: View {
         .preferredColorScheme(.light)
     }
 
-    /// Builds "拖 Type4Me 到上方列表以允许辅助功能" with the app and permission
+    /// Builds "拖 mytype 到上方列表以允许辅助功能" with the app and permission
     /// names emphasized, matching the Codex Computer Use visual pattern.
     private var instructionText: Text {
         Text(L("拖 ", "Drag "))
@@ -123,7 +123,7 @@ private struct PermissionDragOverlayView: View {
         )
         // Attaching `onDrag` here makes the whole chip a drag source — the
         // explicit "grab-me" surface Codex relies on. The pasteboard writes
-        // the live `Type4Me.app` bundle URL so the target (System Settings
+        // the live `mytype.app` bundle URL so the target (System Settings
         // Accessibility list) gets a real file-URL drop, which TCC treats
         // the same as the "+" button's file-picker result.
         .onDrag {

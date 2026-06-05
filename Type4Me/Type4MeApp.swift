@@ -7,7 +7,7 @@ struct Type4MeApp: App {
 
     var body: some Scene {
         MenuBarExtra(
-            "Type4Me",
+            "mytype",
             systemImage: appDelegate.appState.barPhase == .hidden ? "mic" : "mic.fill"
         ) {
             MenuBarContent()
@@ -15,7 +15,7 @@ struct Type4MeApp: App {
                 .environment(appDelegate.appUpdater)
         }
 
-        Window(L("Type4Me 设置", "Type4Me Settings"), id: "settings") {
+        Window(L("mytype 设置", "mytype Settings"), id: "settings") {
             SettingsView()
                 .environment(appDelegate.appState)
                 .environment(appDelegate.appUpdater)
@@ -24,7 +24,7 @@ struct Type4MeApp: App {
         .defaultPosition(.center)
         .windowStyle(.hiddenTitleBar)
 
-        Window(L("Type4Me 设置向导", "Type4Me Setup"), id: "setup") {
+        Window(L("mytype 设置向导", "mytype Setup"), id: "setup") {
             SetupWizardView()
                 .environment(appDelegate.appState)
                 .environment(appDelegate.appUpdater)
@@ -34,7 +34,7 @@ struct Type4MeApp: App {
         .defaultPosition(.center)
         .windowStyle(.hiddenTitleBar)
 
-        Window(L("Type4Me 授权引导", "Type4Me Permissions"), id: "permission-guide") {
+        Window(L("mytype 授权引导", "mytype Permissions"), id: "permission-guide") {
             PermissionGuideView(model: appDelegate.permissionGuideModel)
                 .frame(minWidth: 520, idealWidth: 560, minHeight: 460, idealHeight: 480)
         }
@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let session = RecognitionSession()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSLog("[Type4Me] applicationDidFinishLaunching")
+        NSLog("[mytype] applicationDidFinishLaunching")
         // Restore system volume if previous session crashed while volume was lowered
         SystemVolumeManager.restoreIfNeeded()
         #if HAS_CLOUD_SUBSCRIPTION
@@ -115,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             await session.setOnAutoCancel {
                 Task { @MainActor in
-                    appState.cancel()
+                    appState.showFocusWaiting()
                     focusWakeupController.sessionDidFinish()
                 }
             }
@@ -126,7 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor in
                     switch event {
                     case .ready:
-                        NSLog("[Type4Me] ready event received")
+                        NSLog("[mytype] ready event received")
                         DebugFileLogger.log("ready event received, current barPhase=\(String(describing: appState.barPhase))")
                         appState.markRecordingReady()
                         Task { @MainActor in
@@ -134,7 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 DebugFileLogger.log("playStart aborted, barPhase=\(String(describing: appState.barPhase))")
                                 return
                             }
-                            NSLog("[Type4Me] playStart firing")
+                            NSLog("[mytype] playStart firing")
                             DebugFileLogger.log("playStart firing")
                             // BT wake-up preamble is baked into the sound buffer itself.
                             SoundFeedback.playStart()
@@ -151,6 +151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                     case .transcript(let transcript):
                         appState.setLiveTranscript(transcript)
+                        if appState.barPhase == .focusWaiting,
+                           !transcript.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            appState.markRecordingReady()
+                        }
                     case .completed:
                         appState.stopRecording()
                         if await session.stoppedByMaxDuration {
@@ -207,6 +211,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        NotificationCenter.default.addObserver(
+            forName: .focusWakeupSettingDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.syncFocusWakeupState()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .noiseFloorCalibrationWillStart,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.focusWakeupController?.stop()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .noiseFloorCalibrationDidFinish,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.syncFocusWakeupState()
+            }
+        }
+
         // Suppress/resume hotkeys during hotkey recording
         NotificationCenter.default.addObserver(
             forName: .hotkeyRecordingDidStart,
@@ -230,7 +264,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.startHotkeyWithRetry()
-            self.focusWakeupController?.start()
+            Task {
+                await NoiseFloorCalibrator.calibrateIfNeeded()
+                await MainActor.run {
+                    self.syncFocusWakeupState()
+                }
+            }
         }
 
         // Show setup wizard on first launch
@@ -283,6 +322,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotkeys(for: provider)
     }
 
+    /// Applies the current focus wakeup setting to the live controller.
+    private func syncFocusWakeupState() {
+        let defaults = UserDefaults.standard
+        let enabled = defaults.object(forKey: "tf_focusWakeupEnabled") == nil
+            ? true
+            : defaults.bool(forKey: "tf_focusWakeupEnabled")
+        if enabled {
+            focusWakeupController?.start()
+        } else {
+            focusWakeupController?.stop()
+            if appState.barPhase == .focusWaiting {
+                appState.cancel()
+            }
+        }
+    }
+
     private func registerHotkeys(for provider: ASRProvider) {
         let availableModes = appState.availableModes
         let modes = ASRProviderRegistry.supportedModes(from: availableModes, for: provider)
@@ -303,7 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Safety: if already recording, the toggle state is out of sync.
                     // Redirect to stop so we don't discard accumulated text.
                     if phase == .recording || phase == .preparing {
-                        NSLog("[Type4Me] >>> HOTKEY: toggle desync – onStart while recording, redirecting to STOP (phase=%@)", String(describing: phase))
+                        NSLog("[mytype] >>> HOTKEY: toggle desync – onStart while recording, redirecting to STOP (phase=%@)", String(describing: phase))
                         DebugFileLogger.log("hotkey toggle desync: onStart while recording, redirecting to stop phase=\(phase)")
                         MainActor.assumeIsolated { self.hotkeyManager.resetActiveState() }
                         MainActor.assumeIsolated { self.appState.stopRecording() }
@@ -318,7 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Block new recording while LLM/injection is still in progress.
                     // The current session must finish (paste + history save) before a new one can start.
                     if phase == .processing {
-                        NSLog("[Type4Me] >>> HOTKEY: onStart blocked – still processing")
+                        NSLog("[mytype] >>> HOTKEY: onStart blocked – still processing")
                         DebugFileLogger.log("hotkey onStart blocked: still processing")
                         MainActor.assumeIsolated { self.hotkeyManager.resetActiveState() }
                         return
@@ -327,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let selectedProvider = KeychainService.selectedASRProvider
                     let resolvedMode = ASRProviderRegistry.resolvedMode(for: capturedMode, provider: selectedProvider)
                     let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
-                    NSLog("[Type4Me] >>> HOTKEY: Record START (mode: %@)", effectiveMode.name)
+                    NSLog("[mytype] >>> HOTKEY: Record START (mode: %@)", effectiveMode.name)
                     DebugFileLogger.log("hotkey record start mode=\(effectiveMode.name)")
                     Task { @MainActor in
                         self.focusWakeupController?.pauseForManualRecording()
@@ -338,7 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         // Wait for previous session to fully clean up before starting
                         let ready = await self.session.awaitIdle()
                         if !ready {
-                            NSLog("[Type4Me] >>> HOTKEY: previous session did not reach idle in time")
+                            NSLog("[mytype] >>> HOTKEY: previous session did not reach idle in time")
                             DebugFileLogger.log("hotkey start: awaitIdle timed out")
                         }
                         await self.session.startRecording(mode: effectiveMode)
@@ -348,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self else { return }
 
                     let phase = MainActor.assumeIsolated { self.appState.barPhase }
-                    NSLog("[Type4Me] >>> HOTKEY: Record STOP (phase=%@)", String(describing: phase))
+                    NSLog("[mytype] >>> HOTKEY: Record STOP (phase=%@)", String(describing: phase))
                     DebugFileLogger.log("hotkey record stop phase=\(phase)")
                     MainActor.assumeIsolated { self.appState.stopRecording() }
                     if phase == .preparing {
@@ -369,7 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let selectedProvider = KeychainService.selectedASRProvider
             let resolvedMode = ASRProviderRegistry.resolvedMode(for: newMode, provider: selectedProvider)
             let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
-            NSLog("[Type4Me] >>> HOTKEY: Cross-mode stop → %@", effectiveMode.name)
+            NSLog("[mytype] >>> HOTKEY: Cross-mode stop → %@", effectiveMode.name)
             DebugFileLogger.log("hotkey cross-mode stop → \(effectiveMode.name)")
             MainActor.assumeIsolated {
                 self.appState.currentMode = effectiveMode
@@ -381,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // ESC abort: skip injection but let recognition/clipboard/history proceed.
+        // ESC cancel: discard the current MyType session without injecting text.
         // Returns true if the abort was actually handled (ESC should be swallowed).
         hotkeyManager.onESCAbort = { [weak self] in
             guard let self else { return false }
@@ -389,17 +444,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard phase == .recording || phase == .processing || phase == .preparing else {
                 return false  // Not in an active session, let ESC pass through
             }
-            NSLog("[Type4Me] >>> HOTKEY: ESC abort injection (phase=%@)", String(describing: phase))
-            DebugFileLogger.log("hotkey ESC abort injection phase=\(phase)")
-            MainActor.assumeIsolated { self.appState.stopRecording() }
-            if phase == .preparing {
-                Task { await self.session.cancelRecording() }
-            } else {
-                Task {
-                    await self.session.abortInjection()
-                    await self.session.stopRecording()
-                }
+            NSLog("[mytype] >>> HOTKEY: ESC cancel session (phase=%@)", String(describing: phase))
+            DebugFileLogger.log("hotkey ESC cancel session phase=\(phase)")
+            MainActor.assumeIsolated {
+                self.appState.cancel()
+                self.focusWakeupController?.sessionDidFinish()
+                self.hotkeyManager.isProcessing = false
+                self.safeResetHotkeyState()
             }
+            Task { await self.session.cancelCurrentSession() }
             return true
         }
 
@@ -425,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startHotkeyWithRetry() {
         let success = hotkeyManager.start()
-        NSLog("[Type4Me] Hotkey setup: %@", success ? "OK" : "FAILED (need Accessibility permission)")
+        NSLog("[mytype] Hotkey setup: %@", success ? "OK" : "FAILED (need Accessibility permission)")
 
         if success {
             retryTimer?.invalidate()
@@ -464,7 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if PermissionManager.hasAccessibilityPermission {
             let ok = hotkeyManager.start()
             hotkeyRetryCount += 1
-            NSLog("[Type4Me] Hotkey retry #%d: %@", hotkeyRetryCount, ok ? "OK" : "still failing")
+            NSLog("[mytype] Hotkey retry #%d: %@", hotkeyRetryCount, ok ? "OK" : "still failing")
             if ok {
                 timer.invalidate()
                 retryTimer = nil
@@ -475,7 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 timer.invalidate()
                 retryTimer = nil
                 hotkeyRetryCount = 0
-                NSLog("[Type4Me] Accessibility granted but hotkey tap failed after retries. Suggesting restart.")
+                NSLog("[mytype] Accessibility granted but hotkey tap failed after retries. Suggesting restart.")
                 showRestartAlert()
             }
         }
@@ -485,7 +538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = NSLocalizedString("辅助功能权限已开启，但快捷键未生效", comment: "")
         alert.informativeText = NSLocalizedString(
-            "macOS 有时需要重启应用才能激活全局快捷键。点击「重启」自动重启 Type4Me。",
+            "macOS 有时需要重启应用才能激活全局快捷键。点击「重启」自动重启 mytype。",
             comment: ""
         )
         alert.addButton(withTitle: NSLocalizedString("重启", comment: ""))
@@ -559,7 +612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard !isVisible else { return }
 
-        NSLog("[Type4Me] Menu bar icon appears hidden by system settings")
+        NSLog("[mytype] Menu bar icon appears hidden by system settings")
 
         let alert = NSAlert()
         alert.messageText = L(
@@ -567,8 +620,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "Menu Bar Icon Hidden"
         )
         alert.informativeText = L(
-            "macOS 的菜单栏设置可能隐藏了 Type4Me 图标。\n\n请前往 系统设置 > 菜单栏，在「允许在菜单栏中显示」列表中开启 Type4Me。",
-            "macOS may have hidden the Type4Me icon.\n\nGo to System Settings > Menu Bar and enable Type4Me in the 'Allow in Menu Bar' list."
+            "macOS 的菜单栏设置可能隐藏了 mytype 图标。\n\n请前往 系统设置 > 菜单栏，在「允许在菜单栏中显示」列表中开启 mytype。",
+            "macOS may have hidden the mytype icon.\n\nGo to System Settings > Menu Bar and enable mytype in the 'Allow in Menu Bar' list."
         )
         alert.alertStyle = .warning
         alert.addButton(withTitle: L("打开系统设置", "Open System Settings"))
@@ -618,19 +671,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
-            guard url.scheme == "type4me" else { continue }
+            guard url.scheme == "mytype" else { continue }
             switch url.host {
             case "reload-vocabulary":
-                NSLog("[Type4Me] URL command: reload-vocabulary")
+                NSLog("[mytype] URL command: reload-vocabulary")
                 SnippetStorage.invalidateCache()
                 HotwordStorage.invalidateCache()
                 NotificationCenter.default.post(name: SnippetStorage.didChangeNotification, object: nil)
                 NotificationCenter.default.post(name: HotwordStorage.didChangeNotification, object: nil)
                 SenseVoiceServerManager.syncHotwordsAndRestart()
             case "auth":
-                NSLog("[Type4Me] URL command: auth (no-op, code-based auth now)")
+                NSLog("[mytype] URL command: auth (no-op, code-based auth now)")
             default:
-                NSLog("[Type4Me] Unknown URL command: \(url)")
+                NSLog("[mytype] Unknown URL command: \(url)")
             }
         }
     }
@@ -734,7 +787,7 @@ struct MenuBarContent: View {
 
         Divider()
 
-        Button(L("退出 Type4Me", "Quit Type4Me")) {
+        Button(L("退出 mytype", "Quit mytype")) {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q", modifiers: .command)
@@ -755,6 +808,7 @@ struct MenuBarContent: View {
 
     private var statusColor: Color {
         switch appState.barPhase {
+        case .focusWaiting: return TF.focusWaiting
         case .preparing: return TF.recording
         case .recording: return TF.recording
         case .processing: return TF.amber
@@ -766,6 +820,7 @@ struct MenuBarContent: View {
 
     private var statusText: String {
         switch appState.barPhase {
+        case .focusWaiting: return L("等待声音", "Waiting")
         case .preparing: return L("录制中", "Recording")
         case .recording: return L("录制中", "Recording")
         case .processing: return appState.effectiveProcessingLabel

@@ -41,7 +41,7 @@ enum ASRIdentityStore {
             return existing
         }
 
-        let newValue = "type4me-\(UUID().uuidString.lowercased())"
+        let newValue = "mytype-\(UUID().uuidString.lowercased())"
         UserDefaults.standard.set(newValue, forKey: key)
         return newValue
     }

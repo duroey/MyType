@@ -22,7 +22,7 @@ final class AppUpdater {
     /// Detected once at init
     let isLocalInstallation: Bool
 
-    private let logger = Logger(subsystem: "com.type4me", category: "AppUpdater")
+    private let logger = Logger(subsystem: "com.mytype", category: "AppUpdater")
     private var downloadSession: URLSession?
     private var downloadTask: URLSessionDownloadTask?
     private var resumeData: Data?
@@ -31,8 +31,7 @@ final class AppUpdater {
     // MARK: - Directories
 
     private var stagingDir: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("Type4Me/Updates")
+        AppIdentity.appSupportDirectory().appendingPathComponent("Updates", isDirectory: true)
     }
 
     private var updateLogURL: URL { stagingDir.appendingPathComponent("update.log") }
@@ -175,7 +174,7 @@ final class AppUpdater {
     // MARK: - Download
 
     private func dmgPath(for version: String) -> URL {
-        stagingDir.appendingPathComponent("Type4Me-v\(version)-cloud.dmg")
+        stagingDir.appendingPathComponent("mytype-v\(version)-cloud.dmg")
     }
 
     private func startDownload(url: URL, release: UpdateInfo) {
@@ -329,7 +328,7 @@ final class AppUpdater {
         set -euo pipefail
         LOG="\(stagingDir)/update.log"
         exec > "$LOG" 2>&1
-        echo "Type4Me updater started at $(date)"
+        echo "mytype updater started at $(date)"
 
         # Wait for app to exit
         while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.2; done
@@ -350,13 +349,13 @@ final class AppUpdater {
         # Find .app in DMG
         NEW_APP=$(find "$MOUNT_POINT" -maxdepth 1 -name "*.app" -type d | head -1)
         if [ -z "$NEW_APP" ] || [ ! -d "$NEW_APP" ]; then
-            echo "ERROR: Type4Me.app not found in DMG"
+            echo "ERROR: mytype.app not found in DMG"
             exit 1
         fi
         echo "Found: $NEW_APP"
 
         # Backup current app
-        BACKUP_PATH="$STAGING_DIR/Type4Me-backup.app"
+        BACKUP_PATH="$STAGING_DIR/mytype-backup.app"
         rm -rf "$BACKUP_PATH"
         echo "Backing up $APP_PATH..."
         cp -R "$APP_PATH" "$BACKUP_PATH"

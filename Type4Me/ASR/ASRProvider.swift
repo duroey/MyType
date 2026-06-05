@@ -23,7 +23,7 @@ enum ASRProvider: String, CaseIterable, Codable, Sendable {
     case baidu
     case iflytek
     #if HAS_CLOUD_SUBSCRIPTION
-    // Cloud proxy (Type4Me Cloud subscription)
+    // Cloud proxy (mytype Cloud subscription)
     case cloud
     #endif
     // Fallback
@@ -48,7 +48,7 @@ enum ASRProvider: String, CaseIterable, Codable, Sendable {
         case .baidu:    return L("百度智能云", "Baidu AI Cloud")
         case .iflytek:  return L("讯飞", "iFLYTEK")
         #if HAS_CLOUD_SUBSCRIPTION
-        case .cloud:    return "Type4Me Cloud"
+        case .cloud:    return "mytype Cloud"
         #endif
         case .custom:   return L("自定义", "Custom")
         }

@@ -9,7 +9,7 @@ struct AboutTab: View {
         VStack(alignment: .leading, spacing: 0) {
             SettingsSectionHeader(
                 label: "ABOUT",
-                title: L("关于 Type4Me", "About Type4Me"),
+                title: L("关于 mytype", "About mytype"),
                 description: L("语音，流畅输入。基于火山引擎大模型语音识别的 macOS 原生输入工具。", "Voice to text, seamlessly. A native macOS input tool powered by large-model ASR.")
             )
 
@@ -34,12 +34,12 @@ struct AboutTab: View {
             // Links
             HStack(spacing: 12) {
                 linkButton("GitHub", icon: "chevron.left.forwardslash.chevron.right") {
-                    if let url = URL(string: "https://github.com/joewongjc/type4me") {
+                    if let url = URL(string: "https://github.com/duroey/mytype-native") {
                         NSWorkspace.shared.open(url)
                     }
                 }
                 linkButton(L("反馈", "Feedback"), icon: "envelope") {
-                    if let url = URL(string: "https://github.com/joewongjc/type4me/issues") {
+                    if let url = URL(string: "https://github.com/duroey/mytype-native/issues") {
                         NSWorkspace.shared.open(url)
                     }
                 }
@@ -115,7 +115,7 @@ struct AboutTab: View {
 
                 // GitHub link as secondary option
                 Button {
-                    if let url = URL(string: "https://github.com/joewongjc/type4me/releases") {
+                    if let url = URL(string: "https://github.com/duroey/mytype-native/releases") {
                         NSWorkspace.shared.open(url)
                     }
                 } label: {
@@ -199,7 +199,7 @@ struct AboutTab: View {
                 }
                 .buttonStyle(.plain)
 
-                Text(L("Type4Me 将关闭并自动重启", "Type4Me will close and restart automatically"))
+                Text(L("mytype 将关闭并自动重启", "mytype will close and restart automatically"))
                     .font(.system(size: 10))
                     .foregroundStyle(TF.settingsTextTertiary)
             }

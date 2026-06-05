@@ -52,8 +52,8 @@ struct AccountTab: View, SettingsCardHelpers {
             label: "ACCOUNT",
             title: L("账户", "Account"),
             description: L(
-                "登录后即可使用 Type4Me Cloud 语音识别和文本处理服务。",
-                "Sign in to use Type4Me Cloud voice recognition and text processing."
+                "登录后即可使用 mytype Cloud 语音识别和文本处理服务。",
+                "Sign in to use mytype Cloud voice recognition and text processing."
             )
         )
 

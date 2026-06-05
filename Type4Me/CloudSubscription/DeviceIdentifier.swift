@@ -23,7 +23,7 @@ enum DeviceIdentifier {
     }
 
     private static func keychainFallbackUUID() -> String {
-        let service = "com.type4me.device-id"
+        let service = "com.mytype.device-id"
         let account = "device-uuid"
 
         let query: [String: Any] = [

@@ -24,7 +24,7 @@ enum BailianASRError: Error, LocalizedError {
 actor BailianASRClient: SpeechRecognizer {
 
     private let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "BailianASRClient"
     )
 

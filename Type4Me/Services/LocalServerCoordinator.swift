@@ -8,7 +8,7 @@ class LocalServerCoordinator {
     var isRunning = false
     var isStarting = false
 
-    private let logger = Logger(subsystem: "com.type4me.server", category: "Coordinator")
+    private let logger = Logger(subsystem: "com.mytype.server", category: "Coordinator")
 
     /// Ensure server is running. No-op if already started.
     func ensureRunning() async {

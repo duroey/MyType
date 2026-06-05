@@ -20,7 +20,7 @@ actor VolcASRClient: SpeechRecognizer {
         URL(string: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async")!
 
     private let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "VolcASRClient"
     )
 

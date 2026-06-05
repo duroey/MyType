@@ -50,6 +50,8 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     private var capsuleWidth: CGFloat {
         switch state.barPhase {
+        case .focusWaiting:
+            return 8
         case .preparing:
             return TF.barHeight
         case .recording:
@@ -93,8 +95,12 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 }
             }
         }
-        .padding(.bottom, 16)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .padding(.bottom, state.barPhase == .focusWaiting ? 0 : 16)
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: state.barPhase == .focusWaiting ? .center : .bottom
+        )
         .animation(TF.springSnappy, value: state.barPhase != .hidden)
         .animation(TF.springSnappy, value: showTranscriptPopup)
         .onChange(of: state.barPhase) { _, newPhase in
@@ -123,17 +129,25 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     // MARK: - Capsule Container
 
+    @ViewBuilder
     private var capsuleBar: some View {
-        barContent
-            .animation(TF.springSnappy, value: state.barPhase)
-            .frame(width: capsuleWidth, height: TF.barHeight)
-            .clipShape(Capsule())
-            .background {
-                capsuleBackground
-                    .clipShape(Capsule())
-            }
-            .shadow(color: Color(white: 0.08, opacity: 0.5), radius: 5, x: 0, y: 0)
-            .animation(TF.springSnappy, value: state.barPhase)
+        if state.barPhase == .focusWaiting {
+            FocusWaitingDot()
+                .frame(width: 8, height: 8)
+                .shadow(color: TF.focusWaiting.opacity(0.45), radius: 2, x: 0, y: 0)
+                .animation(TF.springSnappy, value: state.barPhase)
+        } else {
+            barContent
+                .animation(TF.springSnappy, value: state.barPhase)
+                .frame(width: capsuleWidth, height: TF.barHeight)
+                .clipShape(Capsule())
+                .background {
+                    capsuleBackground
+                        .clipShape(Capsule())
+                }
+                .shadow(color: Color(white: 0.08, opacity: 0.5), radius: 5, x: 0, y: 0)
+                .animation(TF.springSnappy, value: state.barPhase)
+        }
     }
 
     // MARK: - Content by Phase
@@ -141,6 +155,12 @@ struct FloatingBarView<S: FloatingBarState>: View {
     @ViewBuilder
     private var barContent: some View {
         switch state.barPhase {
+        case .focusWaiting:
+            focusWaitingContent
+                .transition(.asymmetric(
+                    insertion: .scale(scale: 0.92).combined(with: .opacity),
+                    removal: .opacity
+                ))
         case .preparing:
             preparingContent
                 .transition(.asymmetric(
@@ -174,6 +194,11 @@ struct FloatingBarView<S: FloatingBarState>: View {
         case .hidden:
             EmptyView()
         }
+    }
+
+    private var focusWaitingContent: some View {
+        FocusWaitingDot()
+            .frame(maxWidth: .infinity)
     }
 
     private var preparingContent: some View {
@@ -267,6 +292,15 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     .transition(.opacity)
             }
 
+            if state.barPhase == .focusWaiting {
+                LinearGradient(
+                    colors: [TF.focusWaiting.opacity(0.18), .clear],
+                    startPoint: .leading,
+                    endPoint: UnitPoint(x: 0.62, y: 0.5)
+                )
+                .transition(.opacity)
+            }
+
             if state.barPhase == .processing || state.barPhase == .done {
                 ProcessingProgress(
                     finishTime: state.processingFinishTime,
@@ -294,6 +328,8 @@ struct FloatingBarView<S: FloatingBarState>: View {
 
     private var borderColor: Color {
         switch state.barPhase {
+        case .focusWaiting:
+            TF.focusWaiting.opacity(breathe ? 0.32 : 0.13)
         case .preparing:
             .white.opacity(0.04)
         case .recording:
@@ -316,10 +352,18 @@ struct FloatingBarView<S: FloatingBarState>: View {
         // NSTrackingArea suspends events when the view is hidden (panel orderOut)
         // instead of firing mouseExited, so isHovered would otherwise leak across
         // recording sessions and auto-show the popup without any actual hover.
-        if phase == .preparing || phase == .hidden {
+        if phase == .preparing || phase == .focusWaiting || phase == .hidden {
             isHovered = false
         }
         switch phase {
+        case .focusWaiting:
+            recordingPeakWidth = TF.barHeight
+            processingStartDate = nil
+            doneStartDate = nil
+            breathe = false
+            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+                breathe = true
+            }
         case .preparing:
             recordingPeakWidth = TF.barHeight
             processingStartDate = nil
@@ -379,7 +423,19 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 }
 
-// MARK: - Recording Dot
+// MARK: - Focus Waiting Dot
+
+/// Blue pulse dot used while a focused input is armed but speech has not started.
+struct FocusWaitingDot: View {
+
+    var body: some View {
+        Circle()
+            .fill(TF.focusWaiting)
+            .frame(width: 8, height: 8)
+    }
+}
+
+// MARK: - Preparing Dot
 
 struct PreparingDot: View {
 

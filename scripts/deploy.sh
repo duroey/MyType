@@ -2,29 +2,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && /bin/pwd -P)"
-APP_PATH="${APP_PATH:-/Applications/Type4Me.app}"
-APP_NAME="Type4Me"
+APP_PATH="${APP_PATH:-/Applications/mytype.app}"
+APP_NAME="mytype"
 LAUNCH_APP="${LAUNCH_APP:-1}"
 
-echo "Stopping Type4Me..."
+echo "Stopping mytype..."
 osascript -e "quit app \"$APP_NAME\"" 2>/dev/null || true
 sleep 1
 
 APP_PATH="$APP_PATH" bash "$SCRIPT_DIR/package-app.sh"
 
-# Update Keychain partition lists so Type4Me can access its stored credentials
+# Update Keychain partition lists so mytype can access its stored credentials
 # without prompting after re-sign. Asks for Keychain password once.
 NEW_CDHASH=$(codesign -dvvv "$APP_PATH" 2>&1 | grep "^CDHash=" | cut -d= -f2)
 TEAM_ID=$(codesign -dvvv "$APP_PATH" 2>&1 | grep "^TeamIdentifier=" | cut -d= -f2)
 if [ -n "$NEW_CDHASH" ]; then
-    # Collect all Type4Me keychain accounts: parse acct+svce pairs from dump.
+    # Collect all mytype keychain accounts: parse acct+svce pairs from dump.
     # Entry format: label (0x00000007) appears first, then acct, then svce.
     T4M_ITEMS=()
     while IFS= read -r line; do
         T4M_ITEMS+=("$line")
     done < <(security dump-keychain -a 2>/dev/null | awk '
         /"acct"/ { gsub(/.*="/, ""); gsub(/"$/, ""); acct=$0 }
-        /"svce".*"com\.type4me\.(grouped|scalar)"/ { gsub(/.*="/, ""); gsub(/"$/, ""); if(acct) print $0 "|" acct; acct="" }
+        /"svce".*"com\.mytype\.(grouped|scalar)"/ { gsub(/.*="/, ""); gsub(/"$/, ""); if(acct) print $0 "|" acct; acct="" }
     ')
 
     if [ ${#T4M_ITEMS[@]} -gt 0 ]; then
@@ -37,7 +37,7 @@ if [ -n "$NEW_CDHASH" ]; then
 
         if [ "$NEEDS_UPDATE" = "1" ]; then
             echo "Updating Keychain partition lists (${#T4M_ITEMS[@]} items)..."
-            KC_PASS_FILE="$HOME/.type4me-kc-pass"
+            KC_PASS_FILE="$HOME/.mytype-kc-pass"
             if [ -n "${KC_PASS:-}" ]; then
                 : # already set via env var
             elif [ -f "$KC_PASS_FILE" ]; then

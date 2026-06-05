@@ -32,7 +32,7 @@ struct UpdateInfo: Codable, Identifiable {
     /// Resolved DMG download URL (explicit or fallback from version)
     var resolvedDmgURL: URL {
         if let urlStr = cloudDmgURL, let url = URL(string: urlStr) { return url }
-        return URL(string: "https://github.com/joewongjc/type4me/releases/download/v\(version)/Type4Me-v\(version)-cloud.dmg")!
+        return URL(string: "https://github.com/duroey/mytype-native/releases/download/v\(version)/mytype-v\(version)-cloud.dmg")!
     }
 
     /// Human-readable download size (e.g. "23.5 MB")
@@ -56,7 +56,7 @@ final class UpdateChecker {
 
     static let shared = UpdateChecker()
 
-    private let url = URL(string: "https://raw.githubusercontent.com/joewongjc/type4me/main/updates.json")!
+    private let url = URL(string: "https://raw.githubusercontent.com/duroey/mytype-native/main/updates.json")!
     private let checkIntervalKey = "tf_lastUpdateCheck"
     private let seenVersionKey = "tf_lastSeenVersion"
     private let checkInterval: TimeInterval = 24 * 60 * 60 // 24 hours

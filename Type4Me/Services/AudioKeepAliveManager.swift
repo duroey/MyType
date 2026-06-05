@@ -6,8 +6,8 @@ import os
 /// Microphone keep-alive runs a lightweight AVCaptureSession.
 enum AudioKeepAliveManager {
 
-    private static let logger = Logger(subsystem: "com.type4me.keepalive", category: "AudioKeepAlive")
-    private static let queue = DispatchQueue(label: "com.type4me.keepalive.mic", qos: .background)
+    private static let logger = Logger(subsystem: "com.mytype.keepalive", category: "AudioKeepAlive")
+    private static let queue = DispatchQueue(label: "com.mytype.keepalive.mic", qos: .background)
 
     nonisolated(unsafe) private static var micSession: AVCaptureSession?
 

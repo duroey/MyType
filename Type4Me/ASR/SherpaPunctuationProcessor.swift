@@ -11,7 +11,7 @@ import os
 final class SherpaPunctuationProcessor: @unchecked Sendable {
 
     private let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "Punctuation"
     )
 

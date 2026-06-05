@@ -24,7 +24,7 @@ enum BaiduASRError: Error, LocalizedError {
 actor BaiduASRClient: SpeechRecognizer {
 
     private let logger = Logger(
-        subsystem: "com.type4me.asr",
+        subsystem: "com.mytype.asr",
         category: "BaiduASRClient"
     )
 

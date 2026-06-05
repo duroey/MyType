@@ -3,7 +3,7 @@ import os
 
 actor ClaudeChatClient: LLMClient {
 
-    private let logger = Logger(subsystem: "com.type4me.llm", category: "ClaudeChatClient")
+    private let logger = Logger(subsystem: "com.mytype.llm", category: "ClaudeChatClient")
 
     private var session: URLSession {
         let config = URLSessionConfiguration.default

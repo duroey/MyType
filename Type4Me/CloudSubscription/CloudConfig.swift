@@ -1,4 +1,4 @@
-// Type4Me/Auth/CloudConfig.swift
+// mytype/Auth/CloudConfig.swift
 
 import Foundation
 
@@ -9,7 +9,7 @@ enum CloudRegion: String, Codable {
 
 enum CloudConfig {
     // API endpoints
-    // TODO: switch to domain names before release (cn.api.type4me.com / us.api.type4me.com)
+    // TODO: switch to domain names before release (cn.api.mytype.com / us.api.mytype.com)
     static let cnAPIEndpoint = "http://115.190.217.85"
     static let usAPIEndpoint = "http://149.248.20.226"
 

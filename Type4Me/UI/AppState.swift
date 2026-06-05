@@ -4,6 +4,7 @@ import SwiftUI
 
 enum FloatingBarPhase: Equatable {
     case hidden
+    case focusWaiting
     case preparing
     case recording
     case processing
@@ -653,6 +654,7 @@ final class AppState {
 
     @ObservationIgnored var onShowPanel: (() -> Void)?
     @ObservationIgnored var onHidePanel: (() -> Void)?
+    @ObservationIgnored var onUpdatePanelLayout: (() -> Void)?
 
     // MARK: Update Check
 
@@ -692,16 +694,27 @@ final class AppState {
         onShowPanel?()
     }
 
+    func showFocusWaiting() {
+        segments = []
+        audioLevel.current = 0
+        recordingStartDate = nil
+        feedbackMessage = L("已完成", "Done")
+        processingLabelOverride = nil
+        barPhase = .focusWaiting
+        onShowPanel?()
+    }
+
     func markRecordingReady() {
-        guard barPhase == .preparing else { return }
+        guard barPhase == .preparing || barPhase == .focusWaiting else { return }
         audioLevel.current = 0
         recordingStartDate = Date()
         barPhase = .recording
+        onUpdatePanelLayout?()
     }
 
     func stopRecording() {
         switch barPhase {
-        case .preparing:
+        case .preparing, .focusWaiting:
             cancel()
         case .recording:
             processingFinishTime = nil
@@ -829,12 +842,15 @@ final class AppState {
 extension AppState: FloatingBarState {}
 
 extension Notification.Name {
-    static let modesDidChange = Notification.Name("Type4MeModesDidChange")
-    static let asrProviderDidChange = Notification.Name("Type4MeASRProviderDidChange")
-    static let hotkeyRecordingDidStart = Notification.Name("Type4MeHotkeyRecordingDidStart")
-    static let hotkeyRecordingDidEnd = Notification.Name("Type4MeHotkeyRecordingDidEnd")
-    static let navigateToMode = Notification.Name("Type4MeNavigateToMode")
-    static let navigateToHistory = Notification.Name("Type4MeNavigateToHistory")
-    static let navigateToVocabulary = Notification.Name("Type4MeNavigateToVocabulary")
-    static let selectMode = Notification.Name("Type4MeSelectMode")
+    static let modesDidChange = Notification.Name("mytypeModesDidChange")
+    static let asrProviderDidChange = Notification.Name("mytypeASRProviderDidChange")
+    static let hotkeyRecordingDidStart = Notification.Name("mytypeHotkeyRecordingDidStart")
+    static let hotkeyRecordingDidEnd = Notification.Name("mytypeHotkeyRecordingDidEnd")
+    static let navigateToMode = Notification.Name("mytypeNavigateToMode")
+    static let navigateToHistory = Notification.Name("mytypeNavigateToHistory")
+    static let navigateToVocabulary = Notification.Name("mytypeNavigateToVocabulary")
+    static let selectMode = Notification.Name("mytypeSelectMode")
+    static let focusWakeupSettingDidChange = Notification.Name("MyTypeFocusWakeupSettingDidChange")
+    static let noiseFloorCalibrationWillStart = Notification.Name("MyTypeNoiseFloorCalibrationWillStart")
+    static let noiseFloorCalibrationDidFinish = Notification.Name("MyTypeNoiseFloorCalibrationDidFinish")
 }

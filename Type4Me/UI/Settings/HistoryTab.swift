@@ -698,7 +698,7 @@ struct HistoryTab: View {
 
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.commaSeparatedText]
-        panel.nameFieldStringValue = "type4me-history.csv"
+        panel.nameFieldStringValue = "mytype-history.csv"
         panel.canCreateDirectories = true
 
         guard panel.runModal() == .OK, let url = panel.url else { return }

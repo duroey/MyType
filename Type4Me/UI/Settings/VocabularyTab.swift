@@ -114,8 +114,8 @@ struct VocabularyTab: View {
     @State private var deletingAppBundleId: String? = nil
 
     // Built-in example snippet
-    private static let builtinExampleReplacement = "Type4Me"
-    private static let builtinExampleTriggers = ["typeform me", "typefrom me", "type for me", "typeform"]
+    private static let builtinExampleReplacement = "mytype"
+    private static let builtinExampleTriggers = ["my type", "mytype", "my typed", "my tight"]
 
     // Highlight & scroll
     @State private var highlightedGroup: String? = nil
@@ -1019,4 +1019,3 @@ struct VocabularyTab: View {
     }
 
 }
-

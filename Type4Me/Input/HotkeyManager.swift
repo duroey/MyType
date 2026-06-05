@@ -43,6 +43,7 @@ final class HotkeyManager: NSObject {
     private var holdState: [UUID: Bool] = [:]
     private var toggleState: [UUID: Bool] = [:]
     private var wasModifierDown: [UUID: Bool] = [:]
+    private var modifierTapStates: [UUID: ModifierTapState] = [:]
     private var holdSafetyTimers: [UUID: Timer] = [:]
     /// Which toggle mode is currently active (recording). Only one can be active at a time.
     private var activeToggleModeId: UUID?
@@ -92,6 +93,7 @@ final class HotkeyManager: NSObject {
         holdState = [:]
         toggleState = [:]
         wasModifierDown = [:]
+        modifierTapStates = [:]
         holdSafetyTimers.values.forEach { $0.invalidate() }
         holdSafetyTimers = [:]
     }
@@ -147,6 +149,7 @@ final class HotkeyManager: NSObject {
         holdState = [:]
         toggleState = [:]
         wasModifierDown = [:]
+        modifierTapStates = [:]
         holdSafetyTimers.values.forEach { $0.invalidate() }
         holdSafetyTimers = [:]
     }
@@ -162,7 +165,7 @@ final class HotkeyManager: NSObject {
 
             // Check 1: Is the tap still enabled at the Mach port level?
             if !CGEvent.tapIsEnabled(tap: tap) {
-                NSLog("[Type4Me] Health check: tap disabled, re-enabling...")
+                NSLog("[mytype] Health check: tap disabled, re-enabling...")
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
 
@@ -171,7 +174,7 @@ final class HotkeyManager: NSObject {
             // Only flag this if the tap has been alive for at least 30s (give it time to warm up).
             if let lastEvent = self.lastEventTime,
                Date().timeIntervalSince(lastEvent) > 30 {
-                NSLog("[Type4Me] Health check: no events for 30s, reinstalling tap...")
+                NSLog("[mytype] Health check: no events for 30s, reinstalling tap...")
                 self.reinstallTap()
             }
         }
@@ -181,7 +184,7 @@ final class HotkeyManager: NSObject {
     private func reinstallTap() {
         stop()
         let ok = start()
-        NSLog("[Type4Me] Tap reinstall: %@", ok ? "OK" : "FAILED")
+        NSLog("[mytype] Tap reinstall: %@", ok ? "OK" : "FAILED")
     }
 
     // MARK: - Event handling
@@ -247,6 +250,9 @@ final class HotkeyManager: NSObject {
 
         // MARK: Keyboard events
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        if type == .keyDown, !isModifierKeyCode(keyCode) {
+            markModifierTapDirtyForNonModifierKey()
+        }
 
         for binding in bindings {
             // Skip mouse button bindings in the keyboard path
@@ -263,7 +269,22 @@ final class HotkeyManager: NSObject {
                     let requiredMods = normalizedModifierFlags(binding.modifiers)
                     let currentMods = otherModifierFlags(for: keyCode, flags: event.flags)
                     guard currentMods == requiredMods else { continue }
+                    if binding.style == .toggle {
+                        var tapState = modifierTapStates[binding.modeId] ?? ModifierTapState()
+                        tapState.pressTarget()
+                        modifierTapStates[binding.modeId] = tapState
+                        return Unmanaged.passUnretained(event)
+                    }
                     handleBindingEvent(binding: binding, pressed: true)
+                    return Unmanaged.passUnretained(event)
+                } else if binding.style == .toggle {
+                    var tapState = modifierTapStates[binding.modeId] ?? ModifierTapState()
+                    let shouldFire = tapState.releaseTarget()
+                    modifierTapStates[binding.modeId] = tapState
+                    if shouldFire {
+                        handleBindingEvent(binding: binding, pressed: true)
+                        handleBindingEvent(binding: binding, pressed: false)
+                    }
                     return Unmanaged.passUnretained(event)
                 } else if isModifierBindingActive(binding) {
                     // Always release active state even if other modifiers were released first.
@@ -313,25 +334,33 @@ final class HotkeyManager: NSObject {
             }
         }
 
-        // ESC key (keyCode 53) - abort active recording or processing
+        // ESC key (keyCode 53) - let the app decide whether a session is active.
+        // Focus-triggered recordings do not set activeToggleModeId/holdState, so
+        // gating ESC here would miss the automatic recording path.
         if isESCAbortEnabled && type == .keyDown && keyCode == 53 {
-            let isRecording = activeToggleModeId != nil || holdState.values.contains(true)
-            let shouldAbort = isRecording || isProcessing
-            if shouldAbort {
-                NSLog("[HotkeyManager] ESC pressed, triggering abort (recording=%@, processing=%@)",
-                      isRecording ? "true" : "false", isProcessing ? "true" : "false")
-                if onESCAbort?() == true {
-                    return nil  // Swallow ESC: abort was handled
-                }
-                // App is not actually in an active session — stale state.
-                // Clean up and let ESC pass through to the system.
-                NSLog("[HotkeyManager] ESC abort not handled, resetting stale state")
-                isProcessing = false
-                resetActiveState()
+            if handleEscapeAbort() {
+                return nil
             }
         }
 
         return Unmanaged.passUnretained(event)
+    }
+
+    /// Delegates an Escape press to the application-level abort handler.
+    ///
+    /// Returns:
+    ///   `true` when Escape was handled and should be swallowed, otherwise `false`.
+    @discardableResult
+    func handleEscapeAbort() -> Bool {
+        guard isESCAbortEnabled else { return false }
+        NSLog("[HotkeyManager] ESC pressed, delegating abort (processing=%@)", isProcessing ? "true" : "false")
+        guard onESCAbort?() == true else {
+            NSLog("[HotkeyManager] ESC abort not handled by app")
+            return false
+        }
+        isProcessing = false
+        resetActiveState()
+        return true
     }
 
     // MARK: - Binding dispatch
@@ -375,6 +404,15 @@ final class HotkeyManager: NSObject {
             } else if !pressed {
                 wasModifierDown[id] = false
             }
+        }
+    }
+
+    /// Marks active modifier-only toggle candidates as dirty.
+    private func markModifierTapDirtyForNonModifierKey() {
+        for id in modifierTapStates.keys {
+            var tapState = modifierTapStates[id] ?? ModifierTapState()
+            tapState.markNonModifierKeyDown()
+            modifierTapStates[id] = tapState
         }
     }
 
