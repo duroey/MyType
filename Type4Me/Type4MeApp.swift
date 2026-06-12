@@ -56,6 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var floatingBarController: FloatingBarController?
     private var focusWakeupController: FocusWakeupController?
     private let hotkeyManager = HotkeyManager()
+    private let cmuxDefaultReplyController = CmuxDefaultReplyController()
+    private let codexSessionIndexWatcher = CodexSessionIndexWatcher()
     private let session = RecognitionSession()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -116,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await session.setOnAutoCancel {
                 Task { @MainActor in
                     appState.showFocusWaiting()
-                    focusWakeupController.sessionDidFinish()
+                    focusWakeupController.sessionDidFalseStart()
                 }
             }
         }
@@ -156,13 +158,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             appState.markRecordingReady()
                         }
                     case .completed:
-                        appState.stopRecording()
+                        let canReleaseSessionGates = appState.stopRecordingForCompletedASREvent()
                         if await session.stoppedByMaxDuration {
                             appState.processingLabelOverride = L("已达最大时长", "Max duration reached")
                         }
-                        self.focusWakeupController?.sessionDidFinish()
-                        self.hotkeyManager.isProcessing = false
-                        self.safeResetHotkeyState()
+                        if canReleaseSessionGates {
+                            self.focusWakeupController?.sessionDidFinish()
+                            self.hotkeyManager.isProcessing = false
+                            self.safeResetHotkeyState()
+                        } else {
+                            DebugFileLogger.log("completed: waiting for finalized before releasing focus wakeup")
+                        }
                     case .processingLabelOverride(let label):
                         appState.processingLabelOverride = label
                     case .processingResult(let text):
@@ -170,6 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.hotkeyManager.isProcessing = true
                     case .finalized(let text, let injection):
                         appState.finalize(text: text, outcome: injection)
+                        if injection == .inserted,
+                           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            self.cmuxDefaultReplyController.markFocusedSurfaceUserInput()
+                        }
                         self.focusWakeupController?.sessionDidFinish()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
@@ -264,9 +274,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.startHotkeyWithRetry()
-            Task {
-                await NoiseFloorCalibrator.calibrateIfNeeded()
-                await MainActor.run {
+            Task.detached(priority: .utility) {
+                DebugFileLogger.log("agent router index reconcile started")
+                CmuxAgentRouterService.shared.reconcileIndexes()
+                DebugFileLogger.log("agent router index reconcile finished")
+            }
+            self.codexSessionIndexWatcher.start()
+            if Self.shouldCalibrateNoiseFloorAtStartup() {
+                Task {
+                    await NoiseFloorCalibrator.calibrateIfNeeded()
+                    await MainActor.run {
+                        self.syncFocusWakeupState()
+                    }
+                }
+            } else {
+                Task { @MainActor in
                     self.syncFocusWakeupState()
                 }
             }
@@ -324,11 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Applies the current focus wakeup setting to the live controller.
     private func syncFocusWakeupState() {
-        let defaults = UserDefaults.standard
-        let enabled = defaults.object(forKey: "tf_focusWakeupEnabled") == nil
-            ? true
-            : defaults.bool(forKey: "tf_focusWakeupEnabled")
-        if enabled {
+        if isFocusWakeupEnabled() {
             focusWakeupController?.start()
         } else {
             focusWakeupController?.stop()
@@ -336,6 +354,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appState.cancel()
             }
         }
+        AudioKeepAliveManager.syncMicState()
+    }
+
+    /// Returns whether the automatic RMS wakeup workflow is enabled.
+    ///
+    /// Returns:
+    ///   True when focus wakeup is enabled in user defaults.
+    private func isFocusWakeupEnabled() -> Bool {
+        Self.isFocusWakeupEnabledSetting()
+    }
+
+    /// Returns whether startup should calibrate ambient noise before arming focus wakeup.
+    ///
+    /// Args:
+    ///   defaults: User defaults store used to read the focus wakeup preference.
+    ///
+    /// Returns:
+    ///   True when automatic focus wakeup is enabled.
+    nonisolated static func shouldCalibrateNoiseFloorAtStartup(defaults: UserDefaults = .standard) -> Bool {
+        isFocusWakeupEnabledSetting(defaults: defaults)
+    }
+
+    /// Returns the persisted automatic RMS wakeup setting.
+    ///
+    /// Returns:
+    ///   True when focus wakeup is enabled in user defaults.
+    nonisolated private static func isFocusWakeupEnabledSetting(defaults: UserDefaults = .standard) -> Bool {
+        return defaults.object(forKey: "tf_focusWakeupEnabled") == nil
+            ? true
+            : defaults.bool(forKey: "tf_focusWakeupEnabled")
     }
 
     private func registerHotkeys(for provider: ASRProvider) {
@@ -382,9 +430,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let selectedProvider = KeychainService.selectedASRProvider
                     let resolvedMode = ASRProviderRegistry.resolvedMode(for: capturedMode, provider: selectedProvider)
                     let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+                    let autoStopOnSilence = RMSGatePolicy.usesEndGateForPipelineStart(
+                        focusWakeupEnabled: Self.isFocusWakeupEnabledSetting()
+                    )
                     NSLog("[mytype] >>> HOTKEY: Record START (mode: %@)", effectiveMode.name)
-                    DebugFileLogger.log("hotkey record start mode=\(effectiveMode.name)")
+                    DebugFileLogger.log("hotkey record start mode=\(effectiveMode.name) autoStopOnSilence=\(autoStopOnSilence)")
                     Task { @MainActor in
+                        self.focusWakeupController?.resumeStartGateAfterPipelineStart()
                         self.focusWakeupController?.pauseForManualRecording()
                         self.appState.currentMode = effectiveMode
                         self.appState.startRecording()
@@ -396,7 +448,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             NSLog("[mytype] >>> HOTKEY: previous session did not reach idle in time")
                             DebugFileLogger.log("hotkey start: awaitIdle timed out")
                         }
-                        await self.session.startRecording(mode: effectiveMode)
+                        await self.session.startRecording(
+                            mode: effectiveMode,
+                            autoStopOnSilence: autoStopOnSilence
+                        )
                     }
                 },
                 onStop: { [weak self] in
@@ -436,13 +491,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        hotkeyManager.onKeyboardEvent = { [weak self] type, event in
+            guard let self else { return false }
+            return self.cmuxDefaultReplyController.handleKeyboardEvent(type: type, event: event)
+        }
+
         // ESC cancel: discard the current MyType session without injecting text.
         // Returns true if the abort was actually handled (ESC should be swallowed).
         hotkeyManager.onESCAbort = { [weak self] in
             guard let self else { return false }
             let phase = appState.barPhase
-            guard phase == .recording || phase == .processing || phase == .preparing else {
-                return false  // Not in an active session, let ESC pass through
+            switch EscapeAbortAction.action(for: phase) {
+            case .passThrough:
+                return false
+            case .pauseFocusWakeupWaiting:
+                NSLog("[mytype] >>> HOTKEY: ESC pause focus wakeup waiting")
+                DebugFileLogger.log("hotkey ESC pause focus wakeup waiting")
+                MainActor.assumeIsolated {
+                    self.focusWakeupController?.pauseStartGateForEscape()
+                    self.hotkeyManager.isProcessing = false
+                    self.safeResetHotkeyState()
+                }
+                return true
+            case .cancelActiveSession:
+                break
             }
             NSLog("[mytype] >>> HOTKEY: ESC cancel session (phase=%@)", String(describing: phase))
             DebugFileLogger.log("hotkey ESC cancel session phase=\(phase)")
@@ -663,6 +735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         SystemVolumeManager.restore()
+        codexSessionIndexWatcher.stop()
         // Synchronous kill: don't rely on async Task, app exits immediately after this returns
         SenseVoiceServerManager.killAllServerProcesses()
     }

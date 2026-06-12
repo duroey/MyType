@@ -71,6 +71,7 @@ private final class NotchIndicatorController {
     private let leftLayer: CALayer
     private let rightLayer: CALayer
     private var isVisible = false
+    private var generation: UInt = 0
 
     init() {
         (leftPanel, leftLayer) = Self.makeDotPanel(size: dotSize)
@@ -79,6 +80,7 @@ private final class NotchIndicatorController {
 
     /// Shows the two notch-side dots.
     func show() {
+        generation &+= 1
         updateFrames()
         setColor(NSColor(srgbRed: 0.0, green: 0.4, blue: 1.0, alpha: 1.0))
         guard !isVisible else { return }
@@ -96,15 +98,28 @@ private final class NotchIndicatorController {
     }
 
     /// Hides the two notch-side dots.
-    func hide() {
-        guard isVisible else { return }
+    ///
+    /// Args:
+    ///   animated: Whether to fade the dots out before ordering the panels out.
+    func hide(animated: Bool = true) {
+        generation &+= 1
+        let expectedGeneration = generation
         isVisible = false
+        guard leftPanel.isVisible || rightPanel.isVisible else { return }
+        guard animated else {
+            leftPanel.alphaValue = 0
+            rightPanel.alphaValue = 0
+            leftPanel.orderOut(nil)
+            rightPanel.orderOut(nil)
+            return
+        }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.16
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             leftPanel.animator().alphaValue = 0
             rightPanel.animator().alphaValue = 0
-        }, completionHandler: { [leftPanel, rightPanel] in
+        }, completionHandler: { [weak self, leftPanel, rightPanel] in
+            guard let self, self.generation == expectedGeneration, !self.isVisible else { return }
             leftPanel.orderOut(nil)
             rightPanel.orderOut(nil)
         })
@@ -242,7 +257,7 @@ final class FloatingBarController {
     func show() {
         panelGeneration &+= 1
         if state.barPhase == .focusWaiting {
-            panel.orderOut(nil)
+            hideBarPanelImmediately()
             notchIndicator.show()
             return
         }
@@ -288,7 +303,8 @@ final class FloatingBarController {
     ///   animated: Whether the size and origin change should be animated.
     private func updateLayout(animated: Bool) {
         if state.barPhase == .focusWaiting {
-            panel.orderOut(nil)
+            panelGeneration &+= 1
+            hideBarPanelImmediately()
             notchIndicator.show()
             return
         }
@@ -299,6 +315,13 @@ final class FloatingBarController {
             return
         }
         applyBarPanelLayout(animated: animated)
+    }
+
+    /// Immediately removes the regular bar panel before the notch indicator is shown.
+    private func hideBarPanelImmediately() {
+        panel.contentView?.layer?.removeAllAnimations()
+        panel.alphaValue = 0
+        panel.orderOut(nil)
     }
 
     /// Applies size and placement for the regular bottom floating panel.

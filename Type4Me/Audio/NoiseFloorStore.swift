@@ -58,7 +58,9 @@ enum NoiseFloorCalibrator {
     private static let samples = OSAllocatedUnfairLock(initialState: [Float]())
     private static let isRunning = OSAllocatedUnfairLock(initialState: false)
     private static let fallbackThreshold: Float = 500
-    private static let noiseMargin: Float = 120
+    private static let medianNoiseMargin: Float = 180
+    private static let percentileNoiseMargin: Float = 80
+    private static let madMultiplier: Float = 4
     private static let minThreshold: Float = 120
 
     /// Calibrates ambient RMS once if no process-local snapshot exists yet.
@@ -124,6 +126,7 @@ enum NoiseFloorCalibrator {
         defer { isRunning.withLock { $0 = false } }
 
         samples.withLock { $0.removeAll(keepingCapacity: true) }
+        FocusWakeupLearningStore.resetForNoiseCalibration()
         let engine = AudioCaptureEngine()
         engine.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
         engine.onAudioFrame = { frame in
@@ -165,9 +168,13 @@ enum NoiseFloorCalibrator {
                 error: "采样帧不足，已继续使用配置默认阈值"
             )
         }
-        let floor = median(values)
-        let threshold = max(floor + noiseMargin, minThreshold)
+        let calibration = calibrationStatistics(for: values)
+        let floor = calibration.noiseFloor
+        let threshold = calibration.threshold
         NoiseFloorStore.update(noiseFloor: floor, threshold: threshold, samples: values.count, source: source)
+        DebugFileLogger.log(
+            "noise floor stats source=\(source) median=\(Int(calibration.noiseFloor)) p95=\(Int(calibration.p95)) mad=\(Int(calibration.mad)) threshold=\(Int(threshold))"
+        )
         return NoiseFloorCalibrationResult(
             success: true,
             enabled: true,
@@ -177,6 +184,31 @@ enum NoiseFloorCalibrator {
             duration: duration,
             message: "底噪校准完成",
             error: nil
+        )
+    }
+
+    /// Computes robust ambient calibration statistics from RMS samples.
+    ///
+    /// Args:
+    ///   values: RMS samples collected during calibration.
+    ///
+    /// Returns:
+    ///   Noise floor, p95, MAD, and effective threshold.
+    nonisolated static func calibrationStatistics(
+        for values: [Float]
+    ) -> (noiseFloor: Float, p95: Float, mad: Float, threshold: Float) {
+        let stats = noiseStats(values)
+        let threshold = max(
+            stats.median + medianNoiseMargin,
+            stats.p95 + percentileNoiseMargin,
+            stats.median + stats.mad * madMultiplier,
+            minThreshold
+        )
+        return (
+            noiseFloor: stats.median,
+            p95: stats.p95,
+            mad: stats.mad,
+            threshold: threshold
         )
     }
 
@@ -204,6 +236,42 @@ enum NoiseFloorCalibrator {
             return (sorted[middle - 1] + sorted[middle]) / 2
         }
         return sorted[middle]
+    }
+
+    /// Computes robust ambient-noise statistics from RMS samples.
+    ///
+    /// Args:
+    ///   values: RMS samples collected during calibration.
+    ///
+    /// Returns:
+    ///   Median, high percentile, and median absolute deviation.
+    private static func noiseStats(_ values: [Float]) -> (median: Float, p95: Float, mad: Float) {
+        guard !values.isEmpty else {
+            return (0, 0, 0)
+        }
+        let medianValue = median(values)
+        let deviations = values.map { abs($0 - medianValue) }
+        return (
+            median: medianValue,
+            p95: percentile(values, rank: 0.95),
+            mad: median(deviations)
+        )
+    }
+
+    /// Reads a percentile from RMS samples.
+    ///
+    /// Args:
+    ///   values: RMS samples collected during calibration.
+    ///   rank: Percentile rank in the range 0...1.
+    ///
+    /// Returns:
+    ///   The nearest-rank percentile value.
+    private static func percentile(_ values: [Float], rank: Float) -> Float {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let clampedRank = min(max(rank, 0), 1)
+        let index = Int((Float(sorted.count - 1) * clampedRank).rounded())
+        return sorted[index]
     }
 
     /// Calculates RMS from PCM16 audio bytes.

@@ -80,6 +80,10 @@ final class HotkeyManager: NSObject {
     /// false if the app is not actually in an active session (ESC should pass through).
     var onESCAbort: (() -> Bool)?
 
+    /// Called for non-hotkey keyboard events before binding matching.
+    /// Returns true when the event should be swallowed.
+    var onKeyboardEvent: ((CGEventType, CGEvent) -> Bool)?
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var healthCheckTimer: Timer?
@@ -252,6 +256,10 @@ final class HotkeyManager: NSObject {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         if type == .keyDown, !isModifierKeyCode(keyCode) {
             markModifierTapDirtyForNonModifierKey()
+        }
+
+        if onKeyboardEvent?(type, event) == true {
+            return nil
         }
 
         for binding in bindings {

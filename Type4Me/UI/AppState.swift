@@ -606,13 +606,13 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             id: agentRouterModeId,
             name: L("Agent 路由", "Agent Router"),
             prompt: "",
-            isBuiltin: false,
+            isBuiltin: true,
             processingLabel: L("启动中", "Launching"),
             hotkeyCode: 54, hotkeyModifiers: 0, hotkeyStyle: .toggle
         )
     }
 
-    static var builtins: [ProcessingMode] { [.direct, .formalWriting] }
+    static var builtins: [ProcessingMode] { [.direct, .formalWriting, .agentRouterMode] }
     static var defaults: [ProcessingMode] { [.direct, .formalWriting, .promptOptimize, .translate, .agentMode, .agentRouterMode, .commandMode] }
 }
 
@@ -725,6 +725,17 @@ final class AppState {
         default:
             break
         }
+    }
+
+    /// Handles an ASR completed event without racing the later finalized event.
+    ///
+    /// Returns:
+    ///   `true` when the completion is terminal and external session gates may
+    ///   be released immediately; otherwise `false` when the UI is now waiting
+    ///   for a later `.finalized` event.
+    func stopRecordingForCompletedASREvent() -> Bool {
+        stopRecording()
+        return barPhase != .processing
     }
 
     func appendSegment(_ text: String, isConfirmed: Bool) {

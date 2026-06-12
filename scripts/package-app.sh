@@ -38,7 +38,9 @@ else
     swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64 2>&1 | grep -E "Build complete|Build succeeded|error:|warning:" || true
 fi
 
-if [ -f "$PROJECT_DIR/.build/apple/Products/Release/Type4Me" ]; then
+if [ "$ARCH" = "arm64" ] && [ -f "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me" ]; then
+    BINARY="$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me"
+elif [ -f "$PROJECT_DIR/.build/apple/Products/Release/Type4Me" ]; then
     BINARY="$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
 elif [ -f "$PROJECT_DIR/.build/release/Type4Me" ]; then
     BINARY="$PROJECT_DIR/.build/release/Type4Me"

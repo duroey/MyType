@@ -17,6 +17,14 @@ enum AudioCaptureError: Error, LocalizedError {
     }
 }
 
+struct PCM16FrameStats: Equatable, Sendable {
+    let sampleCount: Int
+    let rms: Float
+    let minSample: Int
+    let maxSample: Int
+    let zeroRatio: Float
+}
+
 final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     // MARK: - Static properties
@@ -52,6 +60,45 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         pcmData.copyBytes(to: mData.assumingMemoryBound(to: UInt8.self), count: pcmData.count)
         buffer.mutableAudioBufferList.pointee.mBuffers.mDataByteSize = UInt32(pcmData.count)
         return buffer
+    }
+
+    /// Calculates lightweight diagnostics for PCM16 audio bytes.
+    ///
+    /// Args:
+    ///   data: PCM16 little-endian audio bytes.
+    ///
+    /// Returns:
+    ///   Sample count, RMS, min/max sample, and zero-sample ratio.
+    nonisolated static func pcm16FrameStats(from data: Data) -> PCM16FrameStats {
+        let sampleCount = data.count / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else {
+            return PCM16FrameStats(sampleCount: 0, rms: 0, minSample: 0, maxSample: 0, zeroRatio: 0)
+        }
+
+        var sum: Float = 0
+        var minSample = Int(Int16.max)
+        var maxSample = Int(Int16.min)
+        var zeroSamples = 0
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return }
+            for index in 0..<sampleCount {
+                let sample = Int(base[index])
+                let value = Float(sample)
+                sum += value * value
+                minSample = min(minSample, sample)
+                maxSample = max(maxSample, sample)
+                if sample == 0 {
+                    zeroSamples += 1
+                }
+            }
+        }
+        return PCM16FrameStats(
+            sampleCount: sampleCount,
+            rms: sqrt(sum / Float(sampleCount)),
+            minSample: minSample,
+            maxSample: maxSample,
+            zeroRatio: Float(zeroSamples) / Float(sampleCount)
+        )
     }
 
     // MARK: - Device Selection
@@ -98,6 +145,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     private let outputQueueTag: UInt8 = 1
     private var activeOutput: AVCaptureAudioDataOutput?
     private var levelCounter = 0
+    private var sessionNotificationTokens: [NSObjectProtocol] = []
 
     // MARK: - Warm-up
 
@@ -180,15 +228,21 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         stateLock.withLock {
             activeOutput = output
         }
+        installSessionDiagnostics(for: session, device: device)
 
         session.startRunning()
         captureSession = session
         isWarmedUp = true
         NSLog("[Audio] Capture session started (AVCapture), device: %@", device.localizedName)
+        DebugFileLogger.log(
+            "audio capture started device=\(device.localizedName) uid=\(device.uniqueID) running=\(session.isRunning)"
+        )
     }
 
     func stop() {
-        captureSession?.stopRunning()
+        let session = captureSession
+        DebugFileLogger.log("audio capture stop requested running=\(session?.isRunning ?? false)")
+        session?.stopRunning()
         drainOutputQueue()
         let output = stateLock.withLock { () -> AVCaptureAudioDataOutput? in
             let current = activeOutput
@@ -196,6 +250,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
             return current
         }
         output?.setSampleBufferDelegate(nil, queue: nil)
+        removeSessionDiagnostics()
         captureSession = nil
         flushRemaining()
         bufferLock.lock()
@@ -206,6 +261,69 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         bufferLock.unlock()
         levelCounter = 0
         NSLog("[Audio] Capture session stopped")
+        DebugFileLogger.log("audio capture stopped")
+    }
+
+    /// Installs AVCaptureSession lifecycle diagnostics for the active session.
+    ///
+    /// Args:
+    ///   session: Capture session whose runtime notifications should be logged.
+    ///   device: Input device attached to the capture session.
+    private func installSessionDiagnostics(for session: AVCaptureSession, device: AVCaptureDevice) {
+        removeSessionDiagnostics()
+        let center = NotificationCenter.default
+        let deviceDescription = "\(device.localizedName) uid=\(device.uniqueID)"
+        sessionNotificationTokens = [
+            center.addObserver(
+                forName: .AVCaptureSessionRuntimeError,
+                object: session,
+                queue: nil
+            ) { notification in
+                let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
+                DebugFileLogger.log(
+                    "audio capture runtime error device=\(deviceDescription) error=\(String(describing: error))"
+                )
+            },
+            center.addObserver(
+                forName: .AVCaptureSessionWasInterrupted,
+                object: session,
+                queue: nil
+            ) { notification in
+                DebugFileLogger.log(
+                    "audio capture interrupted device=\(deviceDescription) userInfo=\(String(describing: notification.userInfo))"
+                )
+            },
+            center.addObserver(
+                forName: .AVCaptureSessionInterruptionEnded,
+                object: session,
+                queue: nil
+            ) { _ in
+                DebugFileLogger.log("audio capture interruption ended device=\(deviceDescription)")
+            },
+            center.addObserver(
+                forName: .AVCaptureSessionDidStartRunning,
+                object: session,
+                queue: nil
+            ) { _ in
+                DebugFileLogger.log("audio capture session did start running device=\(deviceDescription)")
+            },
+            center.addObserver(
+                forName: .AVCaptureSessionDidStopRunning,
+                object: session,
+                queue: nil
+            ) { _ in
+                DebugFileLogger.log("audio capture session did stop running device=\(deviceDescription)")
+            },
+        ]
+    }
+
+    /// Removes AVCaptureSession diagnostic observers for the previous session.
+    private func removeSessionDiagnostics() {
+        let center = NotificationCenter.default
+        for token in sessionNotificationTokens {
+            center.removeObserver(token)
+        }
+        sessionNotificationTokens = []
     }
 
     // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate

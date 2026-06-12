@@ -37,16 +37,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
     @State private var recordingPeakWidth: CGFloat = TF.barHeight
     @State private var processingStartDate: Date?
     @State private var doneStartDate: Date?
-    @State private var isHovered = false
-    @AppStorage("tf_hoverTranscriptPreview") private var hoverTranscriptPreview = true
-
-    // MARK: - Transcript Popup
-
-    private var showTranscriptPopup: Bool {
-        guard hoverTranscriptPreview, isHovered, state.barPhase == .recording, !state.segments.isEmpty else { return false }
-        let textWidth = measureText(state.transcriptionText)
-        return textWidth + 66 > TF.barWidth
-    }
 
     private var capsuleWidth: CGFloat {
         switch state.barPhase {
@@ -71,28 +61,13 @@ struct FloatingBarView<S: FloatingBarState>: View {
     }
 
     var body: some View {
-        VStack(spacing: TF.transcriptPopupGap) {
-            if showTranscriptPopup {
-                transcriptPopup
-                    .transition(.asymmetric(
-                        insertion: .scale(scale: 0.95, anchor: .bottom).combined(with: .opacity),
-                        removal: .opacity
-                    ))
-            }
-
+        VStack {
             if state.barPhase != .hidden {
                 capsuleBar
                 .transition(.asymmetric(
                     insertion: .scale(scale: 0.92).combined(with: .opacity),
                     removal: .opacity
                 ))
-            }
-        }
-        .background {
-            FloatingBarHoverTracker { hovered in
-                withAnimation(TF.springSnappy) {
-                    isHovered = hovered
-                }
             }
         }
         .padding(.bottom, state.barPhase == .focusWaiting ? 0 : 16)
@@ -102,7 +77,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
             alignment: state.barPhase == .focusWaiting ? .center : .bottom
         )
         .animation(TF.springSnappy, value: state.barPhase != .hidden)
-        .animation(TF.springSnappy, value: showTranscriptPopup)
         .onChange(of: state.barPhase) { _, newPhase in
             handlePhaseChange(newPhase)
         }
@@ -348,13 +322,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
     // MARK: - Phase Transitions
 
     private func handlePhaseChange(_ phase: FloatingBarPhase) {
-        // Reset hover state on panel show/hide boundaries.
-        // NSTrackingArea suspends events when the view is hidden (panel orderOut)
-        // instead of firing mouseExited, so isHovered would otherwise leak across
-        // recording sessions and auto-show the popup without any actual hover.
-        if phase == .preparing || phase == .focusWaiting || phase == .hidden {
-            isHovered = false
-        }
         switch phase {
         case .focusWaiting:
             recordingPeakWidth = TF.barHeight
@@ -402,24 +369,6 @@ struct FloatingBarView<S: FloatingBarState>: View {
     /// Measure actual rendered width using the same font as the floating bar text.
     private func measureText(_ string: String) -> CGFloat {
         ceil((string as NSString).size(withAttributes: [.font: floatingBarFont]).width)
-    }
-
-    // MARK: - Transcript Popup View
-
-    private var transcriptPopup: some View {
-        Text(state.transcriptionText)
-            .font(.system(size: 14, weight: .medium))
-            .foregroundStyle(.white)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .frame(width: TF.barWidth)
-            .background(
-                RoundedRectangle(cornerRadius: TF.transcriptPopupCorner, style: .continuous)
-                    .fill(Color(white: 0.08, opacity: 0.78))
-            )
-            .clipShape(RoundedRectangle(cornerRadius: TF.transcriptPopupCorner, style: .continuous))
-            .shadow(color: Color.black.opacity(0.3), radius: 8, y: -2)
     }
 }
 
@@ -950,58 +899,5 @@ private final class LevelTimeline {
         }
         levels[levels.count - 1] = currentLevel
         return levels
-    }
-}
-
-// MARK: - Hover Tracking (works even when app is not active)
-
-/// Uses NSTrackingArea with `.activeAlways` so hover fires on a non-key,
-/// non-activating NSPanel regardless of which app is in the foreground.
-struct FloatingBarHoverTracker: NSViewRepresentable {
-    let onHoverChanged: (Bool) -> Void
-
-    func makeNSView(context: Context) -> HoverTrackingNSView {
-        let view = HoverTrackingNSView()
-        view.onHoverChanged = onHoverChanged
-        return view
-    }
-
-    func updateNSView(_ nsView: HoverTrackingNSView, context: Context) {
-        nsView.onHoverChanged = onHoverChanged
-    }
-}
-
-final class HoverTrackingNSView: NSView {
-    var onHoverChanged: ((Bool) -> Void)?
-    private var enterWorkItem: DispatchWorkItem?
-
-    override func updateTrackingAreas() {
-        for area in trackingAreas { removeTrackingArea(area) }
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        ))
-        super.updateTrackingAreas()
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        enterWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, let window = self.window else { return }
-            // Re-check mouse position at trigger time: updateTrackingAreas()
-            // sends synthetic mouseEntered when the tracking area is recreated
-            // with the cursor inside (e.g. bar grows during recording).
-            let mouseInView = self.convert(window.mouseLocationOutsideOfEventStream, from: nil)
-            guard self.bounds.contains(mouseInView) else { return }
-            self.onHoverChanged?(true)
-        }
-        enterWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        enterWorkItem?.cancel()
-        onHoverChanged?(false)
     }
 }

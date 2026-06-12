@@ -32,6 +32,32 @@ final class ModeStorageTests: XCTestCase {
         XCTAssertTrue(ProcessingMode.defaults.contains { $0.id == ProcessingMode.agentRouterModeId })
     }
 
+    func testAgentRouterModeIsLoadedAsBuiltinAndKeepsHotkey() throws {
+        let storage = ModeStorage(fileURL: testURL)
+        var legacyAgentRouter = ProcessingMode(
+            id: ProcessingMode.agentRouterModeId,
+            name: "Custom Router",
+            prompt: "user edited",
+            isBuiltin: false,
+            processingLabel: "Custom Launching"
+        )
+        legacyAgentRouter.hotkeyCode = 54
+        legacyAgentRouter.hotkeyModifiers = 0
+        legacyAgentRouter.hotkeyStyle = .hold
+
+        try storage.save([ProcessingMode.direct, legacyAgentRouter])
+        let loaded = storage.load()
+        let agentRouter = loaded.first { $0.id == ProcessingMode.agentRouterModeId }
+
+        XCTAssertEqual(agentRouter?.isBuiltin, true)
+        XCTAssertEqual(agentRouter?.name, ProcessingMode.agentRouterMode.name)
+        XCTAssertEqual(agentRouter?.prompt, ProcessingMode.agentRouterMode.prompt)
+        XCTAssertEqual(agentRouter?.processingLabel, ProcessingMode.agentRouterMode.processingLabel)
+        XCTAssertEqual(agentRouter?.hotkeyCode, 54)
+        XCTAssertEqual(agentRouter?.hotkeyModifiers, 0)
+        XCTAssertEqual(agentRouter?.hotkeyStyle, .hold)
+    }
+
     func testLoadMigratesLegacyBuiltinModesToDeletableModes() throws {
         let storage = ModeStorage(fileURL: testURL)
         let legacyModes = [

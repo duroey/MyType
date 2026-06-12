@@ -26,6 +26,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @AppStorage("tf_micKeepAlive") private var micKeepAlive = false
     @AppStorage("tf_focusWakeupEnabled") private var focusWakeupEnabled = true
     @AppStorage("tf_focusAutoStopSilenceSeconds") private var focusAutoStopSilenceSeconds = 0.9
+    @AppStorage(FocusWakeupController.focusWakeupModeIdKey) private var focusWakeupModeId = ""
     @AppStorage("tf_agentLauncherTerminal") private var agentLauncherTerminal = "auto"
     @AppStorage("tf_selectedMicrophoneUID") private var selectedMicrophoneUID = ""
     @AppStorage("tf_selectedSpeakerUID") private var selectedSpeakerUID = ""
@@ -41,6 +42,35 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @State private var availableLauncherTerminals: [AgentLauncherTerminal] = []
 
     typealias TestStatus = SettingsTestStatus
+
+    enum AudioFeatureSetting {
+        case micKeepAlive
+        case focusWakeup
+    }
+
+    /// Resolves mutually exclusive microphone-owning feature preferences.
+    ///
+    /// Args:
+    ///   micKeepAlive: Current microphone keep-alive preference.
+    ///   focusWakeupEnabled: Current focus wakeup preference.
+    ///   changedFeature: Feature whose setting was just changed.
+    ///   enabled: New enabled state for the changed feature.
+    ///
+    /// Returns:
+    ///   Updated preferences with at most one microphone-owning feature enabled.
+    nonisolated static func resolvedAudioFeatureSettings(
+        micKeepAlive: Bool,
+        focusWakeupEnabled: Bool,
+        changedFeature: AudioFeatureSetting,
+        enabled: Bool
+    ) -> (micKeepAlive: Bool, focusWakeupEnabled: Bool) {
+        switch changedFeature {
+        case .micKeepAlive:
+            return (enabled, enabled ? false : focusWakeupEnabled)
+        case .focusWakeup:
+            return (enabled ? false : micKeepAlive, enabled)
+        }
+    }
 
     // MARK: - Body
 
@@ -87,11 +117,11 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
 
                 SettingsDivider()
 
-                // Row 4: 自动提交延迟
+                // Row 4: 自动聚焦模式 / 自动提交延迟
                 HStack(alignment: .top, spacing: 16) {
-                    autoStopSilenceRow
+                    focusWakeupModeRow
                         .frame(maxWidth: .infinity)
-                    Spacer()
+                    autoStopSilenceRow
                         .frame(maxWidth: .infinity)
                 }
             }
@@ -561,7 +591,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             settingsDropdown(
                 selection: Binding(
                     get: { micKeepAlive ? "on" : "off" },
-                    set: { micKeepAlive = $0 == "on" }
+                    set: { applyAudioFeatureSetting(.micKeepAlive, enabled: $0 == "on") }
                 ),
                 options: [
                     ("on", L("开启", "On")),
@@ -589,7 +619,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             settingsDropdown(
                 selection: Binding(
                     get: { focusWakeupEnabled ? "on" : "off" },
-                    set: { focusWakeupEnabled = $0 == "on" }
+                    set: { applyAudioFeatureSetting(.focusWakeup, enabled: $0 == "on") }
                 ),
                 options: [
                     ("on", L("开启", "On")),
@@ -598,6 +628,27 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             )
         }
         .padding(.vertical, 6)
+    }
+
+    /// Applies a mutually exclusive microphone feature setting from the UI.
+    ///
+    /// Args:
+    ///   changedFeature: Feature changed by the user.
+    ///   enabled: New enabled state for the changed feature.
+    private func applyAudioFeatureSetting(_ changedFeature: AudioFeatureSetting, enabled: Bool) {
+        let resolved = Self.resolvedAudioFeatureSettings(
+            micKeepAlive: micKeepAlive,
+            focusWakeupEnabled: focusWakeupEnabled,
+            changedFeature: changedFeature,
+            enabled: enabled
+        )
+        let focusChanged = focusWakeupEnabled != resolved.focusWakeupEnabled
+        micKeepAlive = resolved.micKeepAlive
+        focusWakeupEnabled = resolved.focusWakeupEnabled
+        AudioKeepAliveManager.syncMicState()
+        if focusChanged {
+            NotificationCenter.default.post(name: .focusWakeupSettingDidChange, object: nil)
+        }
     }
 
     private var noiseCalibrationRow: some View {
@@ -670,6 +721,57 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             )
         }
         .padding(.vertical, 6)
+    }
+
+    private var focusWakeupModeRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Text(L("自动聚焦模式", "Focus Mode").uppercased())
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(TF.settingsTextTertiary)
+                Text("|")
+                    .font(.system(size: 10))
+                    .foregroundStyle(TF.settingsTextTertiary.opacity(0.5))
+                Text(L("直接说话时使用", "Used when speaking directly"))
+                    .font(.system(size: 10))
+                    .foregroundStyle(TF.settingsTextTertiary)
+            }
+            settingsDropdown(
+                selection: focusWakeupModeSelection,
+                options: focusWakeupModeOptions,
+                icon: "wand.and.stars"
+            )
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var focusWakeupModeSelection: Binding<String> {
+        Binding(
+            get: { resolvedFocusWakeupModeId },
+            set: { focusWakeupModeId = $0 }
+        )
+    }
+
+    private var focusWakeupModeOptions: [(value: String, label: String)] {
+        let textModes = launcherModes.filter(FocusWakeupController.isTextProducingFocusMode)
+        let supportedModes = ASRProviderRegistry.supportedModes(
+            from: textModes,
+            for: KeychainService.selectedASRProvider
+        )
+        let selectableModes = supportedModes.isEmpty ? textModes : supportedModes
+        return selectableModes.map { ($0.id.uuidString, $0.name) }
+    }
+
+    private var resolvedFocusWakeupModeId: String {
+        let storedId = focusWakeupModeId.isEmpty ? nil : focusWakeupModeId
+        return FocusWakeupController.resolvedFocusWakeupMode(
+            modes: launcherModes,
+            storedModeId: storedId,
+            provider: KeychainService.selectedASRProvider
+        )
+        .id
+        .uuidString
     }
 
     private var launcherHotkeyRow: some View {
@@ -848,7 +950,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         .padding(.vertical, 6)
     }
 
-    /// Reloads persisted processing modes used by the launcher hotkey row.
+    /// Reloads persisted processing modes used by General settings rows.
     ///
     /// Args:
     ///   None.

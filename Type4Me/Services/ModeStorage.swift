@@ -85,6 +85,13 @@ struct ModeStorage {
                 }
                 return mode
             }
+            if mode.id == ProcessingMode.agentRouterModeId {
+                var migrated = ProcessingMode.agentRouterMode
+                migrated.hotkeyCode = mode.hotkeyCode
+                migrated.hotkeyModifiers = mode.hotkeyModifiers
+                migrated.hotkeyStyle = mode.hotkeyStyle
+                return migrated
+            }
             // Drop legacy dual-channel mode (replaced by global "enhanced ASR" toggle)
             if mode.id == UUID(uuidString: "00000000-0000-0000-0000-000000000007")! {
                 return nil

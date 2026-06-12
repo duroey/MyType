@@ -60,4 +60,76 @@ final class RecognitionSessionTests: XCTestCase {
 
         XCTAssertTrue(shouldFallback)
     }
+
+    func testAutoStopThresholdUsesCalibratedNoiseThreshold() {
+        let snapshot = NoiseFloorSnapshot(
+            noiseFloor: 100,
+            threshold: 980,
+            samples: 100,
+            source: "test",
+            measuredAt: Date()
+        )
+
+        let threshold = RecognitionSession.resolveAutoStopEffectiveThreshold(
+            noiseSnapshot: snapshot,
+            fallbackThreshold: 500,
+            triggerThreshold: nil
+        )
+
+        XCTAssertEqual(threshold, 980, accuracy: 0.001)
+    }
+
+    func testAutoStopThresholdPrefersFocusTriggerThreshold() {
+        let snapshot = NoiseFloorSnapshot(
+            noiseFloor: 100,
+            threshold: 980,
+            samples: 100,
+            source: "test",
+            measuredAt: Date()
+        )
+
+        let threshold = RecognitionSession.resolveAutoStopEffectiveThreshold(
+            noiseSnapshot: snapshot,
+            fallbackThreshold: 500,
+            triggerThreshold: 3_204
+        )
+
+        XCTAssertEqual(threshold, 3_204, accuracy: 0.001)
+    }
+
+    func testAutoStopThresholdFallsBackBeforeCalibration() {
+        let threshold = RecognitionSession.resolveAutoStopEffectiveThreshold(
+            noiseSnapshot: nil,
+            fallbackThreshold: 500,
+            triggerThreshold: nil
+        )
+
+        XCTAssertEqual(threshold, 500, accuracy: 0.001)
+    }
+
+    func testAutoStopThresholdKeepsMinimumFloor() {
+        let snapshot = NoiseFloorSnapshot(
+            noiseFloor: 20,
+            threshold: 60,
+            samples: 100,
+            source: "test",
+            measuredAt: Date()
+        )
+
+        let threshold = RecognitionSession.resolveAutoStopEffectiveThreshold(
+            noiseSnapshot: snapshot,
+            fallbackThreshold: 500,
+            triggerThreshold: nil
+        )
+
+        XCTAssertEqual(threshold, 120, accuracy: 0.001)
+    }
+
+    func testAutoStopThresholdIsPreservedAfterASRText() {
+        let threshold = RecognitionSession.autoStopThresholdAfterASRText(
+            currentThreshold: 2_347
+        )
+
+        XCTAssertEqual(threshold, 2_347, accuracy: 0.001)
+    }
 }

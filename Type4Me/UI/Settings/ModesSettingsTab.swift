@@ -306,7 +306,7 @@ struct ModesSettingsTab: View {
     private func builtinModeDetail(_ mode: ProcessingMode) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 6) {
-                Image(systemName: mode.id == ProcessingMode.formalWritingId ? "wand.and.stars" : "bolt.fill")
+                Image(systemName: builtinModeIcon(for: mode))
                     .font(.system(size: 14))
                     .foregroundStyle(TF.settingsAccentAmber)
                 Text(mode.name)
@@ -320,14 +320,51 @@ struct ModesSettingsTab: View {
                     .background(Capsule().fill(TF.settingsCardAlt))
             }
 
-            Text(L("直接使用语音识别 API，识别完成后不做处理、直接粘贴。适合非正式场合、无需纠正口头表达的场景，输入流程更丝滑。",
-                     "Uses the ASR API directly, pastes raw output without post-processing. Best for informal contexts where oral expressions don't need correction."))
+            Text(builtinModeDescription(for: mode))
                 .font(.system(size: 12))
                 .foregroundStyle(TF.settingsTextSecondary)
                 .lineSpacing(3)
 
             Spacer()
         }
+    }
+
+    /// Returns the read-only detail icon for a built-in mode.
+    ///
+    /// Args:
+    ///   mode: Built-in processing mode currently selected.
+    ///
+    /// Returns:
+    ///   SF Symbol name used in the mode detail header.
+    private func builtinModeIcon(for mode: ProcessingMode) -> String {
+        switch mode.id {
+        case ProcessingMode.formalWritingId:
+            return "wand.and.stars"
+        case ProcessingMode.agentRouterModeId:
+            return "terminal.fill"
+        default:
+            return "bolt.fill"
+        }
+    }
+
+    /// Returns read-only explanatory text for a built-in mode.
+    ///
+    /// Args:
+    ///   mode: Built-in processing mode currently selected.
+    ///
+    /// Returns:
+    ///   Localized description for the selected built-in mode.
+    private func builtinModeDescription(for mode: ProcessingMode) -> String {
+        if mode.id == ProcessingMode.agentRouterModeId {
+            return L(
+                "用于呼出 Agent 路由，按语音内容查找或启动对应工作目录。此模式是系统工作流的一部分，只允许配置快捷键，不能编辑提示词或处理逻辑。",
+                "Opens the Agent Router and uses speech to find or start the target workspace. This mode is part of the system workflow: only its hotkey can be configured."
+            )
+        }
+        return L(
+            "直接使用语音识别 API，识别完成后不做处理、直接粘贴。适合非正式场合、无需纠正口头表达的场景，输入流程更丝滑。",
+            "Uses the ASR API directly, pastes raw output without post-processing. Best for informal contexts where oral expressions don't need correction."
+        )
     }
 
     @AppStorage("tf_shortTextExemption") private var shortTextExemption = "0"

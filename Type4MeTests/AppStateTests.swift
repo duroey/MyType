@@ -52,6 +52,31 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.barPhase, .processing)
     }
 
+    func testCompletedASREventDuringRecordingWaitsForFinalizedEvent() {
+        let appState = AppState()
+        appState.currentMode = .smartDirect
+        appState.startRecording()
+        appState.markRecordingReady()
+
+        let canReleaseSessionGates = appState.stopRecordingForCompletedASREvent()
+
+        XCTAssertFalse(canReleaseSessionGates)
+        XCTAssertEqual(appState.barPhase, .processing)
+    }
+
+    func testCompletedASREventAfterEmptyResultCanReleaseSessionGates() {
+        let appState = AppState()
+        appState.currentMode = .smartDirect
+        appState.startRecording()
+        appState.markRecordingReady()
+        appState.showProcessingResult("")
+
+        let canReleaseSessionGates = appState.stopRecordingForCompletedASREvent()
+
+        XCTAssertTrue(canReleaseSessionGates)
+        XCTAssertEqual(appState.barPhase, .hidden)
+    }
+
     func testSetLiveTranscriptReplacesExistingConfirmedSegments() {
         let appState = AppState()
         appState.setLiveTranscript(
@@ -100,6 +125,17 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.barPhase, .done)
         XCTAssertEqual(appState.feedbackMessage, InjectionOutcome.copiedToClipboard.completionMessage)
         XCTAssertEqual(appState.transcriptionText, "测试文本")
+    }
+
+    func testFinalizeShowsActionFailureMessage() {
+        let appState = AppState()
+        appState.barPhase = .processing
+
+        appState.finalize(text: "启动失败：graphics", outcome: .actionFailed("启动失败：graphics"))
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackMessage, "启动失败：graphics")
+        XCTAssertEqual(appState.transcriptionText, "启动失败：graphics")
     }
 
     func testShowErrorDisplaysErrorPhaseAndMessage() {

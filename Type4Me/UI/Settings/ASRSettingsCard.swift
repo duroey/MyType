@@ -49,11 +49,23 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     }
 
     private var hasASRCredentials: Bool {
-        let required = currentASRFields.filter { !$0.isOptional }
-        let effective = effectiveASRValues
-        return required.allSatisfy { field in
-            !(effective[field.key] ?? "").isEmpty
+        Self.hasValidASRCredentials(provider: selectedASRProvider, values: effectiveASRValues)
+    }
+
+    /// Checks whether the current ASR credential values form a usable provider config.
+    ///
+    /// Args:
+    ///   provider: ASR provider selected by the user.
+    ///   values: Credential values collected from saved state and current edits.
+    ///
+    /// Returns:
+    ///   True when the provider-specific config accepts the values and reports itself valid.
+    nonisolated static func hasValidASRCredentials(provider: ASRProvider, values: [String: String]) -> Bool {
+        guard let configType = ASRProviderRegistry.configType(for: provider),
+              let config = configType.init(credentials: values) else {
+            return false
         }
+        return config.isValid
     }
 
     private var isASRProviderAvailable: Bool {
@@ -805,7 +817,10 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
         }
 
         // Both failed
-        asrTestStatus = .failed(L("连接失败，请检查 App ID 和 Access Token", "Connection failed, check App ID & Access Token"))
+        asrTestStatus = .failed(L(
+            "连接失败，请检查 API Key 或旧版 App ID/Access Token",
+            "Connection failed, check API Key or legacy App ID/Access Token"
+        ))
     }
 
     private func testVolcResource(baseValues: [String: String], resourceId: String, options: ASRRequestOptions) async -> Bool {

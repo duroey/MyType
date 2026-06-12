@@ -18,8 +18,35 @@ enum AudioKeepAliveManager {
         syncMicState()
     }
 
+    /// Returns whether microphone keep-alive should own a capture session.
+    ///
+    /// Args:
+    ///   micKeepAliveEnabled: User preference for Bluetooth microphone keep-alive.
+    ///   focusWakeupEnabled: Whether focus wakeup already keeps the microphone warm.
+    ///
+    /// Returns:
+    ///   `true` only when the user enabled mic keep-alive and focus wakeup is off.
+    nonisolated static func shouldRunMicKeepAlive(
+        micKeepAliveEnabled: Bool,
+        focusWakeupEnabled: Bool
+    ) -> Bool {
+        micKeepAliveEnabled && !focusWakeupEnabled
+    }
+
+    /// Synchronizes microphone keep-alive with the current user preferences.
+    ///
+    /// Focus wakeup uses its own live audio monitor, so keep-alive is suppressed
+    /// while focus wakeup is enabled to avoid competing capture sessions.
     static func syncMicState() {
-        let enabled = UserDefaults.standard.bool(forKey: "tf_micKeepAlive")
+        let defaults = UserDefaults.standard
+        let micKeepAliveEnabled = defaults.bool(forKey: "tf_micKeepAlive")
+        let focusWakeupEnabled = defaults.object(forKey: "tf_focusWakeupEnabled") == nil
+            ? true
+            : defaults.bool(forKey: "tf_focusWakeupEnabled")
+        let enabled = shouldRunMicKeepAlive(
+            micKeepAliveEnabled: micKeepAliveEnabled,
+            focusWakeupEnabled: focusWakeupEnabled
+        )
         queue.async {
             if enabled { startMic() } else { stopMic() }
         }

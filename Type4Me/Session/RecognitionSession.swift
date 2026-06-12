@@ -228,11 +228,9 @@ actor RecognitionSession {
     private var autoStopRMSWindow: [Float] = []
     private var autoStopEffectiveThreshold: Float = 0
     private var autoStopLoggedSpeechSource = false
+    private var autoStopRecordedSpeechProfile = false
+    private var autoStopSpeechProfileCandidateRMS: Float = 0
     private var autoStopFalseStartTask: Task<Void, Never>?
-    private static let autoStopASRThresholdRatio: Float = 0.65
-    private static let autoStopMinASRThreshold: Float = 80
-    private static let autoStopASRNoiseMargin: Float = 80
-    private static let autoStopRMSNoiseMargin: Float = 120
     private static let autoStopMinRMSThreshold: Float = 120
 
     // MARK: - Toggle
@@ -256,10 +254,12 @@ actor RecognitionSession {
     ///   mode: Processing mode used for the current recording.
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
     ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
+    ///   autoStopThresholdOverride: RMS threshold used by the trigger that started this recording.
     func startRecording(
         mode: ProcessingMode = .direct,
         autoStopOnSilence: Bool = false,
-        initialAudioChunks: [Data] = []
+        initialAudioChunks: [Data] = [],
+        autoStopThresholdOverride: Float? = nil
     ) async {
         if state == .finishing || state == .injecting || state == .postProcessing {
             NSLog("[Session] startRecording: blocked, current session still processing (state=%@)", String(describing: state))
@@ -307,8 +307,10 @@ actor RecognitionSession {
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
         autoStopRMSWindow = []
-        autoStopEffectiveThreshold = Self.autoStopEffectiveThreshold()
+        autoStopEffectiveThreshold = Self.autoStopEffectiveThreshold(triggerThreshold: autoStopThresholdOverride)
         autoStopLoggedSpeechSource = false
+        autoStopRecordedSpeechProfile = false
+        autoStopSpeechProfileCandidateRMS = 0
         state = .starting
 
         // Load credentials for selected provider
@@ -900,21 +902,16 @@ actor RecognitionSession {
 
             if currentMode.id == ProcessingMode.agentRouterModeId {
                 state = .postProcessing
-                let launchResult = AgentLauncherService.shared.handle(finalText)
-                let launcherText = launchResult.message
-                onASREvent?(.processingResult(text: launcherText))
-                onASREvent?(.finalized(text: launcherText, injection: .inserted))
+                let routerResult = CmuxAgentRouterService.shared.handle(finalText)
+                let routerText = routerResult.message
+                let routerOutcome: InjectionOutcome = routerResult.handled
+                    ? .inserted
+                    : .actionFailed(routerText)
+                onASREvent?(.processingResult(text: routerText))
+                onASREvent?(.finalized(text: routerText, injection: routerOutcome))
 
                 let recordId = UUID().uuidString
                 let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
-                let status: String
-                if launchResult.launched {
-                    status = "agent_launched"
-                } else if launchResult.project == nil {
-                    status = "agent_no_match"
-                } else {
-                    status = "agent_launch_failed"
-                }
                 await historyStore.insert(HistoryRecord(
                     id: recordId,
                     createdAt: Date(),
@@ -922,9 +919,9 @@ actor RecognitionSession {
                     rawText: rawText,
                     processingMode: currentMode.name,
                     processedText: nil,
-                    finalText: launcherText,
-                    status: status,
-                    characterCount: launcherText.count,
+                    finalText: routerText,
+                    status: routerResult.historyStatus,
+                    characterCount: routerText.count,
                     asrProvider: activeProvider.displayName
                 ))
 
@@ -1393,6 +1390,8 @@ actor RecognitionSession {
         autoStopRMSWindow = []
         autoStopEffectiveThreshold = 0
         autoStopLoggedSpeechSource = false
+        autoStopRecordedSpeechProfile = false
+        autoStopSpeechProfileCandidateRMS = 0
         autoStopFalseStartTask?.cancel()
         autoStopFalseStartTask = nil
     }
@@ -1466,6 +1465,7 @@ actor RecognitionSession {
         guard autoStopRMSWindow.count >= min(windowFrames, 2) else { return }
 
         let avg = autoStopRMSWindow.reduce(0, +) / Float(autoStopRMSWindow.count)
+        autoStopSpeechProfileCandidateRMS = max(autoStopSpeechProfileCandidateRMS, avg)
         let transcriptText = currentTranscript.displayText.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasASRText = !transcriptText.isEmpty
         if !autoStopHadSpeech {
@@ -1479,8 +1479,7 @@ actor RecognitionSession {
                 }
             } else if hasASRText {
                 autoStopHadSpeech = true
-                autoStopEffectiveThreshold = Self.adaptAutoStopThresholdFromASR(
-                    avg: avg,
+                autoStopEffectiveThreshold = Self.autoStopThresholdAfterASRText(
                     currentThreshold: autoStopEffectiveThreshold
                 )
                 if !autoStopLoggedSpeechSource {
@@ -1490,6 +1489,9 @@ actor RecognitionSession {
                     autoStopLoggedSpeechSource = true
                 }
             }
+        }
+        if hasASRText {
+            recordSpeechProfileSampleIfNeeded(avg: autoStopSpeechProfileCandidateRMS, source: "asr")
         }
 
         guard autoStopHadSpeech else { return }
@@ -1516,20 +1518,71 @@ actor RecognitionSession {
         await stopRecording()
     }
 
+    /// Records one ASR-confirmed speech RMS sample for future focus wakeup thresholds.
+    ///
+    /// Args:
+    ///   avg: Candidate speech RMS collected during the current recording.
+    ///   source: Confirmation source used for diagnostics.
+    private func recordSpeechProfileSampleIfNeeded(avg: Float, source: String) {
+        guard !autoStopRecordedSpeechProfile else { return }
+        guard avg.isFinite, avg > 0 else { return }
+        autoStopRecordedSpeechProfile = true
+        _ = SpeechRMSProfileStore.record(avg, source: source)
+    }
+
     /// Resolves the effective RMS threshold for focus silence auto-stop.
     ///
     /// Returns:
     ///   A bottom-noise-derived threshold when calibrated, otherwise the
     ///   configured fallback threshold.
     private static func autoStopEffectiveThreshold() -> Float {
-        if let snapshot = NoiseFloorStore.snapshot() {
-            return max(
-                snapshot.noiseFloor + Self.autoStopRMSNoiseMargin,
-                Self.autoStopMinRMSThreshold
-            )
-        }
         let defaults = UserDefaults.standard
-        return Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
+        let fallback = Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
+        return resolveAutoStopEffectiveThreshold(
+            noiseSnapshot: NoiseFloorStore.snapshot(),
+            fallbackThreshold: fallback,
+            triggerThreshold: nil
+        )
+    }
+
+    /// Resolves the effective RMS threshold for focus silence auto-stop.
+    ///
+    /// Args:
+    ///   triggerThreshold: RMS threshold that triggered this focus recording, if any.
+    ///
+    /// Returns:
+    ///   The threshold used by the current recording's silence gate.
+    private static func autoStopEffectiveThreshold(triggerThreshold: Float?) -> Float {
+        let defaults = UserDefaults.standard
+        let fallback = Float(defaults.object(forKey: "tf_focusAutoStopRMSThreshold") as? Double ?? 500)
+        return resolveAutoStopEffectiveThreshold(
+            noiseSnapshot: NoiseFloorStore.snapshot(),
+            fallbackThreshold: fallback,
+            triggerThreshold: triggerThreshold
+        )
+    }
+
+    /// Resolves the RMS threshold used by focus silence auto-stop.
+    ///
+    /// Args:
+    ///   noiseSnapshot: Latest calibrated ambient-noise snapshot, if available.
+    ///   fallbackThreshold: User-configured fallback used before calibration succeeds.
+    ///   triggerThreshold: RMS threshold that triggered this focus recording, if any.
+    ///
+    /// Returns:
+    ///   The trigger threshold when available, then the calibrated threshold, otherwise the fallback.
+    nonisolated static func resolveAutoStopEffectiveThreshold(
+        noiseSnapshot: NoiseFloorSnapshot?,
+        fallbackThreshold: Float,
+        triggerThreshold: Float?
+    ) -> Float {
+        if let triggerThreshold, triggerThreshold.isFinite, triggerThreshold > 0 {
+            return max(triggerThreshold, Self.autoStopMinRMSThreshold)
+        }
+        if let noiseSnapshot {
+            return max(noiseSnapshot.threshold, Self.autoStopMinRMSThreshold)
+        }
+        return max(fallbackThreshold, Self.autoStopMinRMSThreshold)
     }
 
     /// Reads the focus false-start timeout.
@@ -1557,22 +1610,15 @@ actor RecognitionSession {
         return min(max(raw, 0.3), 5.0)
     }
 
-    /// Adapts the RMS stop threshold after ASR has confirmed speech text.
+    /// Preserves the RMS stop threshold after ASR has confirmed speech text.
     ///
     /// Args:
-    ///   avg: Current sliding-window RMS.
     ///   currentThreshold: Current effective RMS threshold.
     ///
     /// Returns:
-    ///   A threshold no higher than the current value, matching the Python MyType logic.
-    private static func adaptAutoStopThresholdFromASR(avg: Float, currentThreshold: Float) -> Float {
-        let noiseFloor = NoiseFloorStore.snapshot()?.noiseFloor ?? 0
-        let adapted = max(
-            noiseFloor + Self.autoStopASRNoiseMargin,
-            avg * Self.autoStopASRThresholdRatio,
-            Self.autoStopMinASRThreshold
-        )
-        return min(currentThreshold, adapted)
+    ///   The unchanged threshold so start and end gates stay aligned for the session.
+    nonisolated static func autoStopThresholdAfterASRText(currentThreshold: Float) -> Float {
+        currentThreshold
     }
 
     /// Calculates RMS from PCM16 audio bytes.

@@ -36,4 +36,22 @@ final class ASRProviderRegistryTests: XCTestCase {
         let bailianModes = ASRProviderRegistry.supportedModes(from: modes, for: .bailian)
         XCTAssertEqual(bailianModes.map(\.id), [ProcessingMode.directId, customMode.id])
     }
+
+    func testSettingsCredentialValidationAcceptsVolcanoApiKeyOnly() {
+        XCTAssertTrue(ASRSettingsCard.hasValidASRCredentials(
+            provider: .volcano,
+            values: ["apiKey": "new-console-api-key"]
+        ))
+    }
+
+    func testSettingsCredentialValidationAcceptsVolcanoLegacyPair() {
+        XCTAssertTrue(ASRSettingsCard.hasValidASRCredentials(
+            provider: .volcano,
+            values: ["appKey": "app-id", "accessKey": "access-token"]
+        ))
+    }
+
+    func testSettingsCredentialValidationRejectsEmptyVolcanoCredentials() {
+        XCTAssertFalse(ASRSettingsCard.hasValidASRCredentials(provider: .volcano, values: [:]))
+    }
 }
