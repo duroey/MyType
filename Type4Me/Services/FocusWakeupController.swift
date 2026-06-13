@@ -268,6 +268,7 @@ final class FocusWakeupController {
                 DebugFileLogger.log("focus wakeup: editable focus retained pid=\(focus.pid) role=\(focus.role)")
                 startAudioMonitoring()
             } else {
+                restoreFocusWaitingIfNeeded()
                 recoverStaleAudioMonitoringIfNeeded()
             }
 
@@ -289,6 +290,7 @@ final class FocusWakeupController {
     /// Starts a low-cost local microphone monitor for RMS wakeup detection.
     private func startAudioMonitoring() {
         guard !isMonitoringAudio else {
+            restoreFocusWaitingIfNeeded()
             DebugFileLogger.log(
                 "focus wakeup: local RMS monitor start skipped alreadyMonitoring=true focus=\(Self.focusLogDescription(currentFocus)) deviceUID=\(Self.selectedMicrophoneUIDDescription())"
             )
@@ -323,6 +325,60 @@ final class FocusWakeupController {
         }
     }
 
+    /// Restores the blue focus-waiting UI when the monitor stayed alive across sessions.
+    private func restoreFocusWaitingIfNeeded(now: Date = Date()) {
+        guard let appState else { return }
+        guard Self.shouldRestoreFocusWaitingUI(
+            isMonitoringAudio: isMonitoringAudio,
+            isFocusRecording: isFocusRecording,
+            isManualRecordingPaused: isManualRecordingPaused,
+            isStartGatePausedByEscape: isStartGatePausedByEscape,
+            hasCurrentFocus: currentFocus != nil,
+            rearmBlockedUntil: rearmBlockedUntil,
+            now: now,
+            barPhase: appState.barPhase
+        ) else {
+            return
+        }
+        appState.showFocusWaiting()
+        DebugFileLogger.log("focus wakeup: focusWaiting restored while monitor remains active")
+    }
+
+    /// Determines whether focus waiting UI should be restored without reopening audio.
+    ///
+    /// Args:
+    ///   isMonitoringAudio: Whether the local RMS monitor is already running.
+    ///   isFocusRecording: Whether a focus-triggered recognition session is active.
+    ///   isManualRecordingPaused: Whether manual hotkey recording owns the microphone.
+    ///   isStartGatePausedByEscape: Whether Escape has paused the start RMS gate.
+    ///   hasCurrentFocus: Whether an editable element is currently retained.
+    ///   rearmBlockedUntil: Timestamp before which the next focus wakeup is blocked.
+    ///   now: Current timestamp.
+    ///   barPhase: Current floating bar phase.
+    ///
+    /// Returns:
+    ///   True when the monitor is alive and ready, but the waiting UI is hidden.
+    nonisolated static func shouldRestoreFocusWaitingUI(
+        isMonitoringAudio: Bool,
+        isFocusRecording: Bool,
+        isManualRecordingPaused: Bool,
+        isStartGatePausedByEscape: Bool,
+        hasCurrentFocus: Bool,
+        rearmBlockedUntil: Date,
+        now: Date,
+        barPhase: FloatingBarPhase
+    ) -> Bool {
+        guard isMonitoringAudio,
+              !isFocusRecording,
+              !isManualRecordingPaused,
+              !isStartGatePausedByEscape,
+              hasCurrentFocus,
+              now >= rearmBlockedUntil else {
+            return false
+        }
+        return barPhase == .hidden
+    }
+
     /// Stops the local microphone monitor and clears pending RMS state.
     ///
     /// Args:
@@ -348,9 +404,15 @@ final class FocusWakeupController {
     /// Args:
     ///   data: PCM16 little-endian audio bytes captured from the selected microphone.
     private func handleMonitorAudio(_ data: Data) {
-        guard currentFocus != nil, !isFocusRecording, !isManualRecordingPaused else { return }
         lastFrameAt = Date()
         monitorFrameCount += 1
+        if isFocusRecording {
+            Task { await session.acceptExternalAudioFrame(data) }
+            return
+        }
+        guard currentFocus != nil, !isManualRecordingPaused else { return }
+        guard Date() >= rearmBlockedUntil else { return }
+
         preRollFrames.append(data)
         if preRollFrames.count > config.preRollFrames {
             preRollFrames.removeFirst(preRollFrames.count - config.preRollFrames)
@@ -394,7 +456,9 @@ final class FocusWakeupController {
     private func startFocusRecording(initialFrames: [Data], triggerThreshold: Float) {
         guard !isFocusRecording else { return }
         let initialChunks = Self.chunkAudioFrames(initialFrames)
-        stopAudioMonitoring()
+        rmsWindow = []
+        preRollFrames = []
+        consecutiveSpeechFrames = 0
         isFocusRecording = true
 
         let mode = Self.resolvedFocusWakeupMode(
@@ -416,7 +480,8 @@ final class FocusWakeupController {
                 mode: mode,
                 autoStopOnSilence: true,
                 initialAudioChunks: initialChunks,
-                autoStopThresholdOverride: triggerThreshold
+                autoStopThresholdOverride: triggerThreshold,
+                externalAudioInput: true
             )
         }
     }

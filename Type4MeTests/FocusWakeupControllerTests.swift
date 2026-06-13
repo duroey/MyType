@@ -2,6 +2,23 @@ import XCTest
 @testable import Type4Me
 
 final class FocusWakeupControllerTests: XCTestCase {
+    func testShouldRestoreFocusWaitingWhenMonitorIsRunningAndPanelHidden() {
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+
+        let shouldRestore = FocusWakeupController.shouldRestoreFocusWaitingUI(
+            isMonitoringAudio: true,
+            isFocusRecording: false,
+            isManualRecordingPaused: false,
+            isStartGatePausedByEscape: false,
+            hasCurrentFocus: true,
+            rearmBlockedUntil: Date(timeIntervalSinceReferenceDate: 99),
+            now: now,
+            barPhase: .hidden
+        )
+
+        XCTAssertTrue(shouldRestore)
+    }
+
     func testShouldReopenWhenMonitorStartedButNoFramesArrived() {
         let startedAt = Date(timeIntervalSinceReferenceDate: 100)
         let now = Date(timeIntervalSinceReferenceDate: 101.2)

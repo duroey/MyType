@@ -187,6 +187,9 @@ actor RecognitionSession {
     private var audioChunkSenderTask: Task<Void, Never>?
     private var uploadFailureFlag: UploadFailureFlag?
     private var lastStreamingError: Error?
+    private var usesExternalAudioInput = false
+    private var externalFrameBuffer: ExternalAudioFrameBuffer?
+    private var externalPendingAudioBuffer: AudioChunkBuffer?
 
     /// Flipped to true when mic level exceeds threshold during recording.
     /// When false at stop time, we skip the full ASR teardown (no speech = nothing to finalize).
@@ -255,11 +258,13 @@ actor RecognitionSession {
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
     ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
     ///   autoStopThresholdOverride: RMS threshold used by the trigger that started this recording.
+    ///   externalAudioInput: Whether audio frames are supplied by an already-running capture stream.
     func startRecording(
         mode: ProcessingMode = .direct,
         autoStopOnSilence: Bool = false,
         initialAudioChunks: [Data] = [],
-        autoStopThresholdOverride: Float? = nil
+        autoStopThresholdOverride: Float? = nil,
+        externalAudioInput: Bool = false
     ) async {
         if state == .finishing || state == .injecting || state == .postProcessing {
             NSLog("[Session] startRecording: blocked, current session still processing (state=%@)", String(describing: state))
@@ -410,10 +415,20 @@ actor RecognitionSession {
         // Audio chunks are buffered while WebSocket handshake is in progress.
         // This eliminates the ~1s perceived latency from connect().
 
-        let audioBuffer = AudioChunkBuffer()
+        let audioBuffer = externalAudioInput
+            ? (externalPendingAudioBuffer ?? AudioChunkBuffer())
+            : AudioChunkBuffer()
+        if externalAudioInput {
+            usesExternalAudioInput = true
+            externalFrameBuffer = ExternalAudioFrameBuffer()
+            externalPendingAudioBuffer = audioBuffer
+        } else {
+            clearExternalAudioInputState()
+        }
         var queuedInitialBytes = 0
         for chunk in initialAudioChunks {
             audioBuffer.append(chunk)
+            externalFrameBuffer?.appendRecordedChunk(chunk)
             queuedInitialBytes += chunk.count
         }
         if !initialAudioChunks.isEmpty {
@@ -422,41 +437,45 @@ actor RecognitionSession {
             )
         }
 
-        speechDetected = false
-        let levelHandler = self.onAudioLevel
-        let speechGraceMs = SoundFeedback.startSoundDurationMs()
-        let speechGraceEnd = ContinuousClock.now + .milliseconds(speechGraceMs)
-        audioEngine.onAudioLevel = { [weak self] level in
-            if level > RecognitionSession.speechLevelThreshold,
-               ContinuousClock.now >= speechGraceEnd {
-                Task { await self?.markSpeechDetected() }
+        speechDetected = externalAudioInput && !initialAudioChunks.isEmpty
+        if externalAudioInput {
+            DebugFileLogger.log("audio engine external input attached")
+        } else {
+            let levelHandler = self.onAudioLevel
+            let speechGraceMs = SoundFeedback.startSoundDurationMs()
+            let speechGraceEnd = ContinuousClock.now + .milliseconds(speechGraceMs)
+            audioEngine.onAudioLevel = { [weak self] level in
+                if level > RecognitionSession.speechLevelThreshold,
+                   ContinuousClock.now >= speechGraceEnd {
+                    Task { await self?.markSpeechDetected() }
+                }
+                levelHandler?(level)
             }
-            levelHandler?(level)
-        }
 
-        audioEngine.onAudioChunk = { [weak self] data in
-            guard self != nil else { return }
-            audioBuffer.append(data)
-        }
-        audioEngine.onAudioFrame = { [weak self] data in
-            Task { await self?.handleAutoStopAudioFrame(data, expectedGeneration: myGeneration) }
-        }
+            audioEngine.onAudioChunk = { [weak self] data in
+                guard self != nil else { return }
+                audioBuffer.append(data)
+            }
+            audioEngine.onAudioFrame = { [weak self] data in
+                Task { await self?.handleAutoStopAudioFrame(data, expectedGeneration: myGeneration) }
+            }
 
-        do {
-            audioEngine.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
-            try audioEngine.start()
-            NSLog("[Session] Audio engine started OK")
-            DebugFileLogger.log("audio engine started OK")
-        } catch {
-            NSLog("[Session] Audio engine start FAILED: %@", String(describing: error))
-            DebugFileLogger.log("audio engine start failed: \(String(describing: error))")
-            SoundFeedback.playError()
-            await client.disconnect()
-            self.asrClient = nil
-            state = .idle
-            onASREvent?(.error(error))
-            onASREvent?(.completed)
-            return
+            do {
+                audioEngine.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
+                try audioEngine.start()
+                NSLog("[Session] Audio engine started OK")
+                DebugFileLogger.log("audio engine started OK")
+            } catch {
+                NSLog("[Session] Audio engine start FAILED: %@", String(describing: error))
+                DebugFileLogger.log("audio engine start failed: \(String(describing: error))")
+                SoundFeedback.playError()
+                await client.disconnect()
+                self.asrClient = nil
+                state = .idle
+                onASREvent?(.error(error))
+                onASREvent?(.completed)
+                return
+            }
         }
 
         state = .recording
@@ -480,10 +499,13 @@ actor RecognitionSession {
             NSLog("[Session] ASR connect FAILED provider=%@ error=%@", provider.rawValue, String(describing: error))
             DebugFileLogger.log("ASR connect failed provider=\(provider.rawValue): \(String(describing: error))")
             SoundFeedback.playError()
-            audioEngine.stop()
+            if !usesExternalAudioInput {
+                audioEngine.stop()
+            }
             audioEngine.onAudioChunk = nil
             audioEngine.onAudioFrame = nil
             audioEngine.onAudioLevel = nil
+            clearExternalAudioInputState()
             await client.disconnect()
             self.asrClient = nil
             state = .idle
@@ -499,6 +521,7 @@ actor RecognitionSession {
             DebugFileLogger.log("startRecording: zombie or state change after connect (gen=\(myGeneration) current=\(sessionGeneration) state=\(state)), bailing")
             await client.disconnect()
             self.asrClient = nil
+            clearExternalAudioInputState()
             return
         }
 
@@ -525,10 +548,14 @@ actor RecognitionSession {
         // Switch callback from buffer to live pipeline
         var chunkCount = bufferedChunks.count
         let failureFlag = self.uploadFailureFlag
-        audioEngine.onAudioChunk = { data in
-            if failureFlag?.failed == true { return }
-            chunkCount += 1
-            chunkContinuation.yield(data)
+        if usesExternalAudioInput {
+            externalPendingAudioBuffer = nil
+        } else {
+            audioEngine.onAudioChunk = { data in
+                if failureFlag?.failed == true { return }
+                chunkCount += 1
+                chunkContinuation.yield(data)
+            }
         }
 
         // Catch any chunks that arrived between drain and callback switch
@@ -570,6 +597,40 @@ actor RecognitionSession {
     /// Switch the processing mode before stopping. Used for cross-mode hotkey stops.
     func switchMode(to mode: ProcessingMode) {
         currentMode = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
+    }
+
+    /// Feeds one externally captured PCM frame into the active recognition session.
+    ///
+    /// Args:
+    ///   data: PCM16 little-endian audio bytes captured by an external monitor stream.
+    func acceptExternalAudioFrame(_ data: Data) async {
+        guard usesExternalAudioInput,
+              state == .starting || state == .recording,
+              let frameBuffer = externalFrameBuffer else {
+            return
+        }
+
+        let chunks = frameBuffer.appendFrame(data)
+        if Self.rms16(data) >= max(autoStopEffectiveThreshold, Self.autoStopMinRMSThreshold) {
+            markSpeechDetected()
+        }
+
+        if !chunks.isEmpty {
+            if let continuation = audioChunkContinuation {
+                for chunk in chunks {
+                    continuation.yield(chunk)
+                }
+            } else {
+                let buffer = externalPendingAudioBuffer ?? AudioChunkBuffer()
+                for chunk in chunks {
+                    buffer.append(chunk)
+                }
+                externalPendingAudioBuffer = buffer
+            }
+        }
+
+        guard state == .recording else { return }
+        await handleAutoStopAudioFrame(data, expectedGeneration: sessionGeneration)
     }
 
     // MARK: - Stop
@@ -624,9 +685,18 @@ actor RecognitionSession {
         SystemVolumeManager.restore()
         SoundFeedback.playStop()
 
-        // Stop capture first so flushRemaining() can emit the tail audio chunk.
-        audioEngine.stop()
-        audioEngine.onAudioChunk = nil
+        // Stop only the capture stream owned by this session. Focus wakeup feeds
+        // external frames from its long-lived monitor, so stopping here would
+        // recreate the Bluetooth/CoreAudio start-stop race.
+        if usesExternalAudioInput {
+            if let tailChunk = externalFrameBuffer?.flushPartialChunk() {
+                audioChunkContinuation?.yield(tailChunk)
+                DebugFileLogger.log("stop: external audio tail flushed \(tailChunk.count)B")
+            }
+        } else {
+            audioEngine.stop()
+            audioEngine.onAudioChunk = nil
+        }
         await finishAudioChunkPipeline()
         DebugFileLogger.log("stop: audio stopped +\(ContinuousClock.now - stopT0)")
         guard sessionGeneration == myGeneration else {
@@ -655,6 +725,7 @@ actor RecognitionSession {
             }
             resetSpeculativeLLM()
             resetAutoStopState()
+            clearExternalAudioInputState()
             SystemVolumeManager.restore()
             return
         }
@@ -693,6 +764,7 @@ actor RecognitionSession {
                     }
                     resetSpeculativeLLM()
                     resetAutoStopState()
+                    clearExternalAudioInputState()
                     SystemVolumeManager.restore()
                     return
                 }
@@ -868,7 +940,9 @@ actor RecognitionSession {
             DebugFileLogger.log(
                 "stop: streaming failed (partial=\(partialText.count) chars, uploadFailed=\(uploadFailed), hasStreamingError=\(lastStreamingError != nil)), attempting batch fallback"
             )
-            let fullAudio = audioEngine.getRecordedAudio()
+            let fullAudio = usesExternalAudioInput
+                ? (externalFrameBuffer?.recordedAudio() ?? Data())
+                : audioEngine.getRecordedAudio()
             if !fullAudio.isEmpty, let config = currentConfig {
                 onASREvent?(.processingResult(text: partialText.isEmpty ? "重新识别中..." : partialText))
                 if let batchText = await attemptBatchFallback(audio: fullAudio, config: config) {
@@ -933,6 +1007,7 @@ actor RecognitionSession {
                 }
                 resetSpeculativeLLM()
                 resetAutoStopState()
+                clearExternalAudioInputState()
                 SystemVolumeManager.restore()
                 logger.info("Session complete, routed agent text \(finalText.count) chars")
                 return
@@ -1129,6 +1204,7 @@ actor RecognitionSession {
         }
         resetSpeculativeLLM()
         resetAutoStopState()
+        clearExternalAudioInputState()
         SystemVolumeManager.restore()
         logger.info("Session complete, injected \(effectiveText.count) chars")
     }
@@ -1307,6 +1383,14 @@ actor RecognitionSession {
             DebugFileLogger.log("audio chunk pipeline drain timeout; sender cancelled")
         }
         audioChunkSenderTask = nil
+    }
+
+    /// Clears external audio input state without touching the owner capture stream.
+    private func clearExternalAudioInputState() {
+        usesExternalAudioInput = false
+        externalFrameBuffer?.reset()
+        externalFrameBuffer = nil
+        externalPendingAudioBuffer = nil
     }
 
     private func markReadyIfNeeded() {
@@ -1851,10 +1935,16 @@ actor RecognitionSession {
         resetSpeculativeLLM()
         resetAutoStopState()
 
-        audioEngine.stop()
+        if usesExternalAudioInput {
+            DebugFileLogger.log("forceReset: detached external audio input without stopping owner capture")
+        } else {
+            audioEngine.stop()
+        }
         audioEngine.onAudioChunk = nil
+        audioEngine.onAudioFrame = nil
         audioEngine.onAudioLevel = nil
         await finishAudioChunkPipeline(timeout: .milliseconds(100))
+        clearExternalAudioInputState()
 
         if let client = asrClient {
             Task.detached { await client.disconnect() }  // fire-and-forget: detached to avoid blocking actor
