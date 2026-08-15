@@ -24,7 +24,7 @@ final class CmuxAgentRouterService: @unchecked Sendable {
     init(
         sessionStore: CmuxSessionSnapshotLoading = CmuxSessionStore.shared,
         commandClient: CmuxCommandClient = CmuxCommandClient(),
-        sessionIndex: CodexSessionIndexStore = CodexSessionIndexStore(),
+        sessionIndex: CodexSessionIndexStore = .shared,
         sessionWorkspaceCreator: (@Sendable (CodexSessionIndexEntry, String) -> Bool)? = nil,
         launcher: AgentLauncherService = .shared
     ) {

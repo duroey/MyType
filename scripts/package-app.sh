@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && /bin/pwd -P)"
-APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/mytype.app}"
-APP_NAME="mytype"
+APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/MyType.app}"
+APP_NAME="${APP_NAME:-MyType}"
 APP_EXECUTABLE="Type4Me"
 APP_ICON_NAME="AppIcon"
 APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.mytype.app}"
@@ -18,16 +18,27 @@ APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-mytype 需要�
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
 
 ENTITLEMENTS="$PROJECT_DIR/entitlements.plist"
+LOCAL_SIGNING_IDENTITY="${LOCAL_SIGNING_IDENTITY:-MyType}"
 
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     SIGNING_IDENTITY="$CODESIGN_IDENTITY"
 elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
     SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
     echo "Using Developer ID: $SIGNING_IDENTITY"
-elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Type4Me Dev"; then
-    SIGNING_IDENTITY="Type4Me Dev"
+# A self-signed local identity remains usable by codesign without global trust.
+elif security find-certificate -c "$LOCAL_SIGNING_IDENTITY" >/dev/null 2>&1 \
+    && security find-key -l "$LOCAL_SIGNING_IDENTITY" >/dev/null 2>&1; then
+    SIGNING_IDENTITY="$LOCAL_SIGNING_IDENTITY"
+    echo "Using local signing identity: $SIGNING_IDENTITY"
 else
-    SIGNING_IDENTITY="-"
+    echo "ERROR: No signing identity found. Create '$LOCAL_SIGNING_IDENTITY' or explicitly set CODESIGN_IDENTITY='-' for ad-hoc signing."
+    exit 1
+fi
+
+if [ "$SIGNING_IDENTITY" = "$LOCAL_SIGNING_IDENTITY" ] || [ "$SIGNING_IDENTITY" = "-" ]; then
+    CODESIGN_TIMESTAMP_ARGS=(--timestamp=none)
+else
+    CODESIGN_TIMESTAMP_ARGS=(--timestamp)
 fi
 
 if [ "$ARCH" = "arm64" ]; then
@@ -200,7 +211,7 @@ WRAPPER
         # macOS 14+; additional kernels are compiled from embedded source at
         # runtime for the host's Metal version.
         find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.metallib" -o -perm +111 \) \
-            -exec codesign --force --options runtime --timestamp --sign "${SIGNING_IDENTITY}" {} \; 2>/dev/null || true
+            -exec codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "${SIGNING_IDENTITY}" {} \; 2>/dev/null || true
         echo "qwen3-asr-server bundled and signed."
     else
         echo "WARNING: qwen3-asr-server dist not found at $QWEN3_DIST (Qwen3 calibration will be unavailable)"
@@ -231,20 +242,24 @@ if [ "$NEEDS_SIGN" = "1" ]; then
     # Sign frameworks and dylibs first (inside-out signing)
     find "$APP_PATH/Contents/Frameworks" \
         -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) \
-        -exec codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" {} \; 2>/dev/null || true
+        -exec codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY" {} \; 2>/dev/null || true
 
     # Sign the wrapper script in Contents/MacOS
     Q3_WRAPPER="$APP_PATH/Contents/MacOS/qwen3-asr-server"
     if [ -f "$Q3_WRAPPER" ]; then
-        codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$Q3_WRAPPER"
+        codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY" "$Q3_WRAPPER"
     fi
 
     # Sign the main app bundle with hardened runtime + entitlements
-    CODESIGN_ARGS=(--force --options runtime --timestamp --sign "$SIGNING_IDENTITY")
+    CODESIGN_ARGS=(--force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY")
     if [ -f "$ENTITLEMENTS" ]; then
         CODESIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
     fi
-    codesign "${CODESIGN_ARGS[@]}" "$APP_PATH" && echo "Signed." || echo "Signing skipped (no identity available)."
+    if ! codesign "${CODESIGN_ARGS[@]}" "$APP_PATH"; then
+        echo "ERROR: Failed to sign app with '$SIGNING_IDENTITY'."
+        exit 1
+    fi
+    echo "Signed."
     codesign --verify --strict "$APP_PATH" && echo "Signature verified." || { echo "ERROR: Signature verification failed"; exit 1; }
 fi
 

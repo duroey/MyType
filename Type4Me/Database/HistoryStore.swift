@@ -47,6 +47,12 @@ actor HistoryStore {
         }
     }
 
+    /// Closes the SQLite connection owned by this store.
+    deinit {
+        guard let db else { return }
+        sqlite3_close(db)
+    }
+
     // MARK: - CRUD
 
     func insert(_ record: HistoryRecord) {

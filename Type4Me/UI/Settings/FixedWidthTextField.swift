@@ -95,11 +95,14 @@ private class SettingsNSSecureTextField: NSSecureTextField {
 struct FixedWidthTextField: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
+    var commitOnReturnOrOutsideClick = false
+    var onEditingEnded: ((String) -> Void)? = nil
 
     func makeNSView(context: Context) -> NSTextField {
         let field = SettingsNSTextField()
         SettingsFieldStyle.applyCommon(to: field, placeholder: placeholder)
         field.delegate = context.coordinator
+        context.coordinator.attach(field: field)
         return field
     }
 
@@ -107,14 +110,93 @@ struct FixedWidthTextField: NSViewRepresentable {
         if nsView.stringValue != text { nsView.stringValue = text }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            text: $text,
+            commitOnReturnOrOutsideClick: commitOnReturnOrOutsideClick,
+            onEditingEnded: onEditingEnded
+        )
+    }
 
     class Coordinator: NSObject, NSTextFieldDelegate {
         var text: Binding<String>
-        init(text: Binding<String>) { self.text = text }
+        var commitOnReturnOrOutsideClick: Bool
+        var onEditingEnded: ((String) -> Void)?
+        private weak var field: NSTextField?
+        private var mouseDownMonitor: Any?
+
+        init(
+            text: Binding<String>,
+            commitOnReturnOrOutsideClick: Bool,
+            onEditingEnded: ((String) -> Void)?
+        ) {
+            self.text = text
+            self.commitOnReturnOrOutsideClick = commitOnReturnOrOutsideClick
+            self.onEditingEnded = onEditingEnded
+        }
+
+        deinit {
+            if let mouseDownMonitor {
+                NSEvent.removeMonitor(mouseDownMonitor)
+            }
+        }
+
+        /// Attaches the coordinator to its AppKit field and installs optional outside-click commit handling.
+        ///
+        /// Args:
+        ///   field: Backing text field created by SwiftUI.
+        func attach(field: NSTextField) {
+            self.field = field
+            guard commitOnReturnOrOutsideClick, mouseDownMonitor == nil else { return }
+            mouseDownMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+            ) { [weak self] event in
+                self?.commitIfClickIsOutsideField(event)
+                return event
+            }
+        }
+
         func controlTextDidChange(_ obj: Notification) {
             guard let field = obj.object as? NSTextField else { return }
             text.wrappedValue = field.stringValue
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            text.wrappedValue = field.stringValue
+            onEditingEnded?(field.stringValue)
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard commitOnReturnOrOutsideClick,
+                  commandSelector == #selector(NSResponder.insertNewline(_:))
+                    || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:))
+            else {
+                return false
+            }
+            commitAndEndEditing(field: control as? NSTextField, value: textView.string)
+            return true
+        }
+
+        private func commitIfClickIsOutsideField(_ event: NSEvent) {
+            guard let field,
+                  let window = field.window,
+                  event.window === window,
+                  let editor = field.currentEditor(),
+                  window.firstResponder === editor
+            else {
+                return
+            }
+            let pointInField = field.convert(event.locationInWindow, from: nil)
+            guard !field.bounds.contains(pointInField) else { return }
+            commitAndEndEditing(field: field, value: editor.string)
+        }
+
+        private func commitAndEndEditing(field: NSTextField?, value: String) {
+            field?.stringValue = value
+            text.wrappedValue = value
+            onEditingEnded?(value)
+            field?.window?.makeFirstResponder(nil)
         }
     }
 }

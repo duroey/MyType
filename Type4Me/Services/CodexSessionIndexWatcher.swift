@@ -32,7 +32,7 @@ final class CodexSessionIndexWatcher: @unchecked Sendable {
             .appendingPathComponent(".codex", isDirectory: true)
             .appendingPathComponent("sessions", isDirectory: true),
         debounceDelay: TimeInterval = CodexSessionIndexWatcher.defaultDebounceDelay,
-        sessionIndex: CodexSessionIndexStore = CodexSessionIndexStore(),
+        sessionIndex: CodexSessionIndexStore = .shared,
         fileManager: FileManager = .default
     ) {
         self.sessionsRoot = sessionsRoot

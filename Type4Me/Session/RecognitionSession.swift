@@ -346,31 +346,70 @@ actor RecognitionSession {
                 onASREvent?(.completed)
                 return
             }
-        } else if let savedConfig = KeychainService.loadASRConfig(for: provider) {
-            config = savedConfig
-            NSLog("[Session] Loaded %@ credentials from file store", provider.rawValue)
-        } else if provider == .volcano,
-                  let appKey = ProcessInfo.processInfo.environment["VOLC_APP_KEY"],
-                  let accessKey = ProcessInfo.processInfo.environment["VOLC_ACCESS_KEY"] {
-            // Env var fallback (volcano only, for dev convenience)
-            let resourceId = ProcessInfo.processInfo.environment["VOLC_RESOURCE_ID"] ?? VolcanoASRConfig.resourceIdSeedASR
-            let volcConfig = VolcanoASRConfig(credentials: [
-                "appKey": appKey, "accessKey": accessKey, "resourceId": resourceId,
-            ])!
-            do {
-                try KeychainService.saveASRCredentials(appKey: appKey, accessKey: accessKey, resourceId: resourceId)
-                NSLog("[Session] Loaded credentials from env vars and persisted to file")
-            } catch {
-                NSLog("[Session] WARNING: env var credentials loaded but failed to persist: %@", String(describing: error))
-            }
-            config = volcConfig
         } else {
-            NSLog("[Session] No ASR credentials found for provider=%@!", provider.rawValue)
-            SoundFeedback.playError()
-            state = .idle
-            onASREvent?(.error(NSError(domain: "mytype", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")])))
-            onASREvent?(.completed)
-            return
+            do {
+                if let savedConfig = try KeychainService.loadASRConfigCheckingKeychain(for: provider) {
+                    config = savedConfig
+                    NSLog("[Session] Loaded %@ credentials from secure store", provider.rawValue)
+                } else if provider == .volcano,
+                          let appKey = ProcessInfo.processInfo.environment["VOLC_APP_KEY"],
+                          let accessKey = ProcessInfo.processInfo.environment["VOLC_ACCESS_KEY"] {
+                    // Env var fallback (volcano only, for dev convenience)
+                    let resourceId = ProcessInfo.processInfo.environment["VOLC_RESOURCE_ID"] ?? VolcanoASRConfig.resourceIdSeedASR
+                    let volcConfig = VolcanoASRConfig(credentials: [
+                        "appKey": appKey, "accessKey": accessKey, "resourceId": resourceId,
+                    ])!
+                    do {
+                        try KeychainService.saveASRCredentials(appKey: appKey, accessKey: accessKey, resourceId: resourceId)
+                        NSLog("[Session] Loaded credentials from env vars and persisted to secure store")
+                    } catch {
+                        NSLog("[Session] WARNING: env var credentials loaded but failed to persist: %@", String(describing: error))
+                    }
+                    config = volcConfig
+                } else {
+                    NSLog("[Session] No ASR credentials found for provider=%@!", provider.rawValue)
+                    SoundFeedback.playError()
+                    state = .idle
+                    onASREvent?(.error(NSError(domain: "mytype", code: -1, userInfo: [NSLocalizedDescriptionKey: L("未配置 API 凭证", "API credentials not configured")])))
+                    onASREvent?(.completed)
+                    return
+                }
+            } catch let error as KeychainReadError {
+                NSLog(
+                    "[Session] ASR credentials unavailable provider=%@: %@",
+                    provider.rawValue,
+                    String(describing: error)
+                )
+                SoundFeedback.playError()
+                state = .idle
+                onASREvent?(.error(NSError(
+                    domain: "mytype",
+                    code: -4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: error.errorDescription
+                            ?? L("无法读取 API 凭证", "Unable to read API credentials"),
+                    ]
+                )))
+                onASREvent?(.completed)
+                return
+            } catch {
+                NSLog(
+                    "[Session] Unexpected credential read failure provider=%@: %@",
+                    provider.rawValue,
+                    String(describing: error)
+                )
+                SoundFeedback.playError()
+                state = .idle
+                onASREvent?(.error(NSError(
+                    domain: "mytype",
+                    code: -5,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: L("无法读取 API 凭证", "Unable to read API credentials"),
+                    ]
+                )))
+                onASREvent?(.completed)
+                return
+            }
         }
 
         self.currentConfig = config
@@ -1683,15 +1722,9 @@ actor RecognitionSession {
     /// Reads the focus auto-submit silence duration.
     ///
     /// Returns:
-    ///   A bounded silence duration in seconds. The default matches the current
-    ///   Python-derived behavior while preventing corrupt settings from causing
-    ///   immediate or excessively delayed submission.
+    ///   The normalized user-configured silence duration in seconds.
     private static func focusAutoStopSilenceSeconds() -> Double {
-        let defaults = UserDefaults.standard
-        let raw = defaults.object(forKey: "tf_focusAutoStopSilenceSeconds") == nil
-            ? 0.9
-            : defaults.double(forKey: "tf_focusAutoStopSilenceSeconds")
-        return min(max(raw, 0.3), 5.0)
+        FocusAutoStopSilenceSetting.read()
     }
 
     /// Preserves the RMS stop threshold after ASR has confirmed speech text.

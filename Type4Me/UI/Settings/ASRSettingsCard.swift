@@ -14,6 +14,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     @State private var isEditingASR = true
     @State private var hasStoredASR = false
     @State private var testTask: Task<Void, Never>?
+    @State private var credentialReadError: String?
     /// Hint shown below ASR credentials when only bigasr works (not seed 2.0)
     @State private var volcResourceHint: String?
 
@@ -174,7 +175,11 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                 HStack(spacing: 8) {
                     Spacer()
                     testButton(L("测试连接", "Test"), status: asrTestStatus) { testASRConnection() }
-                        .disabled(!hasASRCredentials || !isASRProviderAvailable)
+                        .disabled(
+                            !hasASRCredentials
+                                || !isASRProviderAvailable
+                                || credentialReadError != nil
+                        )
                     if isZeroCredentialProvider {
                         EmptyView()
                     } else if hasASRCredentials && !isEditingASR {
@@ -194,13 +199,19 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                             }
                         }
                         primaryButton(L("保存", "Save")) { saveASRCredentials() }
-                            .disabled(!hasASRCredentials)
+                            .disabled(!hasASRCredentials || credentialReadError != nil)
                     }
                 }
                 .padding(.top, 12)
 
                 if let hint = volcResourceHint {
                     Text(hint)
+                        .font(.system(size: 11))
+                        .foregroundStyle(TF.settingsAccentAmber)
+                        .padding(.top, 4)
+                }
+                if let credentialReadError {
+                    Text(credentialReadError)
                         .font(.system(size: 11))
                         .foregroundStyle(TF.settingsAccentAmber)
                         .padding(.top, 4)
@@ -712,21 +723,29 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     private func loadASRCredentialsForProvider(_ provider: ASRProvider) {
         testTask?.cancel()
         editedFields = []
-        if let values = KeychainService.loadASRCredentials(for: provider) {
-            asrCredentialValues = values
-            savedASRValues = values
-            hasStoredASR = true
-            isEditingASR = !hasASRCredentials
-        } else {
-            var defaults: [String: String] = [:]
-            let fields = ASRProviderRegistry.configType(for: provider)?.credentialFields ?? []
-            for field in fields where !field.defaultValue.isEmpty {
-                defaults[field.key] = field.defaultValue
+        credentialReadError = nil
+        do {
+            if let values = try KeychainService.loadASRCredentialsCheckingKeychain(for: provider) {
+                asrCredentialValues = values
+                savedASRValues = values
+                hasStoredASR = true
+                isEditingASR = !hasASRCredentials
+            } else {
+                var defaults: [String: String] = [:]
+                let fields = ASRProviderRegistry.configType(for: provider)?.credentialFields ?? []
+                for field in fields where !field.defaultValue.isEmpty {
+                    defaults[field.key] = field.defaultValue
+                }
+                asrCredentialValues = defaults
+                savedASRValues = [:]
+                hasStoredASR = false
+                isEditingASR = true
             }
-            asrCredentialValues = defaults
-            savedASRValues = [:]
-            hasStoredASR = false
-            isEditingASR = true
+        } catch let error as KeychainReadError {
+            credentialReadError = error.errorDescription
+            asrTestStatus = .failed(L("请先解锁登录钥匙串", "Unlock the login keychain first"))
+        } catch {
+            credentialReadError = L("无法读取 API 凭证", "Unable to read API credentials")
         }
     }
 
@@ -838,6 +857,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     }
 
     private func saveASRCredentialsQuietly(_ values: [String: String]) {
+        guard credentialReadError == nil else { return }
         do {
             try KeychainService.saveASRCredentials(for: .volcano, values: values)
             KeychainService.selectedASRProvider = .volcano

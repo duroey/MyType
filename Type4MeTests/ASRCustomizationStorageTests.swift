@@ -37,6 +37,6 @@ final class ASRCustomizationStorageTests: XCTestCase {
         let second = ASRIdentityStore.loadOrCreateUID()
 
         XCTAssertEqual(first, second)
-        XCTAssertTrue(first.hasPrefix("type4me-"))
+        XCTAssertTrue(first.hasPrefix("mytype-"))
     }
 }

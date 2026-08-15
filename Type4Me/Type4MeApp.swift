@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 @main
 struct Type4MeApp: App {
@@ -83,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         DebugFileLogger.startSession()
         DebugFileLogger.log("applicationDidFinishLaunching")
+        migrateRememberedMicrophoneProfileIfNeeded()
         floatingBarController = FloatingBarController(state: appState)
 
         // Bridge ASR events → AppState for floating bar display
@@ -92,6 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await session.historyStore.migrateCharacterCounts() }
         let appState = self.appState
         let focusWakeupController = FocusWakeupController(appState: appState, session: session)
+        focusWakeupController.onRecordingOwnerResolved = { [weak self] modeId in
+            self?.hotkeyManager.setExternalRecordingOwner(modeId: modeId)
+        }
         self.focusWakeupController = focusWakeupController
 
         SoundFeedback.warmUp()
@@ -232,6 +237,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NotificationCenter.default.addObserver(
+            forName: .rememberedMicrophoneProfileDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { [weak self] in
+                self?.reconcileRememberedMicrophoneProfile(restartFocusWakeup: true)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let device = notification.object as? AVCaptureDevice else { return }
+            MainActor.assumeIsolated { [weak self] in
+                self?.handleRememberedMicrophoneDisconnected(device)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasConnectedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let device = notification.object as? AVCaptureDevice else { return }
+            MainActor.assumeIsolated { [weak self] in
+                self?.handleRememberedMicrophoneConnected(device)
+            }
+        }
+
+        NotificationCenter.default.addObserver(
             forName: .noiseFloorCalibrationWillStart,
             object: nil,
             queue: .main
@@ -280,7 +317,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DebugFileLogger.log("agent router index reconcile finished")
             }
             self.codexSessionIndexWatcher.start()
-            if Self.shouldCalibrateNoiseFloorAtStartup() {
+            self.reconcileRememberedMicrophoneProfile(restartFocusWakeup: false)
+            if self.isFocusWakeupEnabled(), Self.shouldCalibrateNoiseFloorAtStartup() {
                 Task {
                     await NoiseFloorCalibrator.calibrateIfNeeded()
                     await MainActor.run {
@@ -355,6 +393,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         AudioKeepAliveManager.syncMicState()
+    }
+
+    /// Migrates legacy global microphone preferences into the single remembered profile.
+    private func migrateRememberedMicrophoneProfileIfNeeded() {
+        let defaults = UserDefaults.standard
+        let focusWakeupEnabled = Self.isFocusWakeupEnabledSetting(defaults: defaults)
+        let profile = RememberedMicrophoneProfileStore.migrateIfNeeded(
+            selectedUID: defaults.string(forKey: "tf_selectedMicrophoneUID") ?? "",
+            lastUserSelectedUID: defaults.string(forKey: "tf_lastUserSelectedMicrophoneUID") ?? "",
+            focusWakeupEnabled: focusWakeupEnabled,
+            defaults: defaults
+        )
+        guard let profile else { return }
+        defaults.set(profile.deviceUID, forKey: "tf_lastUserSelectedMicrophoneUID")
+    }
+
+    /// Reconciles the remembered profile with currently available microphones.
+    ///
+    /// Args:
+    ///   restartFocusWakeup: Whether to restart the live controller after reconciliation.
+    private func reconcileRememberedMicrophoneProfile(restartFocusWakeup: Bool) {
+        let defaults = UserDefaults.standard
+        let availableUIDs = AudioCaptureEngine.availableAudioDevices().map(\.uid)
+        guard let profile = RememberedMicrophoneProfileStore.load(defaults: defaults) else {
+            if restartFocusWakeup {
+                focusWakeupController?.stop()
+                syncFocusWakeupState()
+            }
+            return
+        }
+
+        let runtimeSettings = RememberedMicrophoneProfilePolicy.runtimeSettings(
+            profile: profile,
+            fallbackEnabled: Self.isFocusWakeupEnabledSetting(defaults: defaults),
+            availableUIDs: availableUIDs
+        )
+        defaults.set(profile.deviceUID, forKey: "tf_lastUserSelectedMicrophoneUID")
+        defaults.set(runtimeSettings.focusWakeupEnabled, forKey: "tf_focusWakeupEnabled")
+        if let restoredUID = runtimeSettings.selectedDeviceUID {
+            defaults.set(restoredUID, forKey: "tf_selectedMicrophoneUID")
+        } else if defaults.string(forKey: "tf_selectedMicrophoneUID") == profile.deviceUID {
+            defaults.set("", forKey: "tf_selectedMicrophoneUID")
+        }
+
+        DebugFileLogger.log(
+            "remembered microphone reconciled uid=\(profile.deviceUID) available=\(runtimeSettings.selectedDeviceUID != nil) focusEnabled=\(runtimeSettings.focusWakeupEnabled)"
+        )
+        if restartFocusWakeup {
+            focusWakeupController?.stop()
+            syncFocusWakeupState()
+        }
+    }
+
+    /// Disables Auto Focus when the remembered microphone disconnects.
+    ///
+    /// Args:
+    ///   device: Audio input device reported by the disconnect notification.
+    private func handleRememberedMicrophoneDisconnected(_ device: AVCaptureDevice) {
+        guard let profile = RememberedMicrophoneProfileStore.load(),
+              profile.deviceUID == device.uniqueID else { return }
+        let defaults = UserDefaults.standard
+        defaults.set("", forKey: "tf_selectedMicrophoneUID")
+        defaults.set(false, forKey: "tf_focusWakeupEnabled")
+        DebugFileLogger.log("remembered microphone disconnected uid=\(device.uniqueID); Auto Focus disabled")
+        syncFocusWakeupState()
+    }
+
+    /// Restores Auto Focus after the remembered microphone reconnects.
+    ///
+    /// Args:
+    ///   device: Audio input device reported by the connect notification.
+    private func handleRememberedMicrophoneConnected(_ device: AVCaptureDevice) {
+        guard let profile = RememberedMicrophoneProfileStore.load(),
+              profile.deviceUID == device.uniqueID else { return }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + MicrophoneSelectionPolicy.reconnectRefreshDelaySeconds
+        ) { [weak self] in
+            MainActor.assumeIsolated { [weak self] in
+                self?.reconcileRememberedMicrophoneProfile(restartFocusWakeup: true)
+            }
+        }
     }
 
     /// Returns whether the automatic RMS wakeup workflow is enabled.
@@ -470,26 +589,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         hotkeyManager.registerBindings(bindings)
-
-        // Cross-mode stop: user pressed mode B's key while mode A was recording.
-        // Switch to mode B and stop, so the recording is processed with mode B.
-        hotkeyManager.onCrossModeStop = { [weak self] newModeId in
-            guard let self else { return }
-            guard let newMode = availableModes.first(where: { $0.id == newModeId }) else { return }
-            let selectedProvider = KeychainService.selectedASRProvider
-            let resolvedMode = ASRProviderRegistry.resolvedMode(for: newMode, provider: selectedProvider)
-            let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
-            NSLog("[mytype] >>> HOTKEY: Cross-mode stop → %@", effectiveMode.name)
-            DebugFileLogger.log("hotkey cross-mode stop → \(effectiveMode.name)")
-            MainActor.assumeIsolated {
-                self.appState.currentMode = effectiveMode
-                self.appState.stopRecording()
-            }
-            Task {
-                await self.session.switchMode(to: effectiveMode)
-                await self.session.stopRecording()
-            }
-        }
 
         hotkeyManager.onKeyboardEvent = { [weak self] type, event in
             guard let self else { return false }

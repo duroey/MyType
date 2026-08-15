@@ -47,6 +47,8 @@ final class HotkeyManager: NSObject {
     private var holdSafetyTimers: [UUID: Timer] = [:]
     /// Which toggle mode is currently active (recording). Only one can be active at a time.
     private var activeToggleModeId: UUID?
+    /// Mode that owns the current recording session, including focus-triggered sessions.
+    private var recordingOwnerModeId: UUID?
 
     /// Maximum hold duration before auto-stop (seconds).
     private let maxHoldDuration: TimeInterval = 120
@@ -66,13 +68,18 @@ final class HotkeyManager: NSObject {
     /// to ensure hotkeys and ESC don't remain stuck.
     func resetActiveState() {
         activeToggleModeId = nil
+        recordingOwnerModeId = nil
         for key in toggleState.keys { toggleState[key] = false }
         for key in holdState.keys { holdState[key] = false }
     }
 
-    /// Called when recording is stopped by a different mode's hotkey.
-    /// The UUID is the new mode's ID that should be used for processing.
-    var onCrossModeStop: ((UUID) -> Void)?
+    /// Marks an already-started non-hotkey recording as owned by a mode hotkey.
+    ///
+    /// Args:
+    ///   modeId: Mode ID whose configured hotkey should stop the active recording.
+    func setExternalRecordingOwner(modeId: UUID) {
+        recordingOwnerModeId = modeId
+    }
 
     /// Called when ESC is pressed during active recording or processing (abort).
     /// Called when ESC is pressed during active recording or processing (abort).
@@ -96,6 +103,7 @@ final class HotkeyManager: NSObject {
         bindings = newBindings
         holdState = [:]
         toggleState = [:]
+        recordingOwnerModeId = nil
         wasModifierDown = [:]
         modifierTapStates = [:]
         holdSafetyTimers.values.forEach { $0.invalidate() }
@@ -193,7 +201,7 @@ final class HotkeyManager: NSObject {
 
     // MARK: - Event handling
 
-    fileprivate func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         lastEventTime = Date()
 
         // Re-enable tap if system disabled it, and recover any stuck hold states.
@@ -219,30 +227,31 @@ final class HotkeyManager: NSObject {
             for binding in bindings {
                 guard binding.isMouseButton, binding.mouseButtonNumber == buttonNumber else { continue }
 
+                let isPress = type == .otherMouseDown
+                if isPress, let ownerDecision = handleActiveOwnerHotkeyPress(binding: binding) {
+                    return ownerDecision ? nil : Unmanaged.passUnretained(event)
+                }
+
                 switch binding.style {
                 case .hold:
-                    if type == .otherMouseDown {
+                    if isPress {
                         handleBindingEvent(binding: binding, pressed: true)
                     } else {
                         handleBindingEvent(binding: binding, pressed: false)
                     }
                 case .toggle:
-                    if type == .otherMouseDown {
+                    if isPress {
                         let id = binding.modeId
-                        if let activeId = activeToggleModeId, activeId != id {
-                            toggleState[activeId] = false
-                            activeToggleModeId = nil
-                            onCrossModeStop?(id)
+                        let isOn = toggleState[id] ?? false
+                        toggleState[id] = !isOn
+                        if !isOn {
+                            activeToggleModeId = id
+                            recordingOwnerModeId = id
+                            binding.onStart()
                         } else {
-                            let isOn = toggleState[id] ?? false
-                            toggleState[id] = !isOn
-                            if !isOn {
-                                activeToggleModeId = id
-                                binding.onStart()
-                            } else {
-                                activeToggleModeId = nil
-                                binding.onStop()
-                            }
+                            activeToggleModeId = nil
+                            recordingOwnerModeId = nil
+                            binding.onStop()
                         }
                     }
                 }
@@ -277,6 +286,9 @@ final class HotkeyManager: NSObject {
                     let requiredMods = normalizedModifierFlags(binding.modifiers)
                     let currentMods = otherModifierFlags(for: keyCode, flags: event.flags)
                     guard currentMods == requiredMods else { continue }
+                    if let ownerDecision = handleActiveOwnerHotkeyPress(binding: binding) {
+                        return ownerDecision ? nil : Unmanaged.passUnretained(event)
+                    }
                     if binding.style == .toggle {
                         var tapState = modifierTapStates[binding.modeId] ?? ModifierTapState()
                         tapState.pressTarget()
@@ -305,12 +317,18 @@ final class HotkeyManager: NSObject {
                 let requiredMods = normalizedModifierFlags(binding.modifiers)
                 let currentMods = normalizedModifierFlags(event.flags)
                 guard currentMods == requiredMods else { continue }
+                if recordingOwnerModeId != nil, recordingOwnerModeId != binding.modeId {
+                    return Unmanaged.passUnretained(event)
+                }
 
                 switch binding.style {
                 case .hold:
                     if type == .keyDown {
                         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat)
                         if isRepeat != 0 { return nil }
+                        if let ownerDecision = handleActiveOwnerHotkeyPress(binding: binding) {
+                            return ownerDecision ? nil : Unmanaged.passUnretained(event)
+                        }
                         handleBindingEvent(binding: binding, pressed: true)
                     } else if type == .keyUp {
                         handleBindingEvent(binding: binding, pressed: false)
@@ -320,21 +338,19 @@ final class HotkeyManager: NSObject {
                         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat)
                         if isRepeat != 0 { return nil }
                         let id = binding.modeId
-                        if let activeId = activeToggleModeId, activeId != id {
-                            // Cross-mode stop: different mode's key pressed while recording
-                            toggleState[activeId] = false
-                            activeToggleModeId = nil
-                            onCrossModeStop?(id)
+                        if let ownerDecision = handleActiveOwnerHotkeyPress(binding: binding) {
+                            return ownerDecision ? nil : Unmanaged.passUnretained(event)
+                        }
+                        let isOn = toggleState[id] ?? false
+                        toggleState[id] = !isOn
+                        if !isOn {
+                            activeToggleModeId = id
+                            recordingOwnerModeId = id
+                            binding.onStart()
                         } else {
-                            let isOn = toggleState[id] ?? false
-                            toggleState[id] = !isOn
-                            if !isOn {
-                                activeToggleModeId = id
-                                binding.onStart()
-                            } else {
-                                activeToggleModeId = nil
-                                binding.onStop()
-                            }
+                            activeToggleModeId = nil
+                            recordingOwnerModeId = nil
+                            binding.onStop()
                         }
                     }
                 }
@@ -381,10 +397,12 @@ final class HotkeyManager: NSObject {
             let wasHolding = holdState[id] ?? false
             if pressed && !wasHolding {
                 holdState[id] = true
+                recordingOwnerModeId = id
                 startSafetyTimer(for: binding)
                 binding.onStart()
             } else if !pressed && wasHolding {
                 holdState[id] = false
+                recordingOwnerModeId = nil
                 cancelSafetyTimer(for: id)
                 binding.onStop()
             }
@@ -392,22 +410,20 @@ final class HotkeyManager: NSObject {
         case .toggle:
             let wasDown = wasModifierDown[id] ?? false
             if pressed && !wasDown {
+                if handleActiveOwnerHotkeyPress(binding: binding) != nil {
+                    return
+                }
                 wasModifierDown[id] = true
-                if let activeId = activeToggleModeId, activeId != id {
-                    // Cross-mode stop via modifier key
-                    toggleState[activeId] = false
-                    activeToggleModeId = nil
-                    onCrossModeStop?(id)
+                let isOn = toggleState[id] ?? false
+                toggleState[id] = !isOn
+                if !isOn {
+                    activeToggleModeId = id
+                    recordingOwnerModeId = id
+                    binding.onStart()
                 } else {
-                    let isOn = toggleState[id] ?? false
-                    toggleState[id] = !isOn
-                    if !isOn {
-                        activeToggleModeId = id
-                        binding.onStart()
-                    } else {
-                        activeToggleModeId = nil
-                        binding.onStop()
-                    }
+                    activeToggleModeId = nil
+                    recordingOwnerModeId = nil
+                    binding.onStop()
                 }
             } else if !pressed {
                 wasModifierDown[id] = false
@@ -422,6 +438,43 @@ final class HotkeyManager: NSObject {
             tapState.markNonModifierKeyDown()
             modifierTapStates[id] = tapState
         }
+    }
+
+    /// Handles a configured hotkey press while another recording owner is active.
+    ///
+    /// Args:
+    ///   binding: Hotkey binding that matched the current input event.
+    ///
+    /// Returns:
+    ///   `true` when the owner hotkey stopped the active recording and should
+    ///   be swallowed, `false` when a non-owner hotkey should pass through, or
+    ///   `nil` when no active owner exists.
+    private func handleActiveOwnerHotkeyPress(binding: ModeBinding) -> Bool? {
+        guard let ownerModeId = recordingOwnerModeId else {
+            return nil
+        }
+
+        guard ownerModeId == binding.modeId else {
+            return false
+        }
+
+        if activeToggleModeId == ownerModeId {
+            toggleState[ownerModeId] = false
+            activeToggleModeId = nil
+        }
+        if holdState[ownerModeId] == true {
+            holdState[ownerModeId] = false
+            cancelSafetyTimer(for: ownerModeId)
+        }
+        wasModifierDown[ownerModeId] = false
+        modifierTapStates[ownerModeId]?.reset()
+        recordingOwnerModeId = nil
+
+        guard let ownerBinding = bindings.first(where: { $0.modeId == ownerModeId }) else {
+            return true
+        }
+        ownerBinding.onStop()
+        return true
     }
 
     // MARK: - Safety Timer

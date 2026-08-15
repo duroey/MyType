@@ -1,6 +1,7 @@
 import SwiftUI
 import ServiceManagement
 import AVFoundation
+import AppKit
 import ApplicationServices
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -25,10 +26,11 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @AppStorage("tf_hoverTranscriptPreview") private var hoverTranscriptPreview = true
     @AppStorage("tf_micKeepAlive") private var micKeepAlive = false
     @AppStorage("tf_focusWakeupEnabled") private var focusWakeupEnabled = true
-    @AppStorage("tf_focusAutoStopSilenceSeconds") private var focusAutoStopSilenceSeconds = 0.9
+    @AppStorage(FocusAutoStopSilenceSetting.storageKey) private var focusAutoStopSilenceSeconds = FocusAutoStopSilenceSetting.defaultSeconds
     @AppStorage(FocusWakeupController.focusWakeupModeIdKey) private var focusWakeupModeId = ""
     @AppStorage("tf_agentLauncherTerminal") private var agentLauncherTerminal = "auto"
     @AppStorage("tf_selectedMicrophoneUID") private var selectedMicrophoneUID = ""
+    @AppStorage("tf_lastUserSelectedMicrophoneUID") private var lastUserSelectedMicrophoneUID = ""
     @AppStorage("tf_selectedSpeakerUID") private var selectedSpeakerUID = ""
 
     @State private var hasMic = false
@@ -37,6 +39,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @State private var availableSpeakers: [(uid: String, name: String)] = []
     @State private var isCalibratingNoise = false
     @State private var noiseCalibrationStatus = ""
+    @State private var focusAutoStopSilenceText = FocusAutoStopSilenceSetting.formatted(FocusAutoStopSilenceSetting.defaultSeconds)
     @State private var launcherModes: [ProcessingMode] = ModeStorage().load()
     @State private var launcherHotkeyRecordingTarget: RecordingTarget?
     @State private var availableLauncherTerminals: [AgentLauncherTerminal] = []
@@ -289,6 +292,15 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         .onReceive(NotificationCenter.default.publisher(for: .modesDidChange)) { _ in
             reloadLauncherModes()
         }
+        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
+            refreshMicrophonesAfterReconnect()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)) { _ in
+            refreshMicrophones()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshMicrophones()
+        }
         .sheet(item: $launcherHotkeyRecordingTarget) { target in
             HotkeyRecordingSheet(
                 target: target,
@@ -519,7 +531,10 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                 .help(L("刷新麦克风列表", "Refresh microphone list"))
             }
             settingsDropdown(
-                selection: $selectedMicrophoneUID,
+                selection: Binding(
+                    get: { selectedMicrophoneUID },
+                    set: { updateUserSelectedMicrophone($0) }
+                ),
                 options: [("", L("系统默认", "System Default"))] + availableMicrophones.map { ($0.uid, $0.name) }
             )
         }
@@ -528,10 +543,40 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
 
     private func refreshMicrophones() {
         availableMicrophones = AudioCaptureEngine.availableAudioDevices()
-        if !selectedMicrophoneUID.isEmpty,
-           !availableMicrophones.contains(where: { $0.uid == selectedMicrophoneUID }) {
-            selectedMicrophoneUID = ""
+        let resolved = MicrophoneSelectionPolicy.resolveAfterDeviceRefresh(
+            selectedUID: selectedMicrophoneUID,
+            lastUserSelectedUID: lastUserSelectedMicrophoneUID,
+            availableUIDs: availableMicrophones.map(\.uid)
+        )
+        selectedMicrophoneUID = resolved.selectedUID
+        lastUserSelectedMicrophoneUID = resolved.lastUserSelectedUID
+    }
+
+    /// Refreshes microphone state immediately and after system enumeration settles.
+    private func refreshMicrophonesAfterReconnect() {
+        refreshMicrophones()
+        DispatchQueue.main.asyncAfter(deadline: .now() + MicrophoneSelectionPolicy.reconnectRefreshDelaySeconds) {
+            refreshMicrophones()
         }
+    }
+
+    /// Records a user-selected microphone and updates persisted recovery state.
+    ///
+    /// Args:
+    ///   uid: UID selected from the settings dropdown. Empty means system default.
+    private func updateUserSelectedMicrophone(_ uid: String) {
+        let resolved = MicrophoneSelectionPolicy.userSelected(uid)
+        selectedMicrophoneUID = resolved.selectedUID
+        lastUserSelectedMicrophoneUID = resolved.lastUserSelectedUID
+        if resolved.lastUserSelectedUID.isEmpty {
+            RememberedMicrophoneProfileStore.clear()
+        } else {
+            RememberedMicrophoneProfileStore.replace(
+                deviceUID: resolved.lastUserSelectedUID,
+                focusWakeupEnabled: focusWakeupEnabled
+            )
+        }
+        NotificationCenter.default.post(name: .rememberedMicrophoneProfileDidChange, object: nil)
     }
 
     private var speakerSelectionRow: some View {
@@ -645,6 +690,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         let focusChanged = focusWakeupEnabled != resolved.focusWakeupEnabled
         micKeepAlive = resolved.micKeepAlive
         focusWakeupEnabled = resolved.focusWakeupEnabled
+        RememberedMicrophoneProfileStore.updateFocusWakeupEnabled(resolved.focusWakeupEnabled)
         AudioKeepAliveManager.syncMicState()
         if focusChanged {
             NotificationCenter.default.post(name: .focusWakeupSettingDidChange, object: nil)
@@ -706,21 +752,34 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                     .font(.system(size: 10))
                     .foregroundStyle(TF.settingsTextTertiary)
             }
-            settingsDropdown(
-                selection: Binding(
-                    get: { Self.autoStopSilenceOption(for: focusAutoStopSilenceSeconds) },
-                    set: { focusAutoStopSilenceSeconds = Double($0) ?? 0.9 }
-                ),
-                options: [
-                    ("0.6", L("0.6 秒", "0.6 sec")),
-                    ("0.9", L("0.9 秒", "0.9 sec")),
-                    ("1.2", L("1.2 秒", "1.2 sec")),
-                    ("1.5", L("1.5 秒", "1.5 sec")),
-                    ("2.0", L("2.0 秒", "2.0 sec")),
-                ]
+            HStack(spacing: 8) {
+                FixedWidthTextField(
+                    text: Binding(
+                        get: { focusAutoStopSilenceText },
+                        set: { updateAutoStopSilenceText($0) }
+                    ),
+                    placeholder: FocusAutoStopSilenceSetting.formatted(FocusAutoStopSilenceSetting.defaultSeconds),
+                    commitOnReturnOrOutsideClick: true,
+                    onEditingEnded: { commitAutoStopSilenceText($0) }
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: 36)
+
+                Text(L("秒", "sec"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(TF.settingsTextSecondary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(TF.settingsCardAlt)
             )
         }
         .padding(.vertical, 6)
+        .onAppear {
+            syncAutoStopSilenceTextFromStoredValue()
+        }
     }
 
     private var focusWakeupModeRow: some View {
@@ -1097,17 +1156,33 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         }
     }
 
-    /// Resolves the nearest supported silence-delay option.
+    /// Syncs the editable silence delay field from persisted settings.
+    ///
+    /// Migrates legacy fast values to the current default while keeping the UI
+    /// text in one-decimal-place form.
+    private func syncAutoStopSilenceTextFromStoredValue() {
+        let normalized = FocusAutoStopSilenceSetting.normalized(focusAutoStopSilenceSeconds)
+        focusAutoStopSilenceSeconds = normalized
+        focusAutoStopSilenceText = FocusAutoStopSilenceSetting.formatted(normalized)
+    }
+
+    /// Updates the persisted silence delay from editable settings text.
     ///
     /// Args:
-    ///   value: Saved silence delay in seconds.
+    ///   text: User-entered seconds text.
+    private func updateAutoStopSilenceText(_ text: String) {
+        focusAutoStopSilenceText = text
+        focusAutoStopSilenceSeconds = FocusAutoStopSilenceSetting.parsed(text)
+    }
+
+    /// Commits the editable silence delay when text editing ends.
     ///
-    /// Returns:
-    ///   A dropdown option string nearest to the saved value.
-    private static func autoStopSilenceOption(for value: Double) -> String {
-        let options = [0.6, 0.9, 1.2, 1.5, 2.0]
-        let nearest = options.min(by: { abs($0 - value) < abs($1 - value) }) ?? 0.9
-        return String(format: "%.1f", nearest)
+    /// Args:
+    ///   text: Final user-entered seconds text.
+    private func commitAutoStopSilenceText(_ text: String) {
+        let normalized = FocusAutoStopSilenceSetting.parsed(text)
+        focusAutoStopSilenceSeconds = normalized
+        focusAutoStopSilenceText = FocusAutoStopSilenceSetting.formatted(normalized)
     }
 
     // MARK: - Permission Block

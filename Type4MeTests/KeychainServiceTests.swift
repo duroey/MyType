@@ -1,23 +1,41 @@
 import XCTest
+import Security
 @testable import Type4Me
 
 final class KeychainServiceTests: XCTestCase {
 
     private var originalProvider: ASRProvider!
-    private let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        .appendingPathComponent("Type4Me", isDirectory: true)
+    private var testStorageDirectory: URL!
+    private var testStorageNamespace: String!
+
     private var credentialsURL: URL {
-        appSupportDir.appendingPathComponent("credentials.json")
+        testStorageDirectory.appendingPathComponent("credentials.json")
     }
 
     override func setUp() {
         super.setUp()
+        let testID = UUID().uuidString.lowercased()
+        testStorageDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mytype-keychain-tests-\(testID)", isDirectory: true)
+        testStorageNamespace = "com.mytype.tests.\(testID)"
+        try? FileManager.default.createDirectory(
+            at: testStorageDirectory,
+            withIntermediateDirectories: true
+        )
+        KeychainService.useIsolatedStorageForTesting(
+            directory: testStorageDirectory,
+            namespace: testStorageNamespace
+        )
         originalProvider = KeychainService.selectedASRProvider
     }
 
     override func tearDown() {
         KeychainService.delete(key: "test_key")
         try? KeychainService.saveASRCredentials(for: .volcano, values: [:])
+        KeychainService.resetStorageAfterTesting()
+        if let testStorageDirectory {
+            try? FileManager.default.removeItem(at: testStorageDirectory)
+        }
         KeychainService.selectedASRProvider = originalProvider
         super.tearDown()
     }
@@ -102,4 +120,30 @@ final class KeychainServiceTests: XCTestCase {
 
         wait(for: [expectation], timeout: 1.0)
     }
+
+    func testInteractionNotAllowedIsReportedAsLockedKeychain() {
+        let error = KeychainReadError(status: errSecInteractionNotAllowed)
+
+        XCTAssertEqual(error, .locked(errSecInteractionNotAllowed))
+    }
+
+    func testInteractionRequiredIsReportedAsLockedKeychain() {
+        let error = KeychainReadError(status: errSecInteractionRequired)
+
+        XCTAssertEqual(error, .locked(errSecInteractionRequired))
+    }
+
+    func testUnexpectedReadStatusRemainsDiagnosable() {
+        let status = errSecDecode
+        let error = KeychainReadError(status: status)
+
+        XCTAssertEqual(error, .unavailable(status))
+    }
+
+    func testUnavailableKeychainIsNotMisreportedAsLocked() {
+        let error = KeychainReadError(status: errSecNotAvailable)
+
+        XCTAssertEqual(error, .unavailable(errSecNotAvailable))
+    }
+
 }

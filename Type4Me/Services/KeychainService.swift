@@ -3,15 +3,79 @@ import Security
 
 enum KeychainService {
 
+    private struct StorageConfiguration {
+        let scalarService: String
+        let groupedService: String
+        let legacyScalarService: String
+        let legacyGroupedService: String
+        let credentialsURL: URL?
+        let usesKeychain: Bool
+
+        static let production = StorageConfiguration(
+            scalarService: "com.mytype.scalar",
+            groupedService: "com.mytype.grouped",
+            legacyScalarService: "com.type4me.scalar",
+            legacyGroupedService: "com.type4me.grouped",
+            credentialsURL: nil,
+            usesKeychain: true
+        )
+    }
+
     private static let lock = NSLock()
     private static var cachedCredentials: [String: Any]?
-    private static let keychainScalarService = "com.mytype.scalar"
-    private static let keychainGroupedService = "com.mytype.grouped"
-    private static let legacyKeychainScalarService = "com.type4me.scalar"
-    private static let legacyKeychainGroupedService = "com.type4me.grouped"
+
+    private static var testingStorageConfiguration: StorageConfiguration?
+
+    private static var activeStorageConfiguration: StorageConfiguration {
+        testingStorageConfiguration ?? .production
+    }
+
+    private static var keychainScalarService: String {
+        activeStorageConfiguration.scalarService
+    }
+
+    private static var keychainGroupedService: String {
+        activeStorageConfiguration.groupedService
+    }
+
+    private static var legacyKeychainScalarService: String {
+        activeStorageConfiguration.legacyScalarService
+    }
+
+    private static var legacyKeychainGroupedService: String {
+        activeStorageConfiguration.legacyGroupedService
+    }
 
     private static var credentialsURL: URL {
-        AppIdentity.appSupportDirectory().appendingPathComponent("credentials.json")
+        activeStorageConfiguration.credentialsURL
+            ?? AppIdentity.appSupportDirectory().appendingPathComponent("credentials.json")
+    }
+
+    /// Redirects credential reads and writes to an isolated namespace for tests.
+    ///
+    /// Args:
+    ///   directory: Temporary directory that should contain the test credentials file.
+    ///   namespace: Unique keychain service prefix reserved for the current test.
+    static func useIsolatedStorageForTesting(directory: URL, namespace: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        cachedCredentials = nil
+        testingStorageConfiguration = StorageConfiguration(
+            scalarService: "\(namespace).scalar",
+            groupedService: "\(namespace).grouped",
+            legacyScalarService: "\(namespace).legacy.scalar",
+            legacyGroupedService: "\(namespace).legacy.grouped",
+            credentialsURL: directory.appendingPathComponent("credentials.json"),
+            usesKeychain: false
+        )
+    }
+
+    /// Restores production credential storage after an isolated test finishes.
+    static func resetStorageAfterTesting() {
+        lock.lock()
+        defer { lock.unlock() }
+        cachedCredentials = nil
+        testingStorageConfiguration = nil
     }
 
     // MARK: - Core read/write (now supports nested objects)
@@ -121,7 +185,7 @@ enum KeychainService {
         let storageKey = asrStorageKey(for: provider)
         let split = splitCredentials(values, using: ASRProviderRegistry.configType(for: provider)?.credentialFields ?? [])
         if split.secure.isEmpty {
-            _ = deleteSecureValue(service: keychainGroupedService, account: storageKey)
+            try deleteSecureValueCheckingKeychain(service: keychainGroupedService, account: storageKey)
         } else {
             try saveSecureValues(split.secure, account: storageKey)
         }
@@ -135,20 +199,73 @@ enum KeychainService {
     }
 
     static func loadASRCredentials(for provider: ASRProvider) -> [String: String]? {
+        do {
+            return try loadASRCredentialsCheckingKeychain(for: provider)
+        } catch {
+            NSLog(
+                "[KeychainService] Failed to load ASR credentials provider=%@: %@",
+                provider.rawValue,
+                String(describing: error)
+            )
+            return nil
+        }
+    }
+
+    /// Loads ASR credentials while preserving keychain read failures.
+    ///
+    /// Args:
+    ///   provider: ASR provider whose credential group should be loaded.
+    ///
+    /// Returns:
+    ///   Merged plaintext and secure credentials, or `nil` when no credentials exist.
+    ///
+    /// Throws:
+    ///   `KeychainReadError` when the secure credential item cannot be read.
+    static func loadASRCredentialsCheckingKeychain(
+        for provider: ASRProvider
+    ) throws -> [String: String]? {
         let dict = loadAll()
         let storageKey = asrStorageKey(for: provider)
         let plaintext = dict[storageKey] as? [String: String] ?? [:]
-        let secure = loadSecureValues(account: storageKey)
+        let fields = ASRProviderRegistry.configType(for: provider)?.credentialFields ?? []
+        let secure = fields.contains(where: \.isSecure)
+            ? try loadSecureValuesCheckingKeychain(account: storageKey)
+            : [:]
         let merged = plaintext.merging(secure) { _, secure in secure }
         return merged.isEmpty ? nil : merged
     }
 
     static func loadASRConfig(for provider: ASRProvider) -> (any ASRProviderConfig)? {
+        do {
+            return try loadASRConfigCheckingKeychain(for: provider)
+        } catch {
+            NSLog(
+                "[KeychainService] Failed to load ASR config provider=%@: %@",
+                provider.rawValue,
+                String(describing: error)
+            )
+            return nil
+        }
+    }
+
+    /// Loads an ASR configuration without collapsing keychain failures into missing credentials.
+    ///
+    /// Args:
+    ///   provider: ASR provider whose configuration should be created.
+    ///
+    /// Returns:
+    ///   A provider configuration, or `nil` when required credentials are genuinely absent.
+    ///
+    /// Throws:
+    ///   `KeychainReadError` when secure credentials exist but are not currently readable.
+    static func loadASRConfigCheckingKeychain(
+        for provider: ASRProvider
+    ) throws -> (any ASRProviderConfig)? {
         guard let configType = ASRProviderRegistry.configType(for: provider) else {
             return nil
         }
 
-        if let values = loadASRCredentials(for: provider) {
+        if let values = try loadASRCredentialsCheckingKeychain(for: provider) {
             return configType.init(credentials: values)
         }
 
@@ -215,7 +332,7 @@ enum KeychainService {
         let storageKey = llmStorageKey(for: provider)
         let split = splitCredentials(values, using: LLMProviderRegistry.configType(for: provider)?.credentialFields ?? [])
         if split.secure.isEmpty {
-            _ = deleteSecureValue(service: keychainGroupedService, account: storageKey)
+            try deleteSecureValueCheckingKeychain(service: keychainGroupedService, account: storageKey)
         } else {
             try saveSecureValues(split.secure, account: storageKey)
         }
@@ -229,10 +346,38 @@ enum KeychainService {
     }
 
     static func loadLLMCredentials(for provider: LLMProvider) -> [String: String]? {
+        do {
+            return try loadLLMCredentialsCheckingKeychain(for: provider)
+        } catch {
+            NSLog(
+                "[KeychainService] Failed to load LLM credentials provider=%@: %@",
+                provider.rawValue,
+                String(describing: error)
+            )
+            return nil
+        }
+    }
+
+    /// Loads LLM credentials while preserving keychain read failures.
+    ///
+    /// Args:
+    ///   provider: LLM provider whose credential group should be loaded.
+    ///
+    /// Returns:
+    ///   Merged plaintext and secure credentials, or `nil` when no credentials exist.
+    ///
+    /// Throws:
+    ///   `KeychainReadError` when the secure credential item cannot be read.
+    static func loadLLMCredentialsCheckingKeychain(
+        for provider: LLMProvider
+    ) throws -> [String: String]? {
         let dict = loadAll()
         let storageKey = llmStorageKey(for: provider)
         let plaintext = dict[storageKey] as? [String: String] ?? [:]
-        let secure = loadSecureValues(account: storageKey)
+        let fields = LLMProviderRegistry.configType(for: provider)?.credentialFields ?? []
+        let secure = fields.contains(where: \.isSecure)
+            ? try loadSecureValuesCheckingKeychain(account: storageKey)
+            : [:]
         let merged = plaintext.merging(secure) { _, secure in secure }
         return merged.isEmpty ? nil : merged
     }
@@ -389,19 +534,58 @@ enum KeychainService {
     /// Returns:
     ///   Secure values, copied from the legacy Type4Me keychain service when the new service is empty.
     private static func loadSecureValues(account: String) -> [String: String] {
-        if let data = loadSecureData(service: keychainGroupedService, account: account),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+        do {
+            return try loadSecureValuesCheckingKeychain(account: account)
+        } catch {
+            NSLog(
+                "[KeychainService] Failed to load grouped credentials account=%@: %@",
+                account,
+                String(describing: error)
+            )
+            return [:]
+        }
+    }
+
+    /// Loads grouped secure values while retaining keychain availability errors.
+    ///
+    /// Args:
+    ///   account: Grouped credential account name.
+    ///
+    /// Returns:
+    ///   Secure values, including a migrated legacy value when available.
+    ///
+    /// Throws:
+    ///   `KeychainReadError` when the keychain is locked, unavailable, or contains invalid data.
+    private static func loadSecureValuesCheckingKeychain(
+        account: String
+    ) throws -> [String: String] {
+        if let data = try loadSecureDataCheckingKeychain(
+            service: keychainGroupedService,
+            account: account
+        ) {
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+                throw KeychainReadError.invalidData
+            }
             return object
         }
-        guard let legacyData = loadSecureData(service: legacyKeychainGroupedService, account: account),
-              let legacyObject = try? JSONSerialization.jsonObject(with: legacyData) as? [String: String] else {
+        guard let legacyData = try loadSecureDataCheckingKeychain(
+            service: legacyKeychainGroupedService,
+            account: account
+        ) else {
             return [:]
+        }
+        guard let legacyObject = try? JSONSerialization.jsonObject(with: legacyData) as? [String: String] else {
+            throw KeychainReadError.invalidData
         }
         try? saveSecureData(legacyData, service: keychainGroupedService, account: account)
         return legacyObject
     }
 
     private static func saveSecureData(_ data: Data, service: String, account: String) throws {
+        guard activeStorageConfiguration.usesKeychain else {
+            try saveTestingSecureData(data, service: service, account: account)
+            return
+        }
         let query = keychainQuery(service: service, account: account)
         let attributes: [String: Any] = [
             kSecValueData as String: data,
@@ -428,14 +612,60 @@ enum KeychainService {
     }
 
     private static func loadSecureData(service: String, account: String) -> Data? {
+        do {
+            return try loadSecureDataCheckingKeychain(service: service, account: account)
+        } catch {
+            NSLog(
+                "[KeychainService] Failed to load secure item service=%@ account=%@: %@",
+                service,
+                account,
+                String(describing: error)
+            )
+            return nil
+        }
+    }
+
+    /// Loads one secure item from the login keychain.
+    ///
+    /// Args:
+    ///   service: Keychain service name.
+    ///   account: Keychain account name.
+    ///
+    /// Returns:
+    ///   Secret data, or `nil` when the item does not exist.
+    ///
+    /// Throws:
+    ///   `KeychainReadError` when the item cannot be read or decoded.
+    private static func loadSecureDataCheckingKeychain(
+        service: String,
+        account: String
+    ) throws -> Data? {
+        guard activeStorageConfiguration.usesKeychain else {
+            return loadTestingSecureData(service: service, account: account)
+        }
         var query = keychainQuery(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else { return nil }
-        return result as? Data
+        switch status {
+        case errSecSuccess:
+            guard let data = result as? Data else {
+                throw KeychainReadError.invalidData
+            }
+            return data
+        case errSecItemNotFound:
+            return nil
+        default:
+            NSLog(
+                "[KeychainService] Keychain read status service=%@ account=%@ status=%d",
+                service,
+                account,
+                status
+            )
+            throw KeychainReadError(status: status)
+        }
     }
 
     /// Deletes one keychain value and its matching legacy fallback.
@@ -448,13 +678,109 @@ enum KeychainService {
     ///   `true` when the current-service deletion succeeds or the item is already absent.
     @discardableResult
     private static func deleteSecureValue(service: String, account: String) -> Bool {
-        let status = SecItemDelete(keychainQuery(service: service, account: account) as CFDictionary)
-        if service == keychainScalarService {
-            _ = SecItemDelete(keychainQuery(service: legacyKeychainScalarService, account: account) as CFDictionary)
-        } else if service == keychainGroupedService {
-            _ = SecItemDelete(keychainQuery(service: legacyKeychainGroupedService, account: account) as CFDictionary)
+        do {
+            try deleteSecureValueCheckingKeychain(service: service, account: account)
+            return true
+        } catch {
+            NSLog(
+                "[KeychainService] Failed to delete secure item service=%@ account=%@: %@",
+                service,
+                account,
+                String(describing: error)
+            )
+            return false
         }
-        return status == errSecSuccess || status == errSecItemNotFound
+    }
+
+    /// Deletes one secure item and fails when the keychain rejects the operation.
+    ///
+    /// Args:
+    ///   service: Keychain service name.
+    ///   account: Keychain account name.
+    ///
+    /// Throws:
+    ///   `KeychainError.deleteFailed` when either current or legacy deletion fails.
+    private static func deleteSecureValueCheckingKeychain(
+        service: String,
+        account: String
+    ) throws {
+        guard activeStorageConfiguration.usesKeychain else {
+            deleteTestingSecureData(service: service, account: account)
+            return
+        }
+        let status = SecItemDelete(keychainQuery(service: service, account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.deleteFailed(status)
+        }
+
+        let legacyService: String?
+        if service == keychainScalarService {
+            legacyService = legacyKeychainScalarService
+        } else if service == keychainGroupedService {
+            legacyService = legacyKeychainGroupedService
+        } else {
+            legacyService = nil
+        }
+        if let legacyService {
+            let legacyStatus = SecItemDelete(
+                keychainQuery(service: legacyService, account: account) as CFDictionary
+            )
+            guard legacyStatus == errSecSuccess || legacyStatus == errSecItemNotFound else {
+                throw KeychainError.deleteFailed(legacyStatus)
+            }
+        }
+    }
+
+    /// Saves test-only secret bytes without touching the user's login keychain.
+    ///
+    /// Args:
+    ///   data: Secret bytes to store in the isolated test file.
+    ///   service: Test service name.
+    ///   account: Test account name.
+    private static func saveTestingSecureData(
+        _ data: Data,
+        service: String,
+        account: String
+    ) throws {
+        let directory = credentialsURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try data.write(to: testingSecureDataURL(service: service, account: account), options: .atomic)
+    }
+
+    /// Loads test-only secret bytes from the isolated test file.
+    ///
+    /// Args:
+    ///   service: Test service name.
+    ///   account: Test account name.
+    ///
+    /// Returns:
+    ///   Stored secret bytes, or `nil` when no test item exists.
+    private static func loadTestingSecureData(service: String, account: String) -> Data? {
+        try? Data(contentsOf: testingSecureDataURL(service: service, account: account))
+    }
+
+    /// Deletes one test-only secret file.
+    ///
+    /// Args:
+    ///   service: Test service name.
+    ///   account: Test account name.
+    private static func deleteTestingSecureData(service: String, account: String) {
+        try? FileManager.default.removeItem(at: testingSecureDataURL(service: service, account: account))
+    }
+
+    /// Resolves the file URL for a test-only secret item.
+    ///
+    /// Args:
+    ///   service: Test service name.
+    ///   account: Test account name.
+    ///
+    /// Returns:
+    ///   URL inside the current isolated test directory.
+    private static func testingSecureDataURL(service: String, account: String) -> URL {
+        let identifier = Data("\(service)|\(account)".utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+        return credentialsURL.deletingLastPathComponent()
+            .appendingPathComponent("secret-\(identifier)")
     }
 
     // MARK: - Secure field splitting
@@ -618,4 +944,46 @@ enum KeychainService {
 enum KeychainError: Error {
     case invalidEncoding
     case saveFailed(OSStatus)
+    case deleteFailed(OSStatus)
+}
+
+enum KeychainReadError: Error, Equatable, LocalizedError {
+    case locked(OSStatus)
+    case unavailable(OSStatus)
+    case invalidData
+
+    /// Creates a diagnosable read error from a Security framework status code.
+    ///
+    /// Args:
+    ///   status: Security framework status returned by `SecItemCopyMatching`.
+    init(status: OSStatus) {
+        switch status {
+        case errSecInteractionNotAllowed,
+             errSecInteractionRequired,
+             errSecAuthFailed:
+            self = .locked(status)
+        default:
+            self = .unavailable(status)
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .locked:
+            return L(
+                "登录钥匙串当前不可用。请先解锁“登录”钥匙串，再重试。",
+                "The login keychain is unavailable. Unlock it, then try again."
+            )
+        case .unavailable(let status):
+            return L(
+                "无法读取 API 凭证（钥匙串错误 \(status)）。请重新打开 MyType 后重试。",
+                "Unable to read API credentials (Keychain error \(status)). Restart MyType and try again."
+            )
+        case .invalidData:
+            return L(
+                "钥匙串中的 API 凭证格式异常。请在设置中重新保存凭证。",
+                "The API credentials in Keychain are invalid. Save them again in Settings."
+            )
+        }
+    }
 }

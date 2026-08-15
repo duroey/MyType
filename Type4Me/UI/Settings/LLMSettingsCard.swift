@@ -14,6 +14,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     @State private var isEditingLLM = true
     @State private var hasStoredLLM = false
     @State private var testTask: Task<Void, Never>?
+    @State private var credentialReadError: String?
     /// Tracks which credential fields are in "custom input" mode (value not in preset options).
     @State private var customModeFields: Set<String> = []
 
@@ -54,7 +55,7 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
             HStack(spacing: 8) {
                 Spacer()
                 testButton(L("测试连接", "Test"), status: llmTestStatus) { testLLMConnection() }
-                    .disabled(!hasLLMCredentials)
+                    .disabled(!hasLLMCredentials || credentialReadError != nil)
                 if hasLLMCredentials && !isEditingLLM {
                     secondaryButton(L("修改", "Edit")) {
                         testTask?.cancel()
@@ -73,10 +74,16 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
                         }
                     }
                     primaryButton(L("保存", "Save")) { saveLLMCredentials() }
-                        .disabled(!hasLLMCredentials)
+                        .disabled(!hasLLMCredentials || credentialReadError != nil)
                 }
             }
             .padding(.top, 12)
+            if let credentialReadError {
+                Text(credentialReadError)
+                    .font(.system(size: 11))
+                    .foregroundStyle(TF.settingsAccentAmber)
+                    .padding(.top, 4)
+            }
         }
         .task {
             loadLLMCredentials()
@@ -252,21 +259,29 @@ struct LLMSettingsCard: View, SettingsCardHelpers {
     private func loadLLMCredentialsForProvider(_ provider: LLMProvider) {
         testTask?.cancel()
         editedFields = []
-        if let values = KeychainService.loadLLMCredentials(for: provider) {
-            llmCredentialValues = values
-            savedLLMValues = values
-            hasStoredLLM = true
-            isEditingLLM = !hasLLMCredentials
-        } else {
-            var defaults: [String: String] = [:]
-            let fields = LLMProviderRegistry.configType(for: provider)?.credentialFields ?? []
-            for field in fields where !field.defaultValue.isEmpty {
-                defaults[field.key] = field.defaultValue
+        credentialReadError = nil
+        do {
+            if let values = try KeychainService.loadLLMCredentialsCheckingKeychain(for: provider) {
+                llmCredentialValues = values
+                savedLLMValues = values
+                hasStoredLLM = true
+                isEditingLLM = !hasLLMCredentials
+            } else {
+                var defaults: [String: String] = [:]
+                let fields = LLMProviderRegistry.configType(for: provider)?.credentialFields ?? []
+                for field in fields where !field.defaultValue.isEmpty {
+                    defaults[field.key] = field.defaultValue
+                }
+                llmCredentialValues = defaults
+                savedLLMValues = [:]
+                hasStoredLLM = false
+                isEditingLLM = true
             }
-            llmCredentialValues = defaults
-            savedLLMValues = [:]
-            hasStoredLLM = false
-            isEditingLLM = true
+        } catch let error as KeychainReadError {
+            credentialReadError = error.errorDescription
+            llmTestStatus = .failed(L("请先解锁登录钥匙串", "Unlock the login keychain first"))
+        } catch {
+            credentialReadError = L("无法读取 API 凭证", "Unable to read API credentials")
         }
         syncCustomModeFields()
     }

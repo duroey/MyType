@@ -92,6 +92,7 @@ final class FocusWakeupController {
 
     private weak var appState: AppState?
     private let session: RecognitionSession
+    var onRecordingOwnerResolved: ((UUID) -> Void)?
     private let monitorAudio = AudioCaptureEngine()
     private var timer: Timer?
     private var currentFocus: FocusSignature?
@@ -474,6 +475,7 @@ final class FocusWakeupController {
                 sessionDidFinish()
                 return
             }
+            onRecordingOwnerResolved?(mode.id)
             appState?.currentMode = mode
             appState?.startRecording()
             await session.startRecording(

@@ -148,4 +148,45 @@ final class HistoryStoreTests: XCTestCase {
 
         await fulfillment(of: [notification], timeout: 1.0)
     }
+
+    func testDatabaseConnectionClosesWhenStoreIsReleased() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("type4me-fd-\(UUID().uuidString).db")
+            .path
+        var scopedStore: HistoryStore? = HistoryStore(path: path)
+        let record = HistoryRecord(
+            id: UUID().uuidString, createdAt: Date(), durationSeconds: 1.0,
+            rawText: "fd", processingMode: nil, processedText: nil,
+            finalText: "fd", status: "completed", characterCount: 2, asrProvider: nil
+        )
+
+        await scopedStore?.insert(record)
+        XCTAssertGreaterThan(try openFileDescriptorCount(containing: path), 0)
+
+        scopedStore = nil
+
+        XCTAssertEqual(try openFileDescriptorCount(containing: path), 0)
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    /// Counts current-process open file descriptors that reference a path.
+    ///
+    /// Args:
+    ///   path: File path to match in `lsof` output.
+    ///
+    /// Returns:
+    ///   The number of open file descriptors containing `path`.
+    private func openFileDescriptorCount(containing path: String) throws -> Int {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-p", "\(ProcessInfo.processInfo.processIdentifier)"]
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        return text.split(separator: "\n").filter { $0.contains(path) }.count
+    }
 }
