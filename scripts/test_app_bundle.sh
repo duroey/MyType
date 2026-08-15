@@ -23,8 +23,8 @@ read_plist() {
 
 [ "$(read_plist CFBundleExecutable)" = "Type4Me" ] || fail "CFBundleExecutable should be Type4Me"
 [ "$(read_plist CFBundleIdentifier)" = "com.mytype.app" ] || fail "CFBundleIdentifier should be com.mytype.app"
-[ "$(read_plist CFBundleName)" = "mytype" ] || fail "CFBundleName should be mytype"
-[ "$(read_plist CFBundleDisplayName)" = "mytype" ] || fail "CFBundleDisplayName should be mytype"
+[ "$(read_plist CFBundleName)" = "MyType" ] || fail "CFBundleName should be MyType"
+[ "$(read_plist CFBundleDisplayName)" = "MyType" ] || fail "CFBundleDisplayName should be MyType"
 [ "$(read_plist CFBundlePackageType)" = "APPL" ] || fail "CFBundlePackageType should be APPL"
 [ "$(read_plist CFBundleShortVersionString)" = "$APP_VERSION" ] || fail "CFBundleShortVersionString should be $APP_VERSION"
 [ "$(read_plist CFBundleVersion)" = "$APP_BUILD" ] || fail "CFBundleVersion should be $APP_BUILD"
