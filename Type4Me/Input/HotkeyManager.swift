@@ -1,4 +1,5 @@
 import Cocoa
+import MediaPlayer
 
 typealias HotkeyStyle = ProcessingMode.HotkeyStyle
 
@@ -13,6 +14,9 @@ struct ModeBinding {
     /// Whether this binding is for a mouse button (encoded with high-bit keyCode).
     var isMouseButton: Bool { ModeBinding.isMouseKeyCode(Int(keyCode)) }
 
+    /// Whether this binding is for a media key (encoded with high-bit keyCode).
+    var isMediaKey: Bool { ModeBinding.isMediaKeyCode(Int(keyCode)) }
+
     /// The mouse button number (2=middle, 3+=side buttons). Only valid when isMouseButton is true.
     var mouseButtonNumber: Int { ModeBinding.mouseButtonNumber(from: Int(keyCode)) }
 
@@ -24,6 +28,16 @@ struct ModeBinding {
     // The encoded value fits in both Int and UInt16 (CGKeyCode).
 
     private static let mouseKeyCodeBase = 0x8000
+    private static let mediaKeyCodeBase = 0x9000
+    static let modifierKeyCodes: Set<Int> = [54, 55, 56, 58, 59, 60, 61, 62, 63]
+    static let functionKeyCodes: Set<Int> = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90]
+    static let standardModifierMask: CGEventFlags = [
+        .maskCommand,
+        .maskShift,
+        .maskAlternate,
+        .maskControl,
+        .maskSecondaryFn,
+    ]
 
     /// Encode a mouse button number as a keyCode (for storage in ProcessingMode.hotkeyCode).
     static func mouseKeyCode(for buttonNumber: Int) -> Int { mouseKeyCodeBase + buttonNumber }
@@ -32,7 +46,123 @@ struct ModeBinding {
     static func mouseButtonNumber(from keyCode: Int) -> Int { keyCode - mouseKeyCodeBase }
 
     /// Check if a keyCode represents a mouse button.
-    static func isMouseKeyCode(_ keyCode: Int) -> Bool { keyCode >= mouseKeyCodeBase }
+    static func isMouseKeyCode(_ keyCode: Int) -> Bool { keyCode >= mouseKeyCodeBase && keyCode < mediaKeyCodeBase }
+
+    // MARK: - Media Key Encoding
+    //
+    // Convention: keyCode = 0x9000 + NX_KEYTYPE value.
+    // NX_KEYTYPE_SOUND_UP=0, NX_KEYTYPE_SOUND_DOWN=1, NX_KEYTYPE_MUTE=7,
+    // NX_KEYTYPE_PLAY=16, NX_KEYTYPE_NEXT=17, NX_KEYTYPE_PREVIOUS=18,
+    // NX_KEYTYPE_FAST=19, NX_KEYTYPE_REWIND=20.
+    // No collision with keyboard (0–127) or mouse (0x8000+) keyCodes.
+
+    /// Encode an NX_KEYTYPE value as a keyCode (for storage in ProcessingMode.hotkeyCode).
+    static func mediaKeyCode(for keyType: Int) -> Int { mediaKeyCodeBase + keyType }
+
+    /// Decode a media keyCode back to the NX_KEYTYPE value.
+    static func mediaKeyType(from keyCode: Int) -> Int { keyCode - mediaKeyCodeBase }
+
+    /// Check if a keyCode represents a media key.
+    static func isMediaKeyCode(_ keyCode: Int) -> Bool { keyCode >= mediaKeyCodeBase }
+
+    static func isModifierKeyCode(_ keyCode: Int) -> Bool {
+        modifierKeyCodes.contains(keyCode)
+    }
+
+    static func isFunctionKeyCode(_ keyCode: Int) -> Bool {
+        functionKeyCodes.contains(keyCode)
+    }
+
+    static func modifierEventFlag(for keyCode: Int) -> CGEventFlags? {
+        switch keyCode {
+        case 54, 55: return .maskCommand
+        case 56, 60: return .maskShift
+        case 58, 61: return .maskAlternate
+        case 59, 62: return .maskControl
+        case 63: return .maskSecondaryFn
+        default: return nil
+        }
+    }
+
+    static func normalizedModifierFlags(_ flags: CGEventFlags, forKeyCode keyCode: Int? = nil) -> CGEventFlags {
+        var normalized = flags.intersection(standardModifierMask)
+        // macOS reports the Fn/function modifier on F-key events themselves.
+        // Treat that as part of the F-key, not as an extra hotkey modifier.
+        if let keyCode, isFunctionKeyCode(keyCode) {
+            normalized.remove(.maskSecondaryFn)
+        }
+        return normalized
+    }
+
+    static func hotkeysAreEquivalent(
+        keyCode: Int,
+        modifiers: UInt64?,
+        otherKeyCode: Int,
+        otherModifiers: UInt64?
+    ) -> Bool {
+        guard keyCode == otherKeyCode else { return false }
+        if isMouseKeyCode(keyCode) || isMediaKeyCode(keyCode) {
+            return true
+        }
+        let flags = normalizedModifierFlags(CGEventFlags(rawValue: modifiers ?? 0), forKeyCode: keyCode)
+        let otherFlags = normalizedModifierFlags(CGEventFlags(rawValue: otherModifiers ?? 0), forKeyCode: otherKeyCode)
+        return flags == otherFlags
+    }
+
+    static func fullModifierFlags(keyCode: Int, modifiers: UInt64?) -> CGEventFlags? {
+        guard let ownFlag = modifierEventFlag(for: keyCode) else { return nil }
+        var flags = normalizedModifierFlags(CGEventFlags(rawValue: modifiers ?? 0))
+        flags.insert(ownFlag)
+        return flags
+    }
+
+    static func modifierBindingIsPrefix(
+        modifierKeyCode: Int,
+        modifierModifiers: UInt64?,
+        otherKeyCode: Int,
+        otherModifiers: UInt64?
+    ) -> Bool {
+        guard let flags = fullModifierFlags(keyCode: modifierKeyCode, modifiers: modifierModifiers) else {
+            return false
+        }
+
+        if let otherFlags = fullModifierFlags(keyCode: otherKeyCode, modifiers: otherModifiers) {
+            return flags != otherFlags && flags.isSubset(of: otherFlags)
+        }
+
+        guard let regularFlags = regularKeyModifierFlags(keyCode: otherKeyCode, modifiers: otherModifiers) else {
+            return false
+        }
+        return flags.isSubset(of: regularFlags)
+    }
+
+    static func hasModifierPrefixConflict(
+        keyCode: Int,
+        modifiers: UInt64?,
+        otherKeyCode: Int,
+        otherModifiers: UInt64?
+    ) -> Bool {
+        modifierBindingIsPrefix(
+            modifierKeyCode: keyCode,
+            modifierModifiers: modifiers,
+            otherKeyCode: otherKeyCode,
+            otherModifiers: otherModifiers
+        ) || modifierBindingIsPrefix(
+            modifierKeyCode: otherKeyCode,
+            modifierModifiers: otherModifiers,
+            otherKeyCode: keyCode,
+            otherModifiers: modifiers
+        )
+    }
+
+    private static func regularKeyModifierFlags(keyCode: Int, modifiers: UInt64?) -> CGEventFlags? {
+        guard !isMouseKeyCode(keyCode),
+              !isMediaKeyCode(keyCode),
+              !isModifierKeyCode(keyCode)
+        else { return nil }
+        let flags = normalizedModifierFlags(CGEventFlags(rawValue: modifiers ?? 0), forKeyCode: keyCode)
+        return flags.isEmpty ? nil : flags
+    }
 }
 
 final class HotkeyManager: NSObject {
@@ -49,9 +179,15 @@ final class HotkeyManager: NSObject {
     private var activeToggleModeId: UUID?
     /// Mode that owns the current recording session, including focus-triggered sessions.
     private var recordingOwnerModeId: UUID?
+    private struct PendingModifierTrigger {
+        let binding: ModeBinding
+        let token: UUID
+    }
+    private var pendingModifierTriggers: [UUID: PendingModifierTrigger] = [:]
 
     /// Maximum hold duration before auto-stop (seconds).
     private let maxHoldDuration: TimeInterval = 120
+    private let modifierPrefixTriggerDelay: TimeInterval = 0.12
 
     // MARK: - State
 
@@ -71,6 +207,7 @@ final class HotkeyManager: NSObject {
         recordingOwnerModeId = nil
         for key in toggleState.keys { toggleState[key] = false }
         for key in holdState.keys { holdState[key] = false }
+        cancelPendingModifierTriggers()
     }
 
     /// Marks an already-started non-hotkey recording as owned by a mode hotkey.
@@ -97,6 +234,10 @@ final class HotkeyManager: NSObject {
     /// Timestamp of the last event received by the tap callback.
     fileprivate var lastEventTime: Date?
 
+    /// Tokens for MPRemoteCommandCenter handlers (prevents Apple Music from auto-launching).
+    private var mediaCommandTokens: [(command: MPRemoteCommand, token: Any)] = []
+    private var isMediaSessionActive = false
+
     // MARK: - Registration
 
     func registerBindings(_ newBindings: [ModeBinding]) {
@@ -108,29 +249,57 @@ final class HotkeyManager: NSObject {
         modifierTapStates = [:]
         holdSafetyTimers.values.forEach { $0.invalidate() }
         holdSafetyTimers = [:]
+        cancelPendingModifierTriggers()
+        updateMediaKeySession()
     }
 
     // MARK: - Start / Stop
 
     @discardableResult
     func start() -> Bool {
+        let hasMediaKeyBindings = bindings.contains { $0.isMediaKey }
+
         let eventMask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.flagsChanged.rawValue)
             | (1 << CGEventType.otherMouseDown.rawValue)
             | (1 << CGEventType.otherMouseUp.rawValue)
+            | (hasMediaKeyBindings ? (1 << 14) : 0)  // kCGEventSystemDefined (NX_SYSDEFINED) for media/headphone keys
 
         let userInfo = Unmanaged.passUnretained(self).toOpaque()
 
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: eventMask,
-            callback: hotkeyCallback,
-            userInfo: userInfo
-        ) else {
+        let tap: CFMachPort?
+        if hasMediaKeyBindings {
+            // Try cghidEventTap first for more reliable interception of media/headphone keys.
+            // If unavailable (e.g. insufficient permissions), fall back to cgSessionEventTap.
+            tap = CGEvent.tapCreate(
+                tap: .cghidEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: eventMask,
+                callback: hotkeyCallback,
+                userInfo: userInfo
+            ) ?? CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: eventMask,
+                callback: hotkeyCallback,
+                userInfo: userInfo
+            )
+        } else {
+            tap = CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: eventMask,
+                callback: hotkeyCallback,
+                userInfo: userInfo
+            )
+        }
+
+        guard let tap = tap else {
             return false
         }
 
@@ -143,10 +312,12 @@ final class HotkeyManager: NSObject {
         CGEvent.tapEnable(tap: tap, enable: true)
 
         startHealthCheck()
+        updateMediaKeySession()
         return true
     }
 
     func stop() {
+        deactivateMediaKeySession()
         healthCheckTimer?.invalidate()
         healthCheckTimer = nil
         if let tap = eventTap {
@@ -164,6 +335,7 @@ final class HotkeyManager: NSObject {
         modifierTapStates = [:]
         holdSafetyTimers.values.forEach { $0.invalidate() }
         holdSafetyTimers = [:]
+        cancelPendingModifierTriggers()
     }
 
     // MARK: - Health check
@@ -175,19 +347,22 @@ final class HotkeyManager: NSObject {
         healthCheckTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             guard let self, let tap = self.eventTap else { return }
 
-            // Check 1: Is the tap still enabled at the Mach port level?
+            // Check 1: Is the tap port still valid? Only recreate the tap for real invalidation,
+            // not for normal idle periods with no keyboard/mouse input.
+            if !CFMachPortIsValid(tap) {
+                NSLog("[Type4Me] Health check: tap port invalid, reinstalling tap...")
+                self.reinstallTap()
+                return
+            }
+
+            // Check 2: Is the tap still enabled at the Mach port level?
             if !CGEvent.tapIsEnabled(tap: tap) {
                 NSLog("[mytype] Health check: tap disabled, re-enabling...")
                 CGEvent.tapEnable(tap: tap, enable: true)
-            }
-
-            // Check 2: If we haven't received ANY event in 30s, the tap may be silently dead.
-            // (User is almost certainly pressing keys within 30s of normal use.)
-            // Only flag this if the tap has been alive for at least 30s (give it time to warm up).
-            if let lastEvent = self.lastEventTime,
-               Date().timeIntervalSince(lastEvent) > 30 {
-                NSLog("[mytype] Health check: no events for 30s, reinstalling tap...")
-                self.reinstallTap()
+                if !CGEvent.tapIsEnabled(tap: tap) {
+                    NSLog("[mytype] Health check: tap re-enable failed, reinstalling tap...")
+                    self.reinstallTap()
+                }
             }
         }
     }
@@ -261,10 +436,71 @@ final class HotkeyManager: NSObject {
             return Unmanaged.passUnretained(event)
         }
 
+        // MARK: Media key events (headphone buttons, keyboard media keys)
+        if type.rawValue == 14 {  // kCGEventSystemDefined (NX_SYSDEFINED)
+            guard let nsEvent = NSEvent(cgEvent: event),
+                  nsEvent.type == .systemDefined,
+                  nsEvent.subtype.rawValue == 8 else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let keyType = Int((nsEvent.data1 >> 16) & 0xFFFF)
+            let keyState = Int((nsEvent.data1 >> 8) & 0xFF)
+            let isKeyDown = keyState == 0x0A
+            let isKeyUp = keyState == 0x0B
+
+            guard Self.isKnownMediaKeyType(keyType) else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let encodedKeyCode = ModeBinding.mediaKeyCode(for: keyType)
+
+            for binding in bindings {
+                guard binding.isMediaKey, Int(binding.keyCode) == encodedKeyCode else { continue }
+
+                switch binding.style {
+                case .hold:
+                    if isKeyDown {
+                        if let ownerDecision = handleActiveOwnerHotkeyPress(binding: binding) {
+                            return ownerDecision ? nil : Unmanaged.passUnretained(event)
+                        }
+                        handleBindingEvent(binding: binding, pressed: true)
+                    } else if isKeyUp {
+                        handleBindingEvent(binding: binding, pressed: false)
+                    }
+                case .toggle:
+                    if isKeyDown {
+                        if let ownerDecision = handleActiveOwnerHotkeyPress(binding: binding) {
+                            return ownerDecision ? nil : Unmanaged.passUnretained(event)
+                        }
+                        let id = binding.modeId
+                        let isOn = toggleState[id] ?? false
+                        toggleState[id] = !isOn
+                        if !isOn {
+                            activeToggleModeId = id
+                            recordingOwnerModeId = id
+                            binding.onStart()
+                        } else {
+                            activeToggleModeId = nil
+                            recordingOwnerModeId = nil
+                            binding.onStop()
+                        }
+                    }
+                }
+                return nil  // Swallow matched media key events
+            }
+
+            return Unmanaged.passUnretained(event)
+        }
+
         // MARK: Keyboard events
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         if type == .keyDown, !isModifierKeyCode(keyCode) {
             markModifierTapDirtyForNonModifierKey()
+        }
+
+        if type == .keyDown {
+            cancelPendingModifierTriggers()
         }
 
         if onKeyboardEvent?(type, event) == true {
@@ -272,8 +508,8 @@ final class HotkeyManager: NSObject {
         }
 
         for binding in bindings {
-            // Skip mouse button bindings in the keyboard path
-            guard !binding.isMouseButton else { continue }
+            // Skip mouse button and media key bindings in the keyboard path
+            guard !binding.isMouseButton && !binding.isMediaKey else { continue }
             guard binding.keyCode == keyCode else { continue }
 
             if isModifierKeyCode(keyCode) {
@@ -290,12 +526,20 @@ final class HotkeyManager: NSObject {
                         return ownerDecision ? nil : Unmanaged.passUnretained(event)
                     }
                     if binding.style == .toggle {
+                        markModifierTapDirtyForInterveningModifier(except: binding.modeId)
                         var tapState = modifierTapStates[binding.modeId] ?? ModifierTapState()
                         tapState.pressTarget()
                         modifierTapStates[binding.modeId] = tapState
                         return Unmanaged.passUnretained(event)
                     }
-                    handleBindingEvent(binding: binding, pressed: true)
+                    if shouldDeferModifierTrigger(for: binding) {
+                        schedulePendingModifierTrigger(for: binding)
+                    } else {
+                        cancelPendingModifierTriggers()
+                        handleBindingEvent(binding: binding, pressed: true)
+                    }
+                    return Unmanaged.passUnretained(event)
+                } else if consumePendingModifierRelease(for: binding) {
                     return Unmanaged.passUnretained(event)
                 } else if binding.style == .toggle {
                     var tapState = modifierTapStates[binding.modeId] ?? ModifierTapState()
@@ -314,8 +558,8 @@ final class HotkeyManager: NSObject {
                 continue
             } else {
                 // Regular keys: check modifier flags match
-                let requiredMods = normalizedModifierFlags(binding.modifiers)
-                let currentMods = normalizedModifierFlags(event.flags)
+                let requiredMods = normalizedModifierFlags(binding.modifiers, forKeyCode: Int(binding.keyCode))
+                let currentMods = normalizedModifierFlags(event.flags, forKeyCode: Int(keyCode))
                 guard currentMods == requiredMods else { continue }
                 if recordingOwnerModeId != nil, recordingOwnerModeId != binding.modeId {
                     return Unmanaged.passUnretained(event)
@@ -440,6 +684,18 @@ final class HotkeyManager: NSObject {
         }
     }
 
+    /// Marks other modifier-only toggle candidates as part of a combo.
+    ///
+    /// Args:
+    ///   modeId: Mode whose target modifier is being pressed and should remain clean.
+    private func markModifierTapDirtyForInterveningModifier(except modeId: UUID) {
+        for id in modifierTapStates.keys where id != modeId {
+            var tapState = modifierTapStates[id] ?? ModifierTapState()
+            tapState.markNonModifierKeyDown()
+            modifierTapStates[id] = tapState
+        }
+    }
+
     /// Handles a configured hotkey press while another recording owner is active.
     ///
     /// Args:
@@ -477,6 +733,69 @@ final class HotkeyManager: NSObject {
         return true
     }
 
+    // MARK: - Modifier Prefix Conflicts
+
+    private func shouldDeferModifierTrigger(for binding: ModeBinding) -> Bool {
+        guard isModifierKeyCode(binding.keyCode) else { return false }
+
+        return bindings.contains { other in
+            guard other.modeId != binding.modeId,
+                  !other.isMouseButton,
+                  !other.isMediaKey
+            else { return false }
+            return ModeBinding.modifierBindingIsPrefix(
+                modifierKeyCode: Int(binding.keyCode),
+                modifierModifiers: binding.modifiers.rawValue,
+                otherKeyCode: Int(other.keyCode),
+                otherModifiers: other.modifiers.rawValue
+            )
+        }
+    }
+
+    private func schedulePendingModifierTrigger(for binding: ModeBinding) {
+        cancelPendingModifierTriggers(except: binding.modeId)
+        let token = UUID()
+        pendingModifierTriggers[binding.modeId] = PendingModifierTrigger(binding: binding, token: token)
+        DispatchQueue.main.asyncAfter(deadline: .now() + modifierPrefixTriggerDelay) { [weak self] in
+            self?.firePendingModifierTrigger(modeId: binding.modeId, token: token)
+        }
+    }
+
+    private func firePendingModifierTrigger(modeId: UUID, token: UUID) {
+        guard let pending = pendingModifierTriggers[modeId],
+              pending.token == token,
+              isExactModifierComboActive(for: pending.binding)
+        else { return }
+        pendingModifierTriggers.removeValue(forKey: modeId)
+        handleBindingEvent(binding: pending.binding, pressed: true)
+    }
+
+    private func consumePendingModifierRelease(for binding: ModeBinding) -> Bool {
+        guard let pending = pendingModifierTriggers.removeValue(forKey: binding.modeId) else { return false }
+        handleBindingEvent(binding: pending.binding, pressed: true)
+        handleBindingEvent(binding: pending.binding, pressed: false)
+        return true
+    }
+
+    private func cancelPendingModifierTriggers(except modeId: UUID? = nil) {
+        let ids = pendingModifierTriggers.keys.filter { $0 != modeId }
+        for id in ids {
+            pendingModifierTriggers.removeValue(forKey: id)
+        }
+    }
+
+    private func isExactModifierComboActive(for binding: ModeBinding) -> Bool {
+        guard let expected = ModeBinding.fullModifierFlags(
+            keyCode: Int(binding.keyCode),
+            modifiers: binding.modifiers.rawValue
+        ) else { return false }
+        let stateFlags = CGEventSource.flagsState(.combinedSessionState)
+        var current = normalizedModifierFlags(stateFlags)
+        if stateFlags.contains(.maskSecondaryFn) {
+            current.insert(.maskSecondaryFn)
+        }
+        return current == expected
+    }
     // MARK: - Safety Timer
 
     private func startSafetyTimer(for binding: ModeBinding) {
@@ -517,9 +836,9 @@ final class HotkeyManager: NSObject {
             let id = binding.modeId
             guard holdState[id] == true else { continue }
 
-            // Mouse buttons: no API to query current state, rely on mouseUp events instead.
-            // Safety timer will catch truly stuck mouse holds.
-            if binding.isMouseButton { continue }
+            // Mouse buttons and media keys: no API to query current state, rely on release events instead.
+            // Safety timer will catch truly stuck holds.
+            if binding.isMouseButton || binding.isMediaKey { continue }
 
             let stillDown: Bool
             if isModifierKeyCode(binding.keyCode) {
@@ -539,23 +858,22 @@ final class HotkeyManager: NSObject {
 
     // MARK: - Helpers
 
-    private func isModifierKeyCode(_ keyCode: CGKeyCode) -> Bool {
-        [54, 55, 56, 58, 59, 60, 61, 62, 63].contains(keyCode)
+    private static func isKnownMediaKeyType(_ keyType: Int) -> Bool {
+        // NX_KEYTYPE values from IOKit/hidsystem/IOHIDParameter.h
+        // SOUND_UP=0, SOUND_DOWN=1, MUTE=7, PLAY=16, NEXT=17, PREVIOUS=18, FAST=19, REWIND=20
+        [0, 1, 7, 16, 17, 18, 19, 20].contains(keyType)
     }
 
-    private func normalizedModifierFlags(_ flags: CGEventFlags) -> CGEventFlags {
-        flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl])
+    private func isModifierKeyCode(_ keyCode: CGKeyCode) -> Bool {
+        ModeBinding.isModifierKeyCode(Int(keyCode))
+    }
+
+    private func normalizedModifierFlags(_ flags: CGEventFlags, forKeyCode keyCode: Int? = nil) -> CGEventFlags {
+        ModeBinding.normalizedModifierFlags(flags, forKeyCode: keyCode)
     }
 
     private func modifierEventFlag(for keyCode: CGKeyCode) -> CGEventFlags? {
-        switch keyCode {
-        case 54, 55: return .maskCommand
-        case 56, 60: return .maskShift
-        case 58, 61: return .maskAlternate
-        case 59, 62: return .maskControl
-        case 63: return .maskSecondaryFn
-        default: return nil
-        }
+        ModeBinding.modifierEventFlag(for: Int(keyCode))
     }
 
     private func otherModifierFlags(for keyCode: CGKeyCode, flags: CGEventFlags) -> CGEventFlags {
@@ -583,6 +901,102 @@ final class HotkeyManager: NSObject {
         case 59, 62: return flags.contains(.maskControl)
         case 63: return flags.contains(.maskSecondaryFn)
         default: return false
+        }
+    }
+
+    // MARK: - Media Session (prevent Apple Music auto-launch)
+
+    /// Register as an active media session when transport media keys (play/next/prev)
+    /// are bound as hotkeys, so the system doesn't launch Apple Music on key press.
+    private func updateMediaKeySession() {
+        for (command, token) in mediaCommandTokens {
+            command.removeTarget(token)
+        }
+        mediaCommandTokens = []
+
+        // Find which transport key types are bound (volume keys don't launch Apple Music)
+        let boundKeyTypes = Set(bindings.filter(\.isMediaKey).map { ModeBinding.mediaKeyType(from: Int($0.keyCode)) })
+        let transportKeyTypes: Set<Int> = [16, 17, 18, 19, 20]
+        let boundTransportKeys = boundKeyTypes.intersection(transportKeyTypes)
+
+        if boundTransportKeys.isEmpty {
+            if isMediaSessionActive {
+                MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+                MPNowPlayingInfoCenter.default().playbackState = .stopped
+                isMediaSessionActive = false
+                NSLog("[HotkeyManager] Deactivated media session (no transport keys bound)")
+            }
+            return
+        }
+
+        let commandCenter = MPRemoteCommandCenter.shared()
+
+        if !isMediaSessionActive {
+            // Must set non-empty NowPlaying info with playbackState=.playing —
+            // mediaremoted on macOS 15 ignores apps with empty nowPlayingInfo.
+            let nowPlayingInfo: [String: Any] = [
+                MPMediaItemPropertyTitle: "Type4Me Voice Input",
+                MPNowPlayingInfoPropertyPlaybackRate: 1.0,
+                MPNowPlayingInfoPropertyElapsedPlaybackTime: 0.0,
+            ]
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+            MPNowPlayingInfoCenter.default().playbackState = .playing
+            isMediaSessionActive = true
+            NSLog("[HotkeyManager] Activated media session (transport keys bound)")
+        }
+
+        let handler: (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus = { event in
+            NSLog("[HotkeyManager] Media remote command received: %@", String(describing: type(of: event)))
+            return .success
+        }
+
+        if boundTransportKeys.contains(16) {
+            commandCenter.playCommand.isEnabled = true
+            commandCenter.pauseCommand.isEnabled = true
+            commandCenter.togglePlayPauseCommand.isEnabled = true
+
+            let playToken = commandCenter.playCommand.addTarget(handler: handler)
+            let pauseToken = commandCenter.pauseCommand.addTarget(handler: handler)
+            let toggleToken = commandCenter.togglePlayPauseCommand.addTarget(handler: handler)
+            mediaCommandTokens.append(contentsOf: [
+                (command: commandCenter.playCommand, token: playToken),
+                (command: commandCenter.pauseCommand, token: pauseToken),
+                (command: commandCenter.togglePlayPauseCommand, token: toggleToken),
+            ])
+        }
+        if boundTransportKeys.contains(17) {
+            commandCenter.nextTrackCommand.isEnabled = true
+            let token = commandCenter.nextTrackCommand.addTarget(handler: handler)
+            mediaCommandTokens.append((command: commandCenter.nextTrackCommand, token: token))
+        }
+        if boundTransportKeys.contains(18) {
+            commandCenter.previousTrackCommand.isEnabled = true
+            let token = commandCenter.previousTrackCommand.addTarget(handler: handler)
+            mediaCommandTokens.append((command: commandCenter.previousTrackCommand, token: token))
+        }
+        if boundTransportKeys.contains(19) {
+            commandCenter.seekForwardCommand.isEnabled = true
+            let token = commandCenter.seekForwardCommand.addTarget(handler: handler)
+            mediaCommandTokens.append((command: commandCenter.seekForwardCommand, token: token))
+        }
+        if boundTransportKeys.contains(20) {
+            commandCenter.seekBackwardCommand.isEnabled = true
+            let token = commandCenter.seekBackwardCommand.addTarget(handler: handler)
+            mediaCommandTokens.append((command: commandCenter.seekBackwardCommand, token: token))
+        }
+    }
+
+    private func deactivateMediaKeySession() {
+        for (command, token) in mediaCommandTokens {
+            command.isEnabled = false
+            command.removeTarget(token)
+        }
+        mediaCommandTokens = []
+        if isMediaSessionActive {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+            isMediaSessionActive = false
+            NSLog("[HotkeyManager] Deactivated media session (stop)")
         }
     }
 }

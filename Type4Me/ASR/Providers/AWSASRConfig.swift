@@ -6,10 +6,10 @@ struct AWSASRConfig: ASRProviderConfig, Sendable {
     static let displayName = "AWS Transcribe"
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "accessKeyId", label: "Access Key ID", placeholder: "AKIA...", isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "secretAccessKey", label: "Secret Access Key", placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
-        CredentialField(key: "region", label: "Region", placeholder: "us-east-1", isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "sessionToken", label: "Session Token", placeholder: L("可选", "Optional"), isSecure: true, isOptional: true, defaultValue: ""),
+        CredentialField(key: "accessKeyId", label: L("Access Key ID", "Access Key ID"), placeholder: "AKIA...", isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "secretAccessKey", label: L("Secret Access Key", "Secret Access Key"), placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "region", label: L("区域", "Region"), placeholder: "us-east-1", isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "sessionToken", label: L("Session Token", "Session Token"), placeholder: L("可选", "Optional"), isSecure: true, isOptional: true, defaultValue: ""),
     ]}
 
     let accessKeyId: String

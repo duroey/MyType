@@ -39,7 +39,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .about:       return L("关于", "About")
         #if HAS_CLOUD_SUBSCRIPTION
         case .account:     return L("账户", "Account")
-        case .debug:       return "Debug"
+        case .debug:       return L("调试", "Debug")
         #endif
         }
     }
@@ -54,7 +54,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .about:       return L("版本、许可证与支持", "Version, license & support")
         #if HAS_CLOUD_SUBSCRIPTION
         case .account:     return L("登录与订阅管理", "Login & subscription")
-        case .debug:       return "Region, endpoints & diagnostics"
+        case .debug:       return L("区域、端点与诊断", "Region, endpoints & diagnostics")
         #endif
         }
     }
@@ -100,7 +100,7 @@ struct SettingsView: View {
             showDeviceConflict = true
         }
         .alert(L("设备冲突", "Device Conflict"), isPresented: $showDeviceConflict) {
-            Button("OK") { if edition == .member { selectedTab = .account } }
+            Button(L("确定", "OK")) { if edition == .member { selectedTab = .account } }
         } message: {
             Text(L("你的账户已在其他设备登录，当前设备已自动登出。",
                     "Your account has been logged in on another device. This device has been signed out."))

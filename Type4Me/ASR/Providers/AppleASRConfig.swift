@@ -3,14 +3,15 @@ import Foundation
 struct AppleASRConfig: ASRProviderConfig, Sendable {
 
     static let provider = ASRProvider.apple
-    static var displayName: String { "Apple Speech" }
+    static var displayName: String { L("Apple 语音识别", "Apple Speech") }
     static let defaultLocaleIdentifier = "zh-CN"
-    static let supportedLocales: [FieldOption] = [
-        FieldOption(value: "zh-CN", label: "简体中文"),
-        FieldOption(value: "en-US", label: "English (US)"),
-        FieldOption(value: "ja-JP", label: "日本語"),
-        FieldOption(value: "ko-KR", label: "한국어"),
+    static var supportedLocales: [FieldOption] { [
+        FieldOption(value: "zh-CN", label: L("简体中文", "Simplified Chinese")),
+        FieldOption(value: "en-US", label: L("英语（美国）", "English (US)")),
+        FieldOption(value: "ja-JP", label: L("日语", "Japanese")),
+        FieldOption(value: "ko-KR", label: L("韩语", "Korean")),
     ]
+    }
     static var credentialFields: [CredentialField] {
         [
             CredentialField(

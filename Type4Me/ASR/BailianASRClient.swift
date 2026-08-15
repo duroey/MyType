@@ -9,14 +9,14 @@ enum BailianASRError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider:
-            return "BailianASRClient requires BailianASRConfig"
+            return L("百炼识别配置无效", "BailianASRClient requires BailianASRConfig")
         case .handshakeTimedOut:
-            return "Alibaba Cloud Bailian task-start handshake timed out"
+            return L("阿里云百炼握手超时", "Alibaba Cloud Bailian task-start handshake timed out")
         case .closedBeforeTaskStart(let code, let reason):
             if let reason, !reason.isEmpty {
-                return "Alibaba Cloud Bailian socket closed before task-started (\(code)): \(reason)"
+                return L("阿里云百炼连接在任务开始前关闭（\(code)）：\(reason)", "Alibaba Cloud Bailian socket closed before task-started (\(code)): \(reason)")
             }
-            return "Alibaba Cloud Bailian socket closed before task-started (\(code))"
+            return L("阿里云百炼连接在任务开始前关闭（\(code)）", "Alibaba Cloud Bailian socket closed before task-started (\(code))")
         }
     }
 }
@@ -232,7 +232,7 @@ private actor BailianTaskStartGate {
     func waitUntilStarted(timeout: Duration) async throws {
         let timeoutTask = Task {
             try? await Task.sleep(for: timeout)
-            await self.markFailure(BailianASRError.handshakeTimedOut)
+            self.markFailure(BailianASRError.handshakeTimedOut)
         }
 
         defer { timeoutTask.cancel() }

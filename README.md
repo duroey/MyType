@@ -1,4 +1,4 @@
-> 抱歉最近在忙着跨国搬家，更新频率有所下降，欢迎提 issue/PR，紧急问题会尽快修。Sorry, I've been busy with an international move lately, so updates have slowed down — issues and PRs welcome, urgent ones will be fixed ASAP.
+
 
 <p align="center">
   <a href="#中文">中文</a> | <a href="#english">English</a>
@@ -30,8 +30,8 @@
 
 | 版本                                                         | 说明                                                         | 安装包大小   |
 | ------------------------------------------------------------ | ------------------------------------------------------------ | ------ |
-| ✨推荐：**[云端版本（点击下载）](https://github.com/joewongjc/type4me/releases/download/v1.9.3/Type4Me-v1.9.3-cloud.dmg)** | 支持云端识别 (Intel + Apple Silicon)，需配置语音、大模型API Key。语音识别推荐火山-豆包语音/Soniox、体验最好。火山注册有送额度，单价都十分便宜。[配置指引](https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr) | ~4MB  |
-| **[本地版本（点击下载）](https://github.com/joewongjc/type4me/releases/download/v1.9.3/Type4Me-v1.9.3-local-apple-silicon.dmg)** | 内嵌 SenseVoice + Qwen3-ASR 本地识别引擎 (Apple Silicon only，约占用8GB内存，建议32GB以上)，大模型依旧需要配置API Key或Ollama本地服务。 | ~700MB |
+| ✨推荐：**[云端版本（点击下载）](https://github.com/joewongjc/type4me/releases/download/v2.0.0/Type4Me-v2.0.0-cloud.dmg)** | 支持云端识别 (Intel + Apple Silicon)，需配置语音、大模型API Key。语音识别推荐火山-豆包语音/Soniox、体验最好。火山注册有送额度，单价都十分便宜。[配置指引](https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr) | ~7MB  |
+| **[本地版本（点击下载）](https://github.com/joewongjc/type4me/releases/download/v2.0.0/Type4Me-v2.0.0-local-apple-silicon.dmg)** | 内嵌 SenseVoice + Qwen3-ASR 本地识别引擎 (Apple Silicon only，约占用8GB内存，建议32GB以上)，大模型依旧需要配置API Key或Ollama本地服务。 | ~700MB |
 
 系统要求：macOS 14+ (Sonoma)
 
@@ -178,8 +178,8 @@ Two editions, sharing the same config files. You can switch between them at any 
 
 | Edition | Description | Size |
 | ------- | ----------- | ---- |
-| ✨Recommended: **[Cloud Edition (Download)](https://github.com/joewongjc/type4me/releases/download/v1.9.3/Type4Me-v1.9.3-cloud.dmg)** | Cloud recognition (Intel + Apple Silicon). Requires ASR and LLM API keys. Recommended: Volcano/Doubao or Soniox for best experience. [Setup Guide](https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr) | ~4MB |
-| **[Local Edition (Download)](https://github.com/joewongjc/type4me/releases/download/v1.9.3/Type4Me-v1.9.3-local-apple-silicon.dmg)** | Bundled SenseVoice + Qwen3-ASR local recognition (Apple Silicon only, ~8GB RAM, 32GB+ recommended). LLM still requires API key or local Ollama. | ~700MB |
+| ✨Recommended: **[Cloud Edition (Download)](https://github.com/joewongjc/type4me/releases/download/v2.0.0/Type4Me-v2.0.0-cloud.dmg)** | Cloud recognition (Intel + Apple Silicon). Requires ASR and LLM API keys. Recommended: Volcano/Doubao or Soniox for best experience. [Setup Guide](https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr) | ~7MB |
+| **[Local Edition (Download)](https://github.com/joewongjc/type4me/releases/download/v2.0.0/Type4Me-v2.0.0-local-apple-silicon.dmg)** | Bundled SenseVoice + Qwen3-ASR local recognition (Apple Silicon only, ~8GB RAM, 32GB+ recommended). LLM still requires API key or local Ollama. | ~700MB |
 
 System requirements: macOS 14+ (Sonoma)
 
@@ -365,7 +365,7 @@ Steps 2-3 are optional. Skipping them disables local ASR, but cloud ASR works fi
 
 - **Swift Package Manager** project, no `.xcodeproj` needed
 - **Local ASR**: dual-engine design. SenseVoice (streaming partial results) + Qwen3-ASR (final calibration via MLX/Metal). Both run as Python WebSocket servers managed by `SenseVoiceServerManager`
-- **Cloud ASR**: 7 providers implemented (Volcano, OpenAI, Deepgram, AssemblyAI, Soniox, Bailian, Baidu)
+- **Cloud ASR**: 9 providers implemented (Volcano, StepFun batch, OpenAI, Deepgram, AssemblyAI, ElevenLabs, Soniox, Bailian, Baidu)
 - **Credentials**: stored at `~/Library/Application Support/Type4Me/credentials.json` (mode 0600), never in code or environment variables. GUI apps cannot read shell env vars from `~/.zshrc`
 - **ASR provider architecture**: plugin-based. To add a new provider: implement `ASRProviderConfig` + `SpeechRecognizer` protocol, register in `ASRProviderRegistry.all`. See `CLAUDE.md` for details
 - **Audio format**: 16kHz mono PCM16-LE, 200ms chunks (6400 bytes)
@@ -379,11 +379,11 @@ Steps 2-3 are optional. Skipping them disables local ASR, but cloud ASR works fi
 
 ## Star History
 
-<a href="https://star-history.com/#joewongjc/type4me&Date">
+<a href="https://star-history.dera.page/#joewongjc/type4me&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=joewongjc/type4me&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=joewongjc/type4me&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=joewongjc/type4me&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&legend=top-left" />
  </picture>
 </a>
 

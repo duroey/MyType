@@ -58,6 +58,11 @@ enum ASRProviderRegistry {
                 createClient: { VolcASRClient() },
                 capabilities: .streaming()
             ),
+            .stepfunBatch: ProviderEntry(
+                configType: StepFunBatchASRConfig.self,
+                createClient: { StepFunBatchASRClient() },
+                capabilities: .batch()
+            ),
             .deepgram: ProviderEntry(
                 configType: DeepgramASRConfig.self,
                 createClient: { DeepgramASRClient() },
@@ -71,6 +76,11 @@ enum ASRProviderRegistry {
             .elevenlabs: ProviderEntry(
                 configType: ElevenLabsASRConfig.self,
                 createClient: { ElevenLabsASRClient() },
+                capabilities: .streaming()
+            ),
+            .grok: ProviderEntry(
+                configType: GrokASRConfig.self,
+                createClient: { GrokASRClient() },
                 capabilities: .streaming()
             ),
             .soniox: ProviderEntry(

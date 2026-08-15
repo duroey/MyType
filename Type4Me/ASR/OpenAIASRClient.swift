@@ -9,10 +9,10 @@ enum OpenAIASRError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidConfig:     return "OpenAI ASR requires OpenAIASRConfig"
-        case .emptyAudio:        return "No audio data recorded"
-        case .requestFailed(let code): return "OpenAI API returned HTTP \(code)"
-        case .invalidResponse:   return "Failed to parse OpenAI transcription response"
+        case .invalidConfig:     return L("OpenAI 识别配置无效", "OpenAI ASR requires OpenAIASRConfig")
+        case .emptyAudio:        return L("没有录到音频", "No audio data recorded")
+        case .requestFailed(let code): return L("OpenAI API 返回 HTTP \(code)", "OpenAI API returned HTTP \(code)")
+        case .invalidResponse:   return L("无法解析 OpenAI 识别结果", "Failed to parse OpenAI transcription response")
         }
     }
 }

@@ -10,19 +10,19 @@ enum DeepgramASRError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider:
-            return "DeepgramASRClient requires DeepgramASRConfig"
+            return L("Deepgram 识别配置无效", "DeepgramASRClient requires DeepgramASRConfig")
         case .handshakeTimedOut:
-            return "Deepgram WebSocket handshake timed out"
+            return L("Deepgram 握手超时", "Deepgram WebSocket handshake timed out")
         case .closedBeforeHandshake(let code, let reason):
             if let reason, !reason.isEmpty {
-                return "Deepgram WebSocket closed before handshake completed (\(code)): \(reason)"
+                return L("Deepgram 连接在握手完成前关闭（\(code)）：\(reason)", "Deepgram WebSocket closed before handshake completed (\(code)): \(reason)")
             }
-            return "Deepgram WebSocket closed before handshake completed (\(code))"
+            return L("Deepgram 连接在握手完成前关闭（\(code)）", "Deepgram WebSocket closed before handshake completed (\(code))")
         case .closed(let code, let reason):
             if let reason, !reason.isEmpty {
-                return "Deepgram WebSocket closed unexpectedly (\(code)): \(reason)"
+                return L("Deepgram 连接意外关闭（\(code)）：\(reason)", "Deepgram WebSocket closed unexpectedly (\(code)): \(reason)")
             }
-            return "Deepgram WebSocket closed unexpectedly (\(code))"
+            return L("Deepgram 连接意外关闭（\(code)）", "Deepgram WebSocket closed unexpectedly (\(code))")
         }
     }
 

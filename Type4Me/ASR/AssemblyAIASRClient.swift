@@ -12,29 +12,29 @@ enum AssemblyAIASRError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider:
-            return "AssemblyAIASRClient requires AssemblyAIASRConfig"
+            return L("AssemblyAI 识别配置无效", "AssemblyAIASRClient requires AssemblyAIASRConfig")
         case .handshakeTimedOut:
-            return "AssemblyAI streaming session begin timed out"
+            return L("AssemblyAI 流式会话启动超时", "AssemblyAI streaming session begin timed out")
         case .closedBeforeSessionBegan(let code, let reason):
             if let reason, !reason.isEmpty {
-                return "AssemblyAI WebSocket closed before session begin (\(code)): \(reason)"
+                return L("AssemblyAI 连接在会话开始前关闭（\(code)）：\(reason)", "AssemblyAI WebSocket closed before session begin (\(code)): \(reason)")
             }
-            return "AssemblyAI WebSocket closed before session begin (\(code))"
+            return L("AssemblyAI 连接在会话开始前关闭（\(code)）", "AssemblyAI WebSocket closed before session begin (\(code))")
         case .unauthorized(let reason):
             if let reason, !reason.isEmpty {
-                return "AssemblyAI unauthorized connection: \(reason)"
+                return L("AssemblyAI 鉴权失败：\(reason)", "AssemblyAI unauthorized connection: \(reason)")
             }
-            return "AssemblyAI unauthorized connection"
+            return L("AssemblyAI 鉴权失败", "AssemblyAI unauthorized connection")
         case .serverCancelled(let reason):
             if let reason, !reason.isEmpty {
-                return "AssemblyAI session cancelled: \(reason)"
+                return L("AssemblyAI 会话被取消：\(reason)", "AssemblyAI session cancelled: \(reason)")
             }
-            return "AssemblyAI session cancelled"
+            return L("AssemblyAI 会话被取消", "AssemblyAI session cancelled")
         case .closed(let code, let reason):
             if let reason, !reason.isEmpty {
-                return "AssemblyAI session closed (\(code)): \(reason)"
+                return L("AssemblyAI 会话已关闭（\(code)）：\(reason)", "AssemblyAI session closed (\(code)): \(reason)")
             }
-            return "AssemblyAI session closed (\(code))"
+            return L("AssemblyAI 会话已关闭（\(code)）", "AssemblyAI session closed (\(code))")
         }
     }
 }

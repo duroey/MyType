@@ -77,6 +77,76 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.barPhase, .hidden)
     }
 
+    func testShowRecoveryDisplaysPartialTextAndStatus() {
+        let appState = AppState()
+
+        appState.showRecovery(
+            text: "已经识别的文字",
+            message: "连接中断，已保留当前文字，正在用整段录音重试"
+        )
+
+        XCTAssertEqual(appState.barPhase, .recovering)
+        XCTAssertEqual(appState.transcriptionText, "已经识别的文字")
+        XCTAssertEqual(appState.effectiveProcessingLabel, "连接中断，已保留当前文字，正在用整段录音重试")
+    }
+
+    func testRecoveryPromptKeepsPartialTextVisible() {
+        let appState = AppState()
+        appState.showRecovery(
+            text: "已经识别的文字",
+            message: "连接中断，已保留当前文字，正在用整段录音重试"
+        )
+
+        appState.showRecoveryPrompt(
+            text: "已经识别的文字",
+            message: "正在恢复上一次识别。继续按下将打断当前恢复并重新开始录音。"
+        )
+
+        XCTAssertEqual(appState.barPhase, .recovering)
+        XCTAssertEqual(appState.transcriptionText, "已经识别的文字")
+        XCTAssertEqual(appState.effectiveProcessingLabel, "正在恢复上一次识别。继续按下将打断当前恢复并重新开始录音。")
+    }
+
+    func testRecoveryResultPinsTranscriptPopup() {
+        let appState = AppState()
+
+        appState.showRecoveryResult(text: "完整识别文字", message: "已恢复完整识别")
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.transcriptionText, "完整识别文字")
+        XCTAssertTrue(appState.pinsTranscriptPopup)
+    }
+
+    func testHiddenRecordingVisualDoesNotShowPanelUntilProcessing() {
+        let previousStyle = UserDefaults.standard.string(forKey: RecordingVisualStyle.storageKey)
+        UserDefaults.standard.set(RecordingVisualStyle.hidden.rawValue, forKey: RecordingVisualStyle.storageKey)
+        defer {
+            if let previousStyle {
+                UserDefaults.standard.set(previousStyle, forKey: RecordingVisualStyle.storageKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: RecordingVisualStyle.storageKey)
+            }
+        }
+
+        let appState = AppState()
+        var showCount = 0
+        var hideCount = 0
+        appState.onShowPanel = { showCount += 1 }
+        appState.onHidePanel = { hideCount += 1 }
+
+        appState.startRecording()
+        appState.markRecordingReady()
+
+        XCTAssertEqual(appState.barPhase, .recording)
+        XCTAssertEqual(showCount, 0)
+        XCTAssertEqual(hideCount, 1)
+
+        appState.stopRecording()
+
+        XCTAssertEqual(appState.barPhase, .processing)
+        XCTAssertEqual(showCount, 1)
+    }
+
     func testSetLiveTranscriptReplacesExistingConfirmedSegments() {
         let appState = AppState()
         appState.setLiveTranscript(
@@ -114,6 +184,30 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.segments.count, 1)
         XCTAssertEqual(appState.segments.first?.text, "DeepSeek")
         XCTAssertTrue(appState.segments.first?.isConfirmed == true)
+    }
+
+    func testSetLiveTranscriptDropsStalePartialUpdates() {
+        let appState = AppState()
+        appState.setLiveTranscript(
+            RecognitionTranscript(
+                confirmedSegments: ["new"],
+                partialText: "",
+                authoritativeText: "new",
+                isFinal: false
+            )
+        )
+
+        appState.setLiveTranscript(
+            RecognitionTranscript(
+                confirmedSegments: ["old"],
+                partialText: "",
+                authoritativeText: "old",
+                isFinal: false,
+                emitTime: ContinuousClock.now - .seconds(1)
+            )
+        )
+
+        XCTAssertEqual(appState.transcriptionText, "new")
     }
 
     func testFinalizeShowsClipboardFallbackMessage() {

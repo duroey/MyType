@@ -29,7 +29,8 @@ actor HistoryStore {
                 final_text TEXT NOT NULL,
                 status TEXT NOT NULL,
                 character_count INTEGER,
-                asr_provider TEXT
+                asr_provider TEXT,
+                asr_model TEXT
             );
             """
             sqlite3_exec(db, sql, nil, nil, nil)
@@ -41,6 +42,10 @@ actor HistoryStore {
             // Migration: add asr_provider column if it doesn't exist
             let alterASRSQL = "ALTER TABLE recognition_history ADD COLUMN asr_provider TEXT;"
             sqlite3_exec(db, alterASRSQL, nil, nil, nil)
+
+            // Migration: add asr_model column if it doesn't exist
+            let alterASRModelSQL = "ALTER TABLE recognition_history ADD COLUMN asr_model TEXT;"
+            sqlite3_exec(db, alterASRModelSQL, nil, nil, nil)
 
             // Index for ORDER BY created_at DESC pagination
             sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_history_created_at ON recognition_history(created_at DESC);", nil, nil, nil)
@@ -58,8 +63,8 @@ actor HistoryStore {
     func insert(_ record: HistoryRecord) {
         let sql = """
         INSERT OR REPLACE INTO recognition_history
-        (id, created_at, duration_seconds, raw_text, processing_mode, processed_text, final_text, status, character_count, asr_provider)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        (id, created_at, duration_seconds, raw_text, processing_mode, processed_text, final_text, status, character_count, asr_provider, asr_model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -80,6 +85,7 @@ actor HistoryStore {
             sqlite3_bind_null(stmt, 9)
         }
         bindOptional(stmt, 10, record.asrProvider)
+        bindOptional(stmt, 11, record.asrModel)
         if sqlite3_step(stmt) == SQLITE_DONE {
             postDidChangeNotification()
         }
@@ -144,7 +150,8 @@ actor HistoryStore {
                 finalText: column(stmt, 6),
                 status: column(stmt, 7),
                 characterCount: sqlite3_column_type(stmt, 8) == SQLITE_NULL ? nil : Int(sqlite3_column_int(stmt, 8)),
-                asrProvider: optionalColumn(stmt, 9)
+                asrProvider: optionalColumn(stmt, 9),
+                asrModel: optionalColumn(stmt, 10)
             ))
         }
         return records
@@ -292,6 +299,17 @@ actor HistoryStore {
         }
     }
 
+    struct UsageBreakdown: Identifiable, Sendable {
+        let modelName: String
+        let lastDayDuration: Double
+        let last7DaysDuration: Double
+        let last30DaysDuration: Double
+        let allTimeDuration: Double
+        let recordCount: Int
+
+        var id: String { modelName }
+    }
+
     /// 获取统计信息，可选日期范围过滤（ISO8601 字符串）
     func getStatistics(from: String? = nil, to: String? = nil) async -> Statistics {
         var conditions: [String] = []
@@ -327,6 +345,55 @@ actor HistoryStore {
             return Statistics(totalDuration: duration, totalCharacters: chars, recordCount: count)
         }
         return Statistics(totalDuration: 0, totalCharacters: 0, recordCount: 0)
+    }
+
+    func getUsageBreakdown(now: Date = Date()) async -> [UsageBreakdown] {
+        let iso = ISO8601DateFormatter()
+        let lastDay = iso.string(from: now.addingTimeInterval(-24 * 60 * 60))
+        let last7Days = iso.string(from: now.addingTimeInterval(-7 * 24 * 60 * 60))
+        let last30Days = iso.string(from: now.addingTimeInterval(-30 * 24 * 60 * 60))
+        let unknown = L("未知", "Unknown")
+
+        let sql = """
+        SELECT
+            CASE
+                WHEN lower(trim(COALESCE(asr_provider, ''))) = 'elevenlabs' THEN 'ElevenLabs'
+                ELSE COALESCE(NULLIF(asr_model, ''), NULLIF(asr_provider, ''), ?)
+            END AS model_name,
+            COALESCE(SUM(CASE WHEN created_at >= ? THEN duration_seconds ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN created_at >= ? THEN duration_seconds ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN created_at >= ? THEN duration_seconds ELSE 0 END), 0),
+            COALESCE(SUM(duration_seconds), 0),
+            COUNT(*)
+        FROM recognition_history
+        GROUP BY 1
+        ORDER BY CASE WHEN model_name = ? THEN 1 ELSE 0 END,
+                 5 DESC,
+                 model_name COLLATE NOCASE ASC;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+
+        bind(stmt, 1, unknown)
+        bind(stmt, 2, lastDay)
+        bind(stmt, 3, last7Days)
+        bind(stmt, 4, last30Days)
+        bind(stmt, 5, unknown)
+
+        var rows: [UsageBreakdown] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            rows.append(UsageBreakdown(
+                modelName: column(stmt, 0),
+                lastDayDuration: sqlite3_column_double(stmt, 1),
+                last7DaysDuration: sqlite3_column_double(stmt, 2),
+                last30DaysDuration: sqlite3_column_double(stmt, 3),
+                allTimeDuration: sqlite3_column_double(stmt, 4),
+                recordCount: Int(sqlite3_column_int(stmt, 5))
+            ))
+        }
+        return rows
     }
 
     // MARK: - SQLite Helpers

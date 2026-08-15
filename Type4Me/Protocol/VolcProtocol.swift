@@ -22,6 +22,30 @@ struct VolcServerResponse: Sendable, Equatable {
 
 enum VolcProtocol: Sendable {
 
+    // MARK: - Auth Headers
+
+    /// Builds the WebSocket handshake headers documented for both Volcengine
+    /// consoles. New-console credentials use `X-Api-Key`; legacy-console
+    /// credentials remain supported with the App ID + Access Token pair.
+    static func authHeaders(
+        authentication: VolcanoASRConfig.Authentication,
+        resourceId: String,
+        connectId: String
+    ) -> [String: String] {
+        var headers = [
+            "X-Api-Resource-Id": resourceId,
+            "X-Api-Connect-Id": connectId,
+        ]
+        switch authentication {
+        case .apiKey(let apiKey):
+            headers["X-Api-Key"] = apiKey
+        case .legacy(let appKey, let accessKey):
+            headers["X-Api-App-Key"] = appKey
+            headers["X-Api-Access-Key"] = accessKey
+        }
+        return headers
+    }
+
     // MARK: - Build Client Request JSON
 
     static func buildClientRequest(

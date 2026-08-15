@@ -7,7 +7,7 @@ struct OpenAIASRConfig: ASRProviderConfig, Sendable {
     static let defaultModel = "gpt-4o-transcribe"
 
     static let credentialFields: [CredentialField] = [
-        CredentialField(key: "apiKey", label: "API Key", placeholder: "sk-...", isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "apiKey", label: L("API Key", "API Key"), placeholder: "sk-...", isSecure: true, isOptional: false, defaultValue: ""),
         CredentialField(
             key: "model", label: L("模型", "Model"),
             placeholder: defaultModel,

@@ -6,9 +6,9 @@ struct TencentASRConfig: ASRProviderConfig, Sendable {
     static var displayName: String { L("腾讯云", "Tencent Cloud") }
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "secretId", label: "Secret ID", placeholder: L("密钥 ID", "Key ID"), isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "secretKey", label: "Secret Key", placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
-        CredentialField(key: "appId", label: "App ID", placeholder: L("应用 ID", "App ID"), isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "secretId", label: L("Secret ID", "Secret ID"), placeholder: L("密钥 ID", "Key ID"), isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "secretKey", label: L("Secret Key", "Secret Key"), placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "appId", label: L("App ID", "App ID"), placeholder: L("应用 ID", "App ID"), isSecure: false, isOptional: false, defaultValue: ""),
     ]}
 
     let secretId: String

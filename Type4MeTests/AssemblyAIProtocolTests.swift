@@ -3,10 +3,10 @@ import XCTest
 
 final class AssemblyAIProtocolTests: XCTestCase {
 
-    func testBuildWebSocketURL_usesExpectedQueryItemsForUniversalStreaming() throws {
+    func testBuildWebSocketURL_usesExpectedQueryItemsForUniversal35Pro() throws {
         let config = try XCTUnwrap(AssemblyAIASRConfig(credentials: [
             "apiKey": "aa_test_key",
-            "model": "universal-streaming-multilingual",
+            "model": "universal-3-5-pro",
         ]))
 
         let url = try AssemblyAIProtocol.buildWebSocketURL(
@@ -25,8 +25,8 @@ final class AssemblyAIProtocolTests: XCTestCase {
         XCTAssertEqual(components.path, "/v3/ws")
         XCTAssertEqual(items.value(for: "sample_rate"), "16000")
         XCTAssertEqual(items.value(for: "encoding"), "pcm_s16le")
-        XCTAssertEqual(items.value(for: "speech_model"), "universal-streaming-multilingual")
-        XCTAssertEqual(items.value(for: "format_turns"), "true")
+        XCTAssertEqual(items.value(for: "speech_model"), "universal-3-5-pro")
+        XCTAssertNil(items.value(for: "format_turns"))
         XCTAssertNil(items.value(for: "keyterms_prompt"))
 
         let hotwords = [" Type4Me ", String(repeating: "a", count: 70), "keep-me"]
@@ -35,6 +35,23 @@ final class AssemblyAIProtocolTests: XCTestCase {
         XCTAssertEqual(updateObj?["type"] as? String, "UpdateConfiguration")
         let terms = try XCTUnwrap(updateObj?["keyterms_prompt"] as? [String])
         XCTAssertEqual(terms, ["Type4Me", String(repeating: "a", count: 50), "keep-me"])
+    }
+
+    func testBuildWebSocketURL_usesFormatTurnsForLegacyUniversalStreaming() throws {
+        let config = try XCTUnwrap(AssemblyAIASRConfig(credentials: [
+            "apiKey": "aa_test_key",
+            "model": "universal-streaming-multilingual",
+        ]))
+
+        let url = try AssemblyAIProtocol.buildWebSocketURL(
+            config: config,
+            options: ASRRequestOptions(enablePunc: true)
+        )
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let items = components.queryItems ?? []
+
+        XCTAssertEqual(items.value(for: "speech_model"), "universal-streaming-multilingual")
+        XCTAssertEqual(items.value(for: "format_turns"), "true")
     }
 
     func testBuildWebSocketURL_omitsFormatTurnsForU3() throws {
@@ -173,15 +190,15 @@ final class AssemblyAIProtocolTests: XCTestCase {
 
         XCTAssertEqual(
             unauthorized.errorDescription,
-            "AssemblyAI unauthorized connection: Missing Authorization header"
+            L("AssemblyAI 鉴权失败：Missing Authorization header", "AssemblyAI unauthorized connection: Missing Authorization header")
         )
         XCTAssertEqual(
             cancelled.errorDescription,
-            "AssemblyAI session cancelled: An error occurred"
+            L("AssemblyAI 会话被取消：An error occurred", "AssemblyAI session cancelled: An error occurred")
         )
         XCTAssertEqual(
             generic.errorDescription,
-            "AssemblyAI session closed (3007): Input duration violation"
+            L("AssemblyAI 会话已关闭（3007）：Input duration violation", "AssemblyAI session closed (3007): Input duration violation")
         )
     }
 

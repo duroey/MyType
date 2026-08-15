@@ -14,7 +14,7 @@ enum EscapeAbortAction: Equatable {
         switch phase {
         case .focusWaiting:
             return .pauseFocusWakeupWaiting
-        case .recording, .processing, .preparing:
+        case .recording, .processing, .preparing, .recovering:
             return .cancelActiveSession
         case .hidden, .done, .error:
             return .passThrough

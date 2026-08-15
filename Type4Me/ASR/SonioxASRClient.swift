@@ -8,9 +8,9 @@ enum SonioxASRError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider:
-            return "SonioxASRClient requires SonioxASRConfig"
+            return L("Soniox 识别配置无效", "SonioxASRClient requires SonioxASRConfig")
         case .serverRejected(let code, let message):
-            return "Soniox request failed (\(code)): \(message)"
+            return L("Soniox 请求失败（\(code)）：\(message)", "Soniox request failed (\(code)): \(message)")
         }
     }
 }

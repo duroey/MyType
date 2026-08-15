@@ -4,12 +4,13 @@ struct AboutTab: View {
 
     @Environment(AppState.self) private var appState
     @Environment(AppUpdater.self) private var appUpdater
+    @State private var showIssueReporter = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             SettingsSectionHeader(
-                label: "ABOUT",
-                title: L("关于 mytype", "About mytype"),
+                label: L("关于", "ABOUT"),
+                title: L("关于 MyType", "About MyType"),
                 description: L("语音，流畅输入。基于火山引擎大模型语音识别的 macOS 原生输入工具。", "Voice to text, seamlessly. A native macOS input tool powered by large-model ASR.")
             )
 
@@ -48,9 +49,12 @@ struct AboutTab: View {
             Spacer()
 
             // Footer
-            Text("Made with ♥ and Claude Code")
+            Text(L("用爱和 Claude Code 打造", "Made with ♥ and Claude Code"))
                 .font(.system(size: 10))
                 .foregroundStyle(TF.settingsTextTertiary)
+        }
+        .sheet(isPresented: $showIssueReporter) {
+            IssueReportSheet()
         }
     }
 
@@ -135,14 +139,15 @@ struct AboutTab: View {
         switch appUpdater.state {
         case .idle:
             if let latest = appState.availableUpdates.first {
-                let sizeText = latest.formattedSize.map { " (\($0))" } ?? ""
+                let sizeText = latest.formattedSize(isLocalInstallation: appUpdater.isLocalInstallation)
+                    .map { " (\($0))" } ?? ""
+                let buttonTitle = appUpdater.isLocalInstallation
+                    ? L("下载本地版更新\(sizeText)", "Download Local Update\(sizeText)")
+                    : L("下载更新\(sizeText)", "Download Update\(sizeText)")
                 Button {
                     appUpdater.downloadUpdate(release: latest)
                 } label: {
-                    Label(
-                        L("下载更新\(sizeText)", "Download Update\(sizeText)"),
-                        systemImage: "arrow.down.circle"
-                    )
+                    Label(buttonTitle, systemImage: "arrow.down.circle")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white)
                     .padding(.horizontal, 14)

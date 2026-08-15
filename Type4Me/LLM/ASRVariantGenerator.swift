@@ -125,7 +125,7 @@ actor ASRVariantGenerator {
         let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let http = response as? HTTPURLResponse else {
-            throw GenerationError.llmFailed("network error")
+            throw GenerationError.llmFailed(L("网络错误", "network error"))
         }
 
         if http.statusCode == 403 {
@@ -133,7 +133,7 @@ actor ASRVariantGenerator {
         }
         guard http.statusCode == 200 else {
             let body = String(data: data, encoding: .utf8) ?? ""
-            throw GenerationError.llmFailed("server \(http.statusCode): \(body)")
+            throw GenerationError.llmFailed(L("服务器 \(http.statusCode)：\(body)", "server \(http.statusCode): \(body)"))
         }
 
         struct CloudVocabResponse: Decodable {

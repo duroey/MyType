@@ -11,12 +11,12 @@ enum CloudLLMError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notAuthenticated: return "Please log in to mytype Cloud"
-        case .quotaExhausted: return "Free quota exhausted"
-        case .networkError: return "Network error"
-        case .serverError(let code): return "Server error (\(code))"
+        case .notAuthenticated: return L("请先登录 MyType Cloud", "Please log in to MyType Cloud")
+        case .quotaExhausted: return L("免费额度已用完", "Free quota exhausted")
+        case .networkError: return L("网络错误", "Network error")
+        case .serverError(let code): return L("服务器错误（\(code)）", "Server error (\(code))")
         case .remoteError(let msg): return msg
-        case .emptyResponse: return "Empty response from server"
+        case .emptyResponse: return L("服务器返回为空", "Empty response from server")
         }
     }
 }
@@ -26,9 +26,24 @@ enum CloudLLMError: Error, LocalizedError {
 actor CloudLLMClient: LLMClient {
 
     private let logger = Logger(subsystem: "com.mytype.app", category: "CloudLLM")
+    private let session: URLSession
+    private let metricsDelegate: LLMURLSessionMetricsDelegate
+
+    init(bypassProxy: Bool = ProxyBypassMode.current.bypassLLM) {
+        let resources = LLMURLSessionFactory.make(
+            providerID: "cloud",
+            bypassProxy: bypassProxy
+        )
+        session = resources.session
+        metricsDelegate = resources.metricsDelegate
+    }
 
     func warmUp(baseURL: String) async {
         // No warmup needed — proxy handles connection pooling
+    }
+
+    func invalidate() async {
+        session.invalidateAndCancel()
     }
 
     func process(text: String, prompt: String, config: LLMConfig) async throws -> String {
@@ -54,7 +69,7 @@ actor CloudLLMClient: LLMClient {
             LLMRequest(text: text, prompt: prompt, mode: "cloud")
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
 
         guard let http = response as? HTTPURLResponse else {
             throw CloudLLMError.networkError

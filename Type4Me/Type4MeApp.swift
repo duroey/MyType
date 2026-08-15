@@ -56,6 +56,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Computed dynamically per recording based on audio device topology.
     private var floatingBarController: FloatingBarController?
     private var focusWakeupController: FocusWakeupController?
+    private lazy var selectionAskController = SelectionAskController { [weak self] conversationContext in
+        self?.toggleSelectionAskFollowUp(conversationContext: conversationContext) ?? false
+    }
     private let hotkeyManager = HotkeyManager()
     private let cmuxDefaultReplyController = CmuxDefaultReplyController()
     private let codexSessionIndexWatcher = CodexSessionIndexWatcher()
@@ -75,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         KeychainService.migrateIfNeeded()
         HotwordStorage.migrateIfNeeded()
         SnippetStorage.migrateIfNeeded()
+        AudioInputDevicePreferenceStore.migrateIfNeeded()
 
         // Sync hotwords to Volcengine cloud table (async, non-blocking)
         VolcHotwordSyncManager.syncIfNeeded()
@@ -100,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.focusWakeupController = focusWakeupController
 
         SoundFeedback.warmUp()
+        AudioInputDeviceMonitor.shared.start()
         AudioKeepAliveManager.syncState()
 
         // Pre-warm audio subsystem and ASR connection so the first recording starts instantly
@@ -179,6 +184,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     case .processingResult(let text):
                         appState.showProcessingResult(text)
                         self.hotkeyManager.isProcessing = true
+                    case .recoveryStarted(let text, let message):
+                        appState.showRecovery(text: text, message: message)
+                        self.hotkeyManager.isProcessing = false
+                        self.hotkeyManager.resetActiveState()
+                    case .recoveryPrompt(let text, let message):
+                        appState.showRecoveryPrompt(text: text, message: message)
+                        self.hotkeyManager.isProcessing = false
+                        self.hotkeyManager.resetActiveState()
+                    case .recoverySucceeded(let text, let message):
+                        appState.showRecoveryResult(text: text, message: message)
+                        self.hotkeyManager.isProcessing = false
+                        self.safeResetHotkeyState()
+                    case .recoveryFailed(let text, let message):
+                        appState.showRecoveryResult(text: text, message: message)
+                        self.hotkeyManager.isProcessing = false
+                        self.safeResetHotkeyState()
+                    case .recoveryInterrupted(let text, let message):
+                        if appState.barPhase == .recovering {
+                            appState.showRecoveryResult(text: text, message: message)
+                        }
+                        self.hotkeyManager.isProcessing = false
+                        self.hotkeyManager.resetActiveState()
                     case .finalized(let text, let injection):
                         appState.finalize(text: text, outcome: injection)
                         if injection == .inserted,
@@ -188,9 +215,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.focusWakeupController?.sessionDidFinish()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
+                    case .macActionResult(let message, let status):
+                        appState.showMacActionResult(message: message, status: status)
+                        self.hotkeyManager.isProcessing = false
+                        self.safeResetHotkeyState()
+                    case .selectionAskStarted(let question, let selectedText):
+                        appState.cancel()
+                        self.selectionAskController.begin(question: question, selectedText: selectedText)
+                        self.hotkeyManager.isProcessing = true
+                    case .selectionAskAnswerDelta(let delta):
+                        self.selectionAskController.appendAnswerDelta(delta)
+                    case .selectionAskAnswerCompleted:
+                        self.selectionAskController.completeAnswer()
+                        self.hotkeyManager.isProcessing = false
+                        self.safeResetHotkeyState()
                     case .error(let error):
                         appState.showError(self.userFacingMessage(for: error))
                         self.focusWakeupController?.sessionDidFinish()
+                        self.selectionAskController.cancelFollowUpRecording()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
                     }
@@ -399,8 +441,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func migrateRememberedMicrophoneProfileIfNeeded() {
         let defaults = UserDefaults.standard
         let focusWakeupEnabled = Self.isFocusWakeupEnabledSetting(defaults: defaults)
+        let preferredUID = AudioInputDevicePreferenceStore.priorityEntries().first?.uid ?? ""
         let profile = RememberedMicrophoneProfileStore.migrateIfNeeded(
-            selectedUID: defaults.string(forKey: "tf_selectedMicrophoneUID") ?? "",
+            selectedUID: preferredUID,
             lastUserSelectedUID: defaults.string(forKey: "tf_lastUserSelectedMicrophoneUID") ?? "",
             focusWakeupEnabled: focusWakeupEnabled,
             defaults: defaults
@@ -415,30 +458,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   restartFocusWakeup: Whether to restart the live controller after reconciliation.
     private func reconcileRememberedMicrophoneProfile(restartFocusWakeup: Bool) {
         let defaults = UserDefaults.standard
-        let availableUIDs = AudioCaptureEngine.availableAudioDevices().map(\.uid)
-        guard let profile = RememberedMicrophoneProfileStore.load(defaults: defaults) else {
-            if restartFocusWakeup {
-                focusWakeupController?.stop()
-                syncFocusWakeupState()
-            }
-            return
-        }
+        let devices = AudioCaptureEngine.availableAudioInputDevices()
+        AudioInputDeviceMonitor.shared.replaceCachedDevices(devices)
+        let preferenceMode = AudioInputDevicePreferenceStore.mode()
+        let resolvedUID = AudioInputDevicePreferenceStore.resolvedDevice(devices: devices)?.uid
+        let profile = RememberedMicrophoneProfileStore.load(defaults: defaults)
+        let savedFocusWakeupEnabled = profile?.focusWakeupEnabled
+            ?? Self.isFocusWakeupEnabledSetting(defaults: defaults)
+        let hasUsableInput = preferenceMode == .systemDefault || resolvedUID != nil
+        let effectiveFocusWakeupEnabled = savedFocusWakeupEnabled && hasUsableInput
 
-        let runtimeSettings = RememberedMicrophoneProfilePolicy.runtimeSettings(
-            profile: profile,
-            fallbackEnabled: Self.isFocusWakeupEnabledSetting(defaults: defaults),
-            availableUIDs: availableUIDs
-        )
-        defaults.set(profile.deviceUID, forKey: "tf_lastUserSelectedMicrophoneUID")
-        defaults.set(runtimeSettings.focusWakeupEnabled, forKey: "tf_focusWakeupEnabled")
-        if let restoredUID = runtimeSettings.selectedDeviceUID {
-            defaults.set(restoredUID, forKey: "tf_selectedMicrophoneUID")
-        } else if defaults.string(forKey: "tf_selectedMicrophoneUID") == profile.deviceUID {
-            defaults.set("", forKey: "tf_selectedMicrophoneUID")
+        if let profile {
+            defaults.set(profile.deviceUID, forKey: "tf_lastUserSelectedMicrophoneUID")
         }
+        defaults.set(effectiveFocusWakeupEnabled, forKey: "tf_focusWakeupEnabled")
 
         DebugFileLogger.log(
-            "remembered microphone reconciled uid=\(profile.deviceUID) available=\(runtimeSettings.selectedDeviceUID != nil) focusEnabled=\(runtimeSettings.focusWakeupEnabled)"
+            "microphone preference reconciled mode=\(preferenceMode.rawValue) " +
+            "resolved=\(resolvedUID ?? "system-default") focusEnabled=\(effectiveFocusWakeupEnabled)"
         )
         if restartFocusWakeup {
             focusWakeupController?.stop()
@@ -451,12 +488,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Args:
     ///   device: Audio input device reported by the disconnect notification.
     private func handleRememberedMicrophoneDisconnected(_ device: AVCaptureDevice) {
-        guard let profile = RememberedMicrophoneProfileStore.load(),
-              profile.deviceUID == device.uniqueID else { return }
+        guard AudioInputDevicePreferenceStore.mode() == .priority,
+              AudioInputDevicePreferenceStore.priorityEntries().contains(where: {
+                  $0.uid == device.uniqueID
+              }) else { return }
+
         let defaults = UserDefaults.standard
-        defaults.set("", forKey: "tf_selectedMicrophoneUID")
+        let devices = AudioCaptureEngine.availableAudioInputDevices()
+        AudioInputDeviceMonitor.shared.replaceCachedDevices(devices)
+        if let fallback = AudioInputDevicePreferenceStore.resolvedDevice(devices: devices) {
+            DebugFileLogger.log(
+                "preferred microphone disconnected uid=\(device.uniqueID); using fallback=\(fallback.uid)"
+            )
+            focusWakeupController?.stop()
+            syncFocusWakeupState()
+            return
+        }
+
         defaults.set(false, forKey: "tf_focusWakeupEnabled")
-        DebugFileLogger.log("remembered microphone disconnected uid=\(device.uniqueID); Auto Focus disabled")
+        DebugFileLogger.log(
+            "preferred microphone disconnected uid=\(device.uniqueID); no fallback, Auto Focus disabled"
+        )
         syncFocusWakeupState()
     }
 
@@ -465,8 +517,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Args:
     ///   device: Audio input device reported by the connect notification.
     private func handleRememberedMicrophoneConnected(_ device: AVCaptureDevice) {
-        guard let profile = RememberedMicrophoneProfileStore.load(),
-              profile.deviceUID == device.uniqueID else { return }
+        guard AudioInputDevicePreferenceStore.mode() == .priority,
+              AudioInputDevicePreferenceStore.priorityEntries().contains(where: {
+                  $0.uid == device.uniqueID
+              }) else { return }
         DispatchQueue.main.asyncAfter(
             deadline: .now() + MicrophoneSelectionPolicy.reconnectRefreshDelaySeconds
         ) { [weak self] in
@@ -537,6 +591,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         return
                     }
 
+                    if phase == .recovering {
+                        NSLog("[Type4Me] >>> HOTKEY: recovery press")
+                        DebugFileLogger.log("hotkey recovery press")
+                        MainActor.assumeIsolated { self.hotkeyManager.resetActiveState() }
+                        let selectedProvider = KeychainService.selectedASRProvider
+                        let resolvedMode = ASRProviderRegistry.resolvedMode(for: capturedMode, provider: selectedProvider)
+                        let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+                        Task {
+                            let action = await self.session.handleRecoveryHotkeyPress()
+                            guard action == .interrupted else { return }
+                            await MainActor.run {
+                                self.appState.currentMode = effectiveMode
+                                self.appState.startRecording()
+                            }
+                            await self.session.startRecording(mode: effectiveMode)
+                        }
+                        return
+                    }
+
                     // Block new recording while LLM/injection is still in progress.
                     // The current session must finish (paste + history save) before a new one can start.
                     if phase == .processing {
@@ -579,6 +652,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let phase = MainActor.assumeIsolated { self.appState.barPhase }
                     NSLog("[mytype] >>> HOTKEY: Record STOP (phase=%@)", String(describing: phase))
                     DebugFileLogger.log("hotkey record stop phase=\(phase)")
+                    if phase == .recovering {
+                        MainActor.assumeIsolated { self.hotkeyManager.resetActiveState() }
+                        Task { _ = await self.session.handleRecoveryHotkeyPress() }
+                        return
+                    }
                     MainActor.assumeIsolated { self.appState.stopRecording() }
                     if phase == .preparing {
                         Task { await self.session.cancelRecording() }
@@ -640,6 +718,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func toggleSelectionAskFollowUp(conversationContext: String) -> Bool {
+        let phase = appState.barPhase
+        if phase == .recording || phase == .preparing {
+            DebugFileLogger.log("selectionAsk follow-up stop phase=\(phase)")
+            appState.stopRecording()
+            if phase == .preparing {
+                Task { await self.session.cancelRecording() }
+            } else {
+                Task { await self.session.stopRecording() }
+            }
+            return true
+        }
+
+        guard phase != .processing else {
+            DebugFileLogger.log("selectionAsk follow-up blocked: still processing")
+            return false
+        }
+
+        let selectedProvider = KeychainService.selectedASRProvider
+        let availableModes = appState.availableModes
+        let resolvedMode = ASRProviderRegistry.resolvedMode(for: .selectionAsk, provider: selectedProvider)
+        let effectiveMode = availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+
+        DebugFileLogger.log("selectionAsk follow-up start")
+        appState.currentMode = effectiveMode
+        appState.startRecording()
+        Task {
+            let ready = await self.session.awaitIdle()
+            if !ready {
+                DebugFileLogger.log("selectionAsk follow-up start: awaitIdle timed out")
+            }
+            await self.session.setSelectionAskConversationContext(conversationContext)
+            await self.session.startRecording(mode: effectiveMode)
+        }
+        return true
+    }
+
     private func syncESCAbortSetting() {
         hotkeyManager.isESCAbortEnabled = true
     }
@@ -693,7 +808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 timer.invalidate()
                 retryTimer = nil
                 hotkeyRetryCount = 0
-                } else if hotkeyRetryCount >= 5 {
+            } else if hotkeyRetryCount >= 5 {
                 // Permission granted but event tap still fails (macOS caches denial at kernel level).
                 // Suggest restart.
                 timer.invalidate()
@@ -707,13 +822,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showRestartAlert() {
         let alert = NSAlert()
-        alert.messageText = NSLocalizedString("辅助功能权限已开启，但快捷键未生效", comment: "")
-        alert.informativeText = NSLocalizedString(
-            "macOS 有时需要重启应用才能激活全局快捷键。点击「重启」自动重启 mytype。",
-            comment: ""
+        alert.messageText = L("辅助功能权限已开启，但快捷键未生效", "Accessibility is enabled, but the hotkey is not working")
+        alert.informativeText = L(
+            "macOS 有时需要重启应用才能激活全局快捷键。点击「重启」自动重启 MyType。",
+            "macOS sometimes requires an app restart before global hotkeys take effect. Click Restart to relaunch MyType."
         )
-        alert.addButton(withTitle: NSLocalizedString("重启", comment: ""))
-        alert.addButton(withTitle: NSLocalizedString("稍后", comment: ""))
+        alert.addButton(withTitle: L("重启", "Restart"))
+        alert.addButton(withTitle: L("稍后", "Later"))
         alert.alertStyle = .informational
 
         if alert.runModal() == .alertFirstButtonReturn {
@@ -984,6 +1099,7 @@ struct MenuBarContent: View {
         case .preparing: return TF.recording
         case .recording: return TF.recording
         case .processing: return TF.amber
+        case .recovering: return TF.amber
         case .done: return TF.success
         case .error: return TF.settingsAccentRed
         case .hidden: return .secondary.opacity(0.4)
@@ -996,6 +1112,7 @@ struct MenuBarContent: View {
         case .preparing: return L("录制中", "Recording")
         case .recording: return L("录制中", "Recording")
         case .processing: return appState.effectiveProcessingLabel
+        case .recovering: return appState.effectiveProcessingLabel
         case .done: return L("完成", "Done")
         case .error: return L("错误", "Error")
         case .hidden: return L("就绪", "Ready")

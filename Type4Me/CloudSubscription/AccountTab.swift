@@ -49,7 +49,7 @@ struct AccountTab: View, SettingsCardHelpers {
     @ViewBuilder
     private var loginView: some View {
         SettingsSectionHeader(
-            label: "ACCOUNT",
+            label: L("账户", "ACCOUNT"),
             title: L("账户", "Account"),
             description: L(
                 "登录后即可使用 mytype Cloud 语音识别和文本处理服务。",
@@ -250,7 +250,7 @@ struct AccountTab: View, SettingsCardHelpers {
     @ViewBuilder
     private var loggedInView: some View {
         SettingsSectionHeader(
-            label: "ACCOUNT",
+            label: L("账户", "ACCOUNT"),
             title: L("账户", "Account"),
             description: ""
         )

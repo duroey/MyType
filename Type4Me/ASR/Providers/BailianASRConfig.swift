@@ -5,12 +5,20 @@ struct BailianASRConfig: ASRProviderConfig, Sendable {
     static let provider = ASRProvider.bailian
     static let displayName = L("阿里云百炼", "Alibaba Cloud Bailian")
     static let defaultModel = "fun-asr-realtime"
+    static let supportedModels = [
+        "fun-asr-realtime",
+        "fun-asr-realtime-2026-02-28",
+        "fun-asr-realtime-2025-11-07",
+        "fun-asr-realtime-2025-09-15",
+        "fun-asr-flash-8k-realtime",
+        "fun-asr-flash-8k-realtime-2026-01-28",
+    ]
     static let supportedLanguageHints = ["zh", "en", "ja"]
 
     static var credentialFields: [CredentialField] {[
         CredentialField(
             key: "apiKey",
-            label: "API Key",
+            label: L("API Key", "API Key"),
             placeholder: "sk-...",
             isSecure: true,
             isOptional: false,
@@ -18,15 +26,17 @@ struct BailianASRConfig: ASRProviderConfig, Sendable {
         ),
         CredentialField(
             key: "model",
-            label: "Model",
+            label: L("模型", "Model"),
             placeholder: defaultModel,
             isSecure: false,
             isOptional: false,
-            defaultValue: defaultModel
+            defaultValue: defaultModel,
+            options: supportedModels.map { FieldOption(value: $0, label: $0) },
+            allowCustomInput: true
         ),
         CredentialField(
             key: "languageHint",
-            label: "Language Hint",
+            label: L("语言提示", "Language Hint"),
             placeholder: "zh / en / ja",
             isSecure: false,
             isOptional: true,
@@ -34,7 +44,7 @@ struct BailianASRConfig: ASRProviderConfig, Sendable {
         ),
         CredentialField(
             key: "vocabularyId",
-            label: "Vocabulary ID",
+            label: L("热词词表 ID", "Vocabulary ID"),
             placeholder: L("热词词表 ID", "Hotword vocabulary ID"),
             isSecure: false,
             isOptional: true,
@@ -42,7 +52,7 @@ struct BailianASRConfig: ASRProviderConfig, Sendable {
         ),
         CredentialField(
             key: "baseURL",
-            label: "Base URL",
+            label: L("Base URL", "Base URL"),
             placeholder: "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
             isSecure: false,
             isOptional: true,

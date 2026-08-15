@@ -303,7 +303,7 @@ final class FocusWakeupController {
         monitorStartedAt = nil
         lastFrameAt = nil
         monitorFrameCount = 0
-        monitorAudio.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
+        monitorAudio.selectedDeviceUID = AudioInputDevicePreferenceStore.resolvedCachedDeviceUID()
         monitorAudio.onAudioFrame = { [weak self] data in
             Task { @MainActor in
                 self?.handleMonitorAudio(data)
@@ -916,8 +916,7 @@ final class FocusWakeupController {
     /// Returns:
     ///   Selected microphone UID, or "default" when the system default is used.
     private static func selectedMicrophoneUIDDescription() -> String {
-        guard let uid = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID"),
-              !uid.isEmpty else {
+        guard let uid = AudioInputDevicePreferenceStore.resolvedCachedDeviceUID() else {
             return "default"
         }
         return uid

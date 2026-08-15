@@ -63,7 +63,7 @@ struct HotkeyRecorderView: View {
     // MARK: - Display
 
     private var displayText: String {
-        if isRecording { return L("按下快捷键或鼠标按键...", "Press a key or mouse button...") }
+        if isRecording { return L("按下快捷键、鼠标或耳机按键...", "Press a key, mouse or headphone button...") }
         guard let kc = keyCode else { return L("未设置", "Not set") }
         return Self.keyDisplayName(keyCode: kc, modifiers: modifiers)
     }
@@ -84,7 +84,25 @@ struct HotkeyRecorderView: View {
             await MainActor.run { stopRecording() }
         }
 
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .otherMouseDown]) { event in
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .otherMouseDown, .systemDefined]) { event in
+            // Media key pressed (headphone buttons, keyboard media keys)
+            if event.type == .systemDefined {
+                guard event.subtype.rawValue == 8 else { return event }
+                let keyType = Int((event.data1 >> 16) & 0xFFFF)
+                let keyState = Int((event.data1 >> 8) & 0xFF)
+                guard keyState == 0x0A else { return event }  // key down only
+                guard Self.isKnownMediaKeyType(keyType) else { return event }
+
+                modifierCaptureTask?.cancel()
+                modifierCaptureTask = nil
+                pendingModifierCode = nil
+
+                keyCode = ModeBinding.mediaKeyCode(for: keyType)
+                modifiers = 0
+                stopRecording()
+                return nil
+            }
+
             // Mouse button pressed (middle click, side buttons)
             if event.type == .otherMouseDown {
                 let buttonNumber = event.buttonNumber
@@ -145,8 +163,8 @@ struct HotkeyRecorderView: View {
                     return nil
                 }
                 keyCode = kc
-                // Store modifier flags, stripping noise (capsLock, numericPad, function)
-                let clean = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                // Store modifier flags, stripping only non-hotkey noise.
+                let clean = Self.sanitizedModifierFlags(event.modifierFlags, forKeyCode: kc)
                 modifiers = clean.isEmpty ? 0 : UInt64(clean.rawValue)
                 stopRecording()
                 return nil
@@ -181,6 +199,18 @@ struct HotkeyRecorderView: View {
 
     static let modifierKeyCodes: Set<Int> = [54, 55, 56, 58, 59, 60, 61, 62, 63]
 
+    static func isKnownMediaKeyType(_ keyType: Int) -> Bool {
+        [0, 1, 7, 16, 17, 18, 19, 20].contains(keyType)
+    }
+
+    nonisolated static func sanitizedModifierFlags(_ flags: NSEvent.ModifierFlags, forKeyCode keyCode: Int? = nil) -> NSEvent.ModifierFlags {
+        var clean = flags.intersection([.command, .shift, .option, .control, .function])
+        if let keyCode, ModeBinding.isFunctionKeyCode(keyCode) {
+            clean.remove(.function)
+        }
+        return clean
+    }
+
     private func isModifierPressed(keyCode: Int, flags: NSEvent.ModifierFlags) -> Bool {
         switch keyCode {
         case 54, 55: return flags.contains(.command)
@@ -200,12 +230,13 @@ struct HotkeyRecorderView: View {
         case 56, 60: return .shift
         case 58, 61: return .option
         case 59, 62: return .control
+        case 63: return .function
         default: return nil
         }
     }
 
     private func modifierComboModifiers(for keyCode: Int, flags: NSEvent.ModifierFlags) -> UInt64 {
-        var clean = flags.intersection([.command, .shift, .option, .control])
+        var clean = Self.sanitizedModifierFlags(flags)
         if let own = modifierFlag(for: keyCode) {
             clean.remove(own)
         }
@@ -215,19 +246,20 @@ struct HotkeyRecorderView: View {
     // MARK: - Key Display Name
 
     static func keyDisplayName(keyCode: Int, modifiers: UInt64?) -> String {
-        // Mouse buttons: no modifier combos, just the button name
-        if ModeBinding.isMouseKeyCode(keyCode) {
+        // Mouse buttons and media keys: no modifier combos, just the name
+        if ModeBinding.isMouseKeyCode(keyCode) || ModeBinding.isMediaKeyCode(keyCode) {
             return singleKeyName(keyCode)
         }
 
         let mods = modifiers ?? 0
         var parts: [String] = []
         if mods != 0 {
-            let flags = NSEvent.ModifierFlags(rawValue: UInt(mods))
+            let flags = sanitizedModifierFlags(NSEvent.ModifierFlags(rawValue: UInt(mods)), forKeyCode: keyCode)
             if flags.contains(.control) { parts.append("⌃") }
             if flags.contains(.option) { parts.append("⌥") }
             if flags.contains(.shift) { parts.append("⇧") }
             if flags.contains(.command) { parts.append("⌘") }
+            if flags.contains(.function) { parts.append("fn") }
         }
         parts.append(singleKeyName(keyCode))
         return parts.joined(separator: "+")
@@ -243,26 +275,42 @@ struct HotkeyRecorderView: View {
             }
         }
 
+        // Media keys (high-bit keyCode convention: 0x9000 + NX_KEYTYPE)
+        if ModeBinding.isMediaKeyCode(keyCode) {
+            let keyType = ModeBinding.mediaKeyType(from: keyCode)
+            switch keyType {
+            case 0:  return L("音量↑", "Vol ↑")
+            case 1:  return L("音量↓", "Vol ↓")
+            case 7:  return L("静音", "Mute")
+            case 16: return L("播放/暂停", "Play/Pause")
+            case 17: return L("下一曲", "Next")
+            case 18: return L("上一曲", "Prev")
+            case 19: return L("快进", "Fast")
+            case 20: return L("快退", "Rewind")
+            default: return L("媒体键\(keyType)", "Media\(keyType)")
+            }
+        }
+
         switch keyCode {
         // Modifier keys
-        case 54: return "Right Command"
-        case 55: return "Left Command"
-        case 56: return "Left Shift"
-        case 58: return "Left Option"
-        case 59: return "Left Control"
-        case 60: return "Right Shift"
-        case 61: return "Right Option"
-        case 62: return "Right Control"
-        case 63: return "fn"
+        case 54: return L("右 Command", "Right Command")
+        case 55: return L("左 Command", "Left Command")
+        case 56: return L("左 Shift", "Left Shift")
+        case 58: return L("左 Option", "Left Option")
+        case 59: return L("左 Control", "Left Control")
+        case 60: return L("右 Shift", "Right Shift")
+        case 61: return L("右 Option", "Right Option")
+        case 62: return L("右 Control", "Right Control")
+        case 63: return L("fn", "fn")
 
         // Special keys
-        case 36: return "Return"
-        case 48: return "Tab"
-        case 49: return "Space"
-        case 51: return "Delete"
-        case 53: return "Escape"
-        case 76: return "Enter"
-        case 117: return "Forward Delete"
+        case 36: return L("Return", "Return")
+        case 48: return L("Tab", "Tab")
+        case 49: return L("空格", "Space")
+        case 51: return L("删除", "Delete")
+        case 53: return L("退出", "Escape")
+        case 76: return L("Enter", "Enter")
+        case 117: return L("向前删除", "Forward Delete")
 
         // Arrows
         case 123: return "←"
@@ -285,7 +333,7 @@ struct HotkeyRecorderView: View {
         case 111: return "F12"
 
         default:
-            return ucKeyTranslateName(keyCode) ?? "Key \(keyCode)"
+            return ucKeyTranslateName(keyCode) ?? L("按键 \(keyCode)", "Key \(keyCode)")
         }
     }
 

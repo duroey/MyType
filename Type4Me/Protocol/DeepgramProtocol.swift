@@ -6,7 +6,7 @@ enum DeepgramProtocolError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint:
-            return "Failed to build Deepgram WebSocket URL"
+            return L("无法生成 Deepgram WebSocket URL", "Failed to build Deepgram WebSocket URL")
         }
     }
 }

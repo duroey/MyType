@@ -296,11 +296,11 @@ enum VolcHotwordError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noCredentials:
-            return "Volcengine IAM credentials not configured"
+            return L("未配置火山引擎 IAM 凭证", "Volcengine IAM credentials not configured")
         case .invalidResponse:
-            return "Invalid response from Volcengine API"
+            return L("火山引擎 API 返回无效", "Invalid response from Volcengine API")
         case .apiError(let action, let message):
-            return "\(action) failed: \(message)"
+            return L("\(action) 失败：\(message)", "\(action) failed: \(message)")
         }
     }
 }

@@ -7,9 +7,9 @@ enum BaiduProtocolError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidMessage:
-            return "Invalid Baidu realtime ASR message"
+            return L("百度实时识别消息无效", "Invalid Baidu realtime ASR message")
         case .serverError(let code, let message):
-            return "Baidu realtime ASR failed [\(code)]: \(message)"
+            return L("百度实时识别失败 [\(code)]：\(message)", "Baidu realtime ASR failed [\(code)]: \(message)")
         }
     }
 }
@@ -46,14 +46,19 @@ enum BaiduProtocol {
         config: BaiduASRConfig,
         options: ASRRequestOptions
     ) -> String {
+        let effectivePID = effectiveDevPID(from: config.devPID, enablePunc: options.enablePunc)
         var data: [String: Any] = [
             "appid": config.appID,
             "appkey": config.apiKey,
-            "dev_pid": effectiveDevPID(from: config.devPID, enablePunc: options.enablePunc),
+            "dev_pid": effectivePID,
             "cuid": config.cuid,
             "format": "pcm",
             "sample": 16000,
         ]
+
+        if effectivePID == 15376 {
+            data["user"] = config.cuid
+        }
 
         if let lmID = sanitized(config.lmID) {
             data["lm_id"] = lmID

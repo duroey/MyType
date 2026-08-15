@@ -6,11 +6,11 @@ struct CustomASRConfig: ASRProviderConfig, Sendable {
     static var displayName: String { L("自定义", "Custom") }
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "endpointURL", label: "Endpoint URL", placeholder: L("wss://... 或 https://...", "wss://... or https://..."), isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "apiKey", label: "API Key / Token", placeholder: L("认证密钥", "Auth key"), isSecure: true, isOptional: true, defaultValue: ""),
-        CredentialField(key: "secretKey", label: "Secret Key", placeholder: L("可选", "Optional"), isSecure: true, isOptional: true, defaultValue: ""),
-        CredentialField(key: "appId", label: "App ID", placeholder: L("可选", "Optional"), isSecure: false, isOptional: true, defaultValue: ""),
-        CredentialField(key: "region", label: "Region", placeholder: L("可选", "Optional"), isSecure: false, isOptional: true, defaultValue: ""),
+        CredentialField(key: "endpointURL", label: L("端点 URL", "Endpoint URL"), placeholder: L("wss://... 或 https://...", "wss://... or https://..."), isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "apiKey", label: L("API Key / Token", "API Key / Token"), placeholder: L("认证密钥", "Auth key"), isSecure: true, isOptional: true, defaultValue: ""),
+        CredentialField(key: "secretKey", label: L("Secret Key", "Secret Key"), placeholder: L("可选", "Optional"), isSecure: true, isOptional: true, defaultValue: ""),
+        CredentialField(key: "appId", label: L("App ID", "App ID"), placeholder: L("可选", "Optional"), isSecure: false, isOptional: true, defaultValue: ""),
+        CredentialField(key: "region", label: L("区域", "Region"), placeholder: L("可选", "Optional"), isSecure: false, isOptional: true, defaultValue: ""),
     ]}
 
     let endpointURL: String

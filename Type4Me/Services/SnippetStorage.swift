@@ -332,7 +332,7 @@ enum SnippetStorage {
         // Delete the per-app snippet file
         try? FileManager.default.removeItem(at: appSnippetFileURL(bundleId: bundleId))
         // Invalidate this app's compiled cache
-        appCacheLock.withLock { $0.removeValue(forKey: bundleId) }
+        _ = appCacheLock.withLock { $0.removeValue(forKey: bundleId) }
     }
 
     // MARK: - Per-app snippet load/save
@@ -343,7 +343,7 @@ enum SnippetStorage {
 
     static func saveAppSnippets(_ snippets: [(trigger: String, value: String)], bundleId: String) {
         writeFile(snippets, to: appSnippetFileURL(bundleId: bundleId))
-        appCacheLock.withLock { $0.removeValue(forKey: bundleId) }
+        _ = appCacheLock.withLock { $0.removeValue(forKey: bundleId) }
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 

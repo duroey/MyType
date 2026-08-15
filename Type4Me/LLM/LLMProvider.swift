@@ -14,7 +14,9 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
     case deepseek
     case zhipu
     case claude
+    case codexCLI
     case ollama
+    case custom
 
     var displayName: String {
         switch self {
@@ -29,7 +31,9 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
         case .deepseek:    return L("DeepSeek (深度求索)", "DeepSeek")
         case .zhipu:       return L("智谱 (GLM)", "Zhipu (GLM)")
         case .claude:      return "Claude (Anthropic)"
+        case .codexCLI:    return L("Codex CLI（本地账号）", "Codex CLI (Local Account)")
         case .ollama:      return L("Ollama (本地模型)", "Ollama (Local)")
+        case .custom:      return L("自定义 (OpenAI 兼容)", "Custom (OpenAI Compatible)")
         }
     }
 
@@ -46,7 +50,9 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
         case .deepseek:    return "https://api.deepseek.com"
         case .zhipu:       return "https://open.bigmodel.cn/api/paas/v4"
         case .claude:      return "https://api.anthropic.com/v1"
+        case .codexCLI:    return ""
         case .ollama:      return "http://localhost:11434/v1"
+        case .custom:      return ""
         }
     }
 
@@ -57,86 +63,98 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
         switch self {
         case .doubao:
             return [
-                FieldOption(value: "doubao-seed-2-0-mini-260215", label: "doubao-seed-2-0-mini-260215"),
-                FieldOption(value: "doubao-seed-2-0-lite-260215", label: "doubao-seed-2-0-lite-260215"),
+                FieldOption(value: "doubao-seed-2-1-turbo-260628", label: "doubao-seed-2-1-turbo-260628"),
+                FieldOption(value: "doubao-seed-2-1-pro-260628", label: "doubao-seed-2-1-pro-260628"),
+                FieldOption(value: "doubao-seed-2-0-lite-260428", label: "doubao-seed-2-0-lite-260428"),
+                FieldOption(value: "doubao-seed-2-0-mini-260428", label: "doubao-seed-2-0-mini-260428"),
                 FieldOption(value: "doubao-seed-2-0-pro-260215", label: "doubao-seed-2-0-pro-260215"),
-                FieldOption(value: "doubao-seed-1-6-flash-250828", label: "doubao-seed-1-6-flash-250828"),
-                FieldOption(value: "doubao-1-5-pro-32k-250115", label: "doubao-1-5-pro-32k-250115"),
-                FieldOption(value: "doubao-1-5-lite-32k-250115", label: "doubao-1-5-lite-32k-250115"),
             ]
         case .minimaxCN, .minimaxIntl:
             return [
+                FieldOption(value: "MiniMax-M3", label: "MiniMax-M3"),
                 FieldOption(value: "MiniMax-M2.7", label: "MiniMax-M2.7"),
                 FieldOption(value: "MiniMax-M2.7-highspeed", label: "MiniMax-M2.7-highspeed"),
                 FieldOption(value: "MiniMax-M2.5", label: "MiniMax-M2.5"),
                 FieldOption(value: "MiniMax-M2.5-highspeed", label: "MiniMax-M2.5-highspeed"),
                 FieldOption(value: "MiniMax-M2.1", label: "MiniMax-M2.1"),
+                FieldOption(value: "MiniMax-M2.1-highspeed", label: "MiniMax-M2.1-highspeed"),
+                FieldOption(value: "MiniMax-M2", label: "MiniMax-M2"),
             ]
         case .bailian:
             return [
-                FieldOption(value: "qwen3.6-plus", label: "qwen3.6-plus"),
-                FieldOption(value: "qwen3.5-flash", label: "qwen3.5-flash"),
-                FieldOption(value: "qwen3-max", label: "qwen3-max"),
+                FieldOption(value: "qwen3.7-plus", label: "qwen3.7-plus"),
+                FieldOption(value: "qwen3.7-max", label: "qwen3.7-max"),
+                FieldOption(value: "qwen3.6-flash", label: "qwen3.6-flash"),
                 FieldOption(value: "qwen-plus", label: "qwen-plus"),
                 FieldOption(value: "qwen-turbo", label: "qwen-turbo"),
                 FieldOption(value: "qwen-long", label: "qwen-long"),
             ]
         case .kimi:
             return [
+                FieldOption(value: "kimi-k2.6", label: "kimi-k2.6"),
+                FieldOption(value: "kimi-k2.7-code-highspeed", label: "kimi-k2.7-code-highspeed"),
+                FieldOption(value: "kimi-k2.7-code", label: "kimi-k2.7-code"),
                 FieldOption(value: "kimi-k2.5", label: "kimi-k2.5"),
-                FieldOption(value: "kimi-k2-turbo-preview", label: "kimi-k2-turbo-preview"),
-                FieldOption(value: "moonshot-v1-auto", label: "moonshot-v1-auto"),
                 FieldOption(value: "moonshot-v1-128k", label: "moonshot-v1-128k"),
                 FieldOption(value: "moonshot-v1-32k", label: "moonshot-v1-32k"),
+                FieldOption(value: "moonshot-v1-8k", label: "moonshot-v1-8k"),
             ]
         case .openai:
             return [
-                FieldOption(value: "gpt-5.4-nano", label: "gpt-5.4-nano"),
                 FieldOption(value: "gpt-5.4-mini", label: "gpt-5.4-mini"),
+                FieldOption(value: "gpt-5.5", label: "gpt-5.5"),
+                FieldOption(value: "gpt-5.5-pro", label: "gpt-5.5-pro"),
                 FieldOption(value: "gpt-5.4", label: "gpt-5.4"),
-                FieldOption(value: "gpt-4.1-nano", label: "gpt-4.1-nano"),
-                FieldOption(value: "gpt-4.1-mini", label: "gpt-4.1-mini"),
-                FieldOption(value: "gpt-4.1", label: "gpt-4.1"),
-                FieldOption(value: "gpt-4o-mini", label: "gpt-4o-mini"),
-                FieldOption(value: "o4-mini", label: "o4-mini"),
+                FieldOption(value: "gpt-5.4-pro", label: "gpt-5.4-pro"),
+                FieldOption(value: "gpt-5.4-nano", label: "gpt-5.4-nano"),
             ]
         case .gemini:
             return [
+                FieldOption(value: "gemini-3.5-flash", label: "gemini-3.5-flash"),
+                FieldOption(value: "gemini-3.1-flash-lite", label: "gemini-3.1-flash-lite"),
+                FieldOption(value: "gemini-3.1-pro-preview", label: "gemini-3.1-pro-preview"),
+                FieldOption(value: "gemini-3-flash-preview", label: "gemini-3-flash-preview"),
                 FieldOption(value: "gemini-2.5-flash", label: "gemini-2.5-flash"),
                 FieldOption(value: "gemini-2.5-pro", label: "gemini-2.5-pro"),
                 FieldOption(value: "gemini-2.5-flash-lite", label: "gemini-2.5-flash-lite"),
-                FieldOption(value: "gemini-2.0-flash", label: "gemini-2.0-flash"),
-                FieldOption(value: "gemini-3.1-pro-preview", label: "gemini-3.1-pro-preview"),
-                FieldOption(value: "gemini-3.1-flash-lite-preview", label: "gemini-3.1-flash-lite-preview"),
             ]
         case .deepseek:
             return [
-                FieldOption(value: "deepseek-chat", label: "deepseek-chat"),
-                FieldOption(value: "deepseek-reasoner", label: "deepseek-reasoner"),
+                FieldOption(value: "deepseek-v4-flash", label: "deepseek-v4-flash"),
+                FieldOption(value: "deepseek-v4-pro", label: "deepseek-v4-pro"),
             ]
         case .zhipu:
             return [
+                FieldOption(value: "glm-5.2", label: "glm-5.2"),
+                FieldOption(value: "glm-5.1", label: "glm-5.1"),
                 FieldOption(value: "glm-5", label: "glm-5"),
                 FieldOption(value: "glm-5-turbo", label: "glm-5-turbo"),
+                FieldOption(value: "glm-4.7", label: "glm-4.7"),
+                FieldOption(value: "glm-4.7-flashx", label: "glm-4.7-flashx"),
                 FieldOption(value: "glm-4.7-flash", label: "glm-4.7-flash"),
-                FieldOption(value: "glm-4.5-flash", label: "glm-4.5-flash"),
                 FieldOption(value: "glm-4.5-air", label: "glm-4.5-air"),
+                FieldOption(value: "glm-4.5-airx", label: "glm-4.5-airx"),
                 FieldOption(value: "glm-4-long", label: "glm-4-long"),
             ]
         case .claude:
             return [
-                FieldOption(value: "claude-sonnet-4-6", label: "claude-sonnet-4-6"),
-                FieldOption(value: "claude-opus-4-6", label: "claude-opus-4-6"),
+                FieldOption(value: "claude-sonnet-5", label: "claude-sonnet-5"),
+                FieldOption(value: "claude-fable-5", label: "claude-fable-5"),
+                FieldOption(value: "claude-opus-4-8", label: "claude-opus-4-8"),
                 FieldOption(value: "claude-haiku-4-5-20251001", label: "claude-haiku-4-5-20251001"),
-                FieldOption(value: "claude-sonnet-4-5-20250929", label: "claude-sonnet-4-5-20250929"),
             ]
-        case .openrouter, .ollama:
+        case .codexCLI:
+            return [
+                FieldOption(value: "gpt-5.6-luna", label: L("GPT-5.6 Luna（推荐）", "GPT-5.6 Luna (Recommended)")),
+                FieldOption(value: "gpt-5.3-codex-spark", label: L("GPT-5.3 Codex Spark（极速实验）", "GPT-5.3 Codex Spark (Fast, Experimental)")),
+            ]
+        case .openrouter, .ollama, .custom:
             return []
         }
     }
 
     var isOpenAICompatible: Bool {
-        self != .claude
+        self != .claude && self != .codexCLI
     }
 
     /// Whether this is a local provider bundled with the app (no external service).
@@ -146,23 +164,41 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
 
     /// Whether this provider requires an API key for authentication.
     var requiresAPIKey: Bool {
-        self != .ollama
+        self != .ollama && self != .codexCLI
+    }
+
+    /// Whether recording-time speculative requests are safe and economical.
+    /// CLI runtimes start a full agent process for every request, so they only
+    /// run once after the final transcript is available.
+    var supportsSpeculativeProcessing: Bool {
+        self != .ollama && self != .codexCLI
     }
 
     /// Thinking/reasoning disable strategy for this provider.
     /// Each provider uses a different field name to turn off chain-of-thought.
     /// Returns nil for providers where no explicit disable is needed or possible.
     var thinkingDisableField: ThinkingDisableField? {
+        thinkingDisableField(for: nil)
+    }
+
+    func thinkingDisableField(for model: String?) -> ThinkingDisableField? {
         switch self {
-        case .doubao, .kimi, .deepseek:
+        case .doubao, .deepseek:
+            // thinking: { type: "disabled" }
+            return .thinking
+        case .kimi:
+            let normalizedModel = (model ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if normalizedModel.hasPrefix("kimi-k2.7-code") {
+                return nil
+            }
             // thinking: { type: "disabled" }
             return .thinking
         case .bailian:
             // enable_thinking: false (Qwen models)
             return .enableThinking
         case .zhipu:
-            // reasoning_effort: "none" (GLM-4.5+)
-            return .reasoningEffort
+            // thinking: { type: "disabled" } (GLM-5.x / GLM-4.7)
+            return .thinking
         case .ollama:
             // think: false
             return .think
@@ -185,12 +221,12 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
 
 // MARK: - Thinking Disable Strategy
 
-enum ThinkingDisableField {
-    /// `thinking: { type: "disabled" }` — Doubao, Kimi, DeepSeek
+enum ThinkingDisableField: Equatable {
+    /// `thinking: { type: "disabled" }` — Doubao, Kimi, DeepSeek, Zhipu
     case thinking
     /// `enable_thinking: false` — Bailian (Qwen)
     case enableThinking
-    /// `reasoning_effort: "none"` — Zhipu (GLM)
+    /// `reasoning_effort: "none"` — providers that still expose OpenAI-style effort control
     case reasoningEffort
     /// `think: false` — Ollama
     case think

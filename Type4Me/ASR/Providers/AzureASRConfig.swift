@@ -6,9 +6,9 @@ struct AzureASRConfig: ASRProviderConfig, Sendable {
     static let displayName = "Azure Speech"
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "subscriptionKey", label: "Subscription Key", placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
-        CredentialField(key: "region", label: "Region", placeholder: "eastasia", isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "customEndpoint", label: "Custom Endpoint", placeholder: L("可选", "Optional"), isSecure: false, isOptional: true, defaultValue: ""),
+        CredentialField(key: "subscriptionKey", label: L("订阅密钥", "Subscription Key"), placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "region", label: L("区域", "Region"), placeholder: "eastasia", isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "customEndpoint", label: L("自定义端点", "Custom Endpoint"), placeholder: L("可选", "Optional"), isSecure: false, isOptional: true, defaultValue: ""),
     ]}
 
     let subscriptionKey: String

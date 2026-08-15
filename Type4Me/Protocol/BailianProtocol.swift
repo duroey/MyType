@@ -7,11 +7,11 @@ enum BailianProtocolError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidMessage:
-            return "Invalid Alibaba Cloud Bailian ASR message"
+            return L("阿里云百炼识别消息无效", "Invalid Alibaba Cloud Bailian ASR message")
         case .taskFailed(let code, let message):
             let codePart = code?.isEmpty == false ? "[\(code!)] " : ""
-            let messagePart = message?.isEmpty == false ? message! : "Task failed"
-            return "Alibaba Cloud Bailian ASR failed: \(codePart)\(messagePart)"
+            let messagePart = message?.isEmpty == false ? message! : L("任务失败", "Task failed")
+            return L("阿里云百炼识别失败：\(codePart)\(messagePart)", "Alibaba Cloud Bailian ASR failed: \(codePart)\(messagePart)")
         }
     }
 }

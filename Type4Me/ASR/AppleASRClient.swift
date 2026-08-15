@@ -11,7 +11,7 @@ enum AppleASRError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidConfig:
-            return "Apple ASR requires AppleASRConfig"
+            return L("Apple 语音识别配置无效", "Apple ASR requires AppleASRConfig")
         case .permissionDenied:
             return L("未授予语音识别权限", "Speech recognition permission not granted")
         case .recognizerUnavailable:

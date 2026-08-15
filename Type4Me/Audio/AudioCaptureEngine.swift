@@ -106,14 +106,14 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     /// Set before calling `start()`. Empty string or nil means system default.
     var selectedDeviceUID: String?
 
+    /// Returns rich metadata for available audio input devices.
+    static func availableAudioInputDevices() -> [AudioInputDevice] {
+        AudioInputDeviceDiscovery.availableInputDevices()
+    }
+
     /// Returns a list of available audio input devices (UID + display name).
     static func availableAudioDevices() -> [(uid: String, name: String)] {
-        let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInMicrophone, .externalUnknown],
-            mediaType: .audio,
-            position: .unspecified
-        )
-        return discoverySession.devices.map { (uid: $0.uniqueID, name: $0.localizedName) }
+        availableAudioInputDevices().map { (uid: $0.uid, name: $0.name) }
     }
 
     /// Resolve the capture device: use selectedDeviceUID if set and valid, otherwise system default.
@@ -150,8 +150,6 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     // MARK: - Warm-up
 
     private var isWarmedUp = false
-    private var warmSession: AVCaptureSession?
-
     override init() {
         super.init()
         outputQueue.setSpecific(key: outputQueueKey, value: outputQueueTag)
@@ -165,25 +163,13 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
             return
         }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            do {
-                guard let device = self.resolveDevice() else { return }
-                let session = AVCaptureSession()
-                let input = try AVCaptureDeviceInput(device: device)
-                guard session.canAddInput(input) else { return }
-                session.addInput(input)
-                let output = AVCaptureAudioDataOutput()
-                guard session.canAddOutput(output) else { return }
-                session.addOutput(output)
-                session.startRunning()
-                // Keep it alive briefly to fully initialize CoreAudio, then stop
-                Thread.sleep(forTimeInterval: 0.3)
-                session.stopRunning()
-                self.isWarmedUp = true
-                NSLog("[Audio] Warm-up complete (device: %@)", device.localizedName)
-            } catch {
-                NSLog("[Audio] Warm-up failed: %@", String(describing: error))
-            }
+            // Loading AVAudioEngine and its input node primes the framework without
+            // opening the microphone. Starting a warm-up capture here would push a
+            // Bluetooth headset into call mode while the app is merely launching.
+            let engine = AVAudioEngine()
+            _ = engine.inputNode
+            self?.isWarmedUp = true
+            NSLog("[Audio] Warm-up complete (AVAudioEngine graph initialized)")
         }
     }
 
@@ -240,10 +226,16 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     }
 
     func stop() {
-        let session = captureSession
-        DebugFileLogger.log("audio capture stop requested running=\(session?.isRunning ?? false)")
-        session?.stopRunning()
+        guard let session = captureSession else {
+            removeSessionDiagnostics()
+            clearCaptureState()
+            return
+        }
+
+        DebugFileLogger.log("audio capture stop requested running=\(session.isRunning)")
+        session.stopRunning()
         drainOutputQueue()
+
         let output = stateLock.withLock { () -> AVCaptureAudioDataOutput? in
             let current = activeOutput
             activeOutput = nil
@@ -251,8 +243,28 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         }
         output?.setSampleBufferDelegate(nil, queue: nil)
         removeSessionDiagnostics()
+
+        // stopRunning() stops delivery, but explicitly detaching every graph node
+        // releases the AVCaptureDeviceInput immediately. This is important for a
+        // Bluetooth headset: CoreAudio can leave the HFP input route alive while
+        // a stopped session still owns its device input.
+        session.beginConfiguration()
+        for captureOutput in session.outputs {
+            session.removeOutput(captureOutput)
+        }
+        for captureInput in session.inputs {
+            session.removeInput(captureInput)
+        }
+        session.commitConfiguration()
         captureSession = nil
+
         flushRemaining()
+        clearCaptureState()
+        NSLog("[Audio] Capture session stopped and graph detached")
+        DebugFileLogger.log("audio capture stopped; AVCapture graph detached")
+    }
+
+    private func clearCaptureState() {
         bufferLock.lock()
         converter = nil
         onAudioChunk = nil
@@ -260,8 +272,6 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         onAudioLevel = nil
         bufferLock.unlock()
         levelCounter = 0
-        NSLog("[Audio] Capture session stopped")
-        DebugFileLogger.log("audio capture stopped")
     }
 
     /// Installs AVCaptureSession lifecycle diagnostics for the active session.
@@ -359,6 +369,9 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
             }
             converter = AVAudioConverter(from: sourceFormat, to: Self.targetFormat)
             NSLog("[Audio] Input format: %@", sourceFormat.description)
+            DebugFileLogger.log(
+                "audio input format rate=\(sourceFormat.sampleRate) channels=\(sourceFormat.channelCount) interleaved=\(sourceFormat.isInterleaved)"
+            )
         }
         guard let conv = converter else {
             bufferLock.unlock()

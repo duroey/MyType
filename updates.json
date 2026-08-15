@@ -1,6 +1,83 @@
 {
-  "latest": "1.9.3",
+  "latest": "2.0.0",
   "releases": [
+    {
+      "version": "2.0.0",
+      "date": "2026-08-07",
+      "notes": "- 新增 Selection Ask：可围绕选中文本连续追问，并以流式 Markdown 展示回答\n- 文本处理支持使用本机已登录的 Codex CLI，无需单独配置 API Key\n- 新增 Grok 流式语音识别与 StepFun 批量转写\n- Local 版新增 Qwen3-only 本地识别模式\n- 火山语音识别支持新版 API Key，同时兼容旧版 App ID + Access Token\n- 历史用量详情、应用内 GitHub 反馈与 ElevenLabs 英文标点处理得到改进",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
+    {
+      "version": "1.9.9",
+      "date": "2026-07-03",
+      "notes": "- Soniox 默认升级到 stt-rt-v5，批量兜底升级到 stt-async-v5\n- 缩短 Soniox endpoint delay，并丢弃过期 partial，减少录音启动/收尾阶段转圈或旧文本回流\n- 修复 F1-F20 功能键被 macOS 附带 Fn 标记后，录制、冲突检测和触发不一致的问题\n- 刷新主流 LLM/ASR 厂商的模型列表，并修正 Kimi K2.7、智谱 GLM 新模型的思考模式参数",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
+    {
+      "version": "1.9.8",
+      "date": "2026-06-19",
+      "notes": "- 减少录音中提前润色的无意义 LLM 请求：过短文本、小幅增量和并发中的重复请求会被节流\n- 最终 ASR 与提前润色输入只有空白、标点或尾部标点差异时，可复用已有 LLM 结果\n- 新增提前润色复用判断与请求节流的单元测试",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
+    {
+      "version": "1.9.7",
+      "date": "2026-06-19",
+      "notes": "- 修复旧版本升级后 ASR/LLM 凭证可能无法保存、测试/保存按钮不可用的问题\n- 修复测试连接失败时，长错误信息不再撑坏按钮布局\n- 修复单修饰键快捷键与组合修饰键冲突时，较短快捷键提前触发导致录音浮窗不出现或录音内容丢失的问题\n- 修复快捷键录制时无法保留 Fn 组合键的问题，支持 Fn+Space 等组合\n- 修复录音动效设置不生效的问题，并新增「关闭」录音动效选项\n- 改进应用内更新下载失败提示；遇到系统 “too many open files” 时给出明确重启/手动安装建议\n- 忽略火山 ASR HTTP 探测产生的误导性 WebSocket upgrade 报错",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
+    {
+      "version": "1.9.6",
+      "date": "2026-06-15",
+      "notes": "- 修复应用内安装失败后可能回滚到旧版本、或重新打开 Type4Me-backup 的问题\n- 本地版大包更新增强：放宽下载超时、自动断点重试，并补强进度条显示兜底\n- 语音识别设置新增麦克风输入优先级：可指定多个输入设备，蓝牙等设备不可用时自动回退到下一个设备，最后跟随系统默认\n- 语音识别设置新增「中英文空格」开关，可按需保留或去除中文与英文/数字之间的空格\n- 保留中英文和数字之间的合理空格，同时继续清理 CJK 内部拼接产生的多余空格 (#186)\n- 修复 LLM 默认模型下保存/测试凭据按钮不可用的问题\n- LLM 请求复用客户端和 URLSession，减少重复初始化开销",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
+    {
+      "version": "1.9.5",
+      "date": "2026-06-02",
+      "notes": "- 修复本地版应用内更新误下载云端版 DMG，导致升级后 Qwen3-ASR / SenseVoice 本地识别不可用的问题 (#184)\n- 修复火山 ASR 长时间不用后重连时可能显示误导性 WebSocket upgrade 报错的问题 (#181)\n- 修复耳机/媒体键作为快捷键时可能自动打开 Apple Music 的问题 (#180)\n- Local 版本降低 Qwen3-ASR 把热词列表当成正文输出的概率，并做保守清理/回退\n- 设置页快捷键录制弹窗扩大触发样式按钮点击区域",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
+    {
+      "version": "1.9.4",
+      "date": "2026-06-01",
+      "notes": "- 新增 Mac Action 模式：用语音执行窗口管理、提醒事项、滚动等 macOS 操作\n- LLM 设置增强：支持自定义 OpenAI 兼容服务、从 /v1/models 自动发现模型，并可按服务商控制思考模式\n- 历史记录新增本机 ASR 用量详情：按模型/引擎查看近 1 天、7 天、30 天累计时长\n- 支持耳机/媒体键作为录音快捷键\n- ElevenLabs 转写更干净，并自动限制 keyterm 避免请求失败\n- Local 版本稳定性提升：修复 SenseVoice + Qwen3 长时间使用内存增长、服务重启和 MLX 兼容问题",
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null,
+      "local_dmg_url": null,
+      "local_dmg_size": null,
+      "local_dmg_sha256": null
+    },
     {
       "version": "1.9.3",
       "date": "2026-04-26",
@@ -60,9 +137,9 @@
       "version": "1.5.1",
       "date": "2026-03-30",
       "notes": "- 修复片段替换链式叠加 bug（\"Cloud Code\" 被替换成 \"Claudee Code\"）\n- 快捷键 event tap 健康检查：自动检测和恢复静默失效的全局快捷键\n- 辅助功能权限重试改进：5 次失败后提示重启 App\n- 新增 type4me:// URL scheme，支持外部工具触发词表刷新\n- 签名优化：自动创建持久化自签名证书，避免重编译后辅助功能权限失效\n- 移除 quarantine flag，防止 Accessibility 权限静默失效",
-      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v1.5.1/Type4Me-v1.5.1-cloud.dmg",
-      "cloud_dmg_size": 24540374,
-      "cloud_dmg_sha256": "6eb436b248eb678d0009921ff4a729f8ddfaa248eb7dda3f31980a9158cb2cf7"
+      "cloud_dmg_url": null,
+      "cloud_dmg_size": null,
+      "cloud_dmg_sha256": null
     },
     {
       "version": "1.5.0",

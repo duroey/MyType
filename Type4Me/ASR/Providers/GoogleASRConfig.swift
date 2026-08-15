@@ -6,7 +6,7 @@ struct GoogleASRConfig: ASRProviderConfig, Sendable {
     static let displayName = "Google Cloud STT"
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "serviceAccountJSON", label: "Service Account JSON", placeholder: L("粘贴 JSON 内容或文件路径", "Paste JSON content or file path"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "serviceAccountJSON", label: L("Service Account JSON", "Service Account JSON"), placeholder: L("粘贴 JSON 内容或文件路径", "Paste JSON content or file path"), isSecure: true, isOptional: false, defaultValue: ""),
     ]}
 
     let serviceAccountJSON: String

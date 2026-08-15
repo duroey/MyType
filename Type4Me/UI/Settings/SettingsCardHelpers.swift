@@ -240,7 +240,12 @@ extension SettingsCardHelpers {
     }
 
     /// A "test connection" button that shows its own status inline.
-    func testButton(_ title: String, status: SettingsTestStatus, action: @escaping () -> Void) -> some View {
+    func testButton(
+        _ title: String,
+        status: SettingsTestStatus,
+        isEnabled: Bool = true,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 switch status {
@@ -259,10 +264,10 @@ extension SettingsCardHelpers {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 12))
                     Text(L("连接成功", "Connected"))
-                case .failed(let msg):
+                case .failed:
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 12))
-                    Text(msg)
+                    Text(L("重试", "Retry"))
                 }
             }
             .font(.system(size: 12, weight: .medium))
@@ -273,7 +278,21 @@ extension SettingsCardHelpers {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(status == .testing)
+        .disabled(status == .testing || !isEnabled)
+        .opacity(status == .testing || isEnabled ? 1 : 0.55)
+    }
+
+    @ViewBuilder
+    func testStatusMessage(status: SettingsTestStatus) -> some View {
+        if case .failed(let msg) = status {
+            Text(msg)
+                .font(.system(size: 10))
+                .foregroundStyle(TF.settingsAccentRed)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .padding(.top, 6)
+        }
     }
 
     func maskedSecret(_ value: String) -> String {

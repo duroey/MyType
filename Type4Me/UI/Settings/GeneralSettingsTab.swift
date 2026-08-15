@@ -17,25 +17,26 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @AppStorage("tf_startSound") private var startSound = StartSoundStyle.chime.rawValue
     @AppStorage("tf_launchAtLogin") private var launchAtLogin = true
     @AppStorage("tf_volumeReduction") private var volumeReduction = -1
-    @AppStorage("tf_visualStyle") private var visualStyle = "timeline"
+    @AppStorage(RecordingVisualStyle.storageKey) private var visualStyle = RecordingVisualStyle.defaultValue
     @AppStorage("tf_language") private var language = AppLanguage.systemDefault
     @AppStorage("tf_preserveClipboard") private var preserveClipboard = true
     @AppStorage("tf_showDockIcon") private var showDockIcon = true
     @AppStorage("tf_bypassProxy") private var bypassProxy = "off"
     @AppStorage("tf_stripTrailingPunctuation") private var stripTrailingPunctuation = "off"
+    @AppStorage("tf_preserveCJKLatinSpacing") private var preserveCJKLatinSpacing = true
     @AppStorage("tf_hoverTranscriptPreview") private var hoverTranscriptPreview = true
     @AppStorage("tf_micKeepAlive") private var micKeepAlive = false
     @AppStorage("tf_focusWakeupEnabled") private var focusWakeupEnabled = true
     @AppStorage(FocusAutoStopSilenceSetting.storageKey) private var focusAutoStopSilenceSeconds = FocusAutoStopSilenceSetting.defaultSeconds
     @AppStorage(FocusWakeupController.focusWakeupModeIdKey) private var focusWakeupModeId = ""
     @AppStorage("tf_agentLauncherTerminal") private var agentLauncherTerminal = "auto"
-    @AppStorage("tf_selectedMicrophoneUID") private var selectedMicrophoneUID = ""
-    @AppStorage("tf_lastUserSelectedMicrophoneUID") private var lastUserSelectedMicrophoneUID = ""
+    @AppStorage(AudioInputDevicePreferenceStore.modeKey) private var microphonePreferenceMode = AudioInputDevicePreferenceMode.systemDefault.rawValue
+    @AppStorage(AudioInputDevicePreferenceStore.priorityEntriesKey) private var microphonePriorityEntriesStorage = ""
     @AppStorage("tf_selectedSpeakerUID") private var selectedSpeakerUID = ""
 
     @State private var hasMic = false
     @State private var hasAccessibility = false
-    @State private var availableMicrophones: [(uid: String, name: String)] = []
+    @State private var availableMicrophones: [AudioInputDevice] = []
     @State private var availableSpeakers: [(uid: String, name: String)] = []
     @State private var isCalibratingNoise = false
     @State private var noiseCalibrationStatus = ""
@@ -43,6 +44,8 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @State private var launcherModes: [ProcessingMode] = ModeStorage().load()
     @State private var launcherHotkeyRecordingTarget: RecordingTarget?
     @State private var availableLauncherTerminals: [AgentLauncherTerminal] = []
+    @State private var showMicrophonePrioritySheet = false
+    @State private var draftMicrophonePriorityEntries: [AudioInputDevicePreferenceEntry] = []
 
     typealias TestStatus = SettingsTestStatus
 
@@ -80,7 +83,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             SettingsSectionHeader(
-                label: "GENERAL",
+                label: L("通用", "GENERAL"),
                 title: L("通用设置", "General Settings"),
                 description: L("偏好设置与系统权限。快捷键请在「处理模式」中配置。", "Preferences and permissions. Hotkeys are configured in Modes.")
             )
@@ -146,9 +149,11 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
 
                 SettingsDivider()
 
-                // Row 2: 去句末标点 / 悬停文字预览
+                // Row 2: 去句末标点 / 中英文空格 / 悬停文字预览
                 HStack(alignment: .top, spacing: 16) {
                     stripPunctuationRow
+                        .frame(maxWidth: .infinity)
+                    cjkLatinSpacingRow
                         .frame(maxWidth: .infinity)
                     hoverPreviewRow
                         .frame(maxWidth: .infinity)
@@ -292,13 +297,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         .onReceive(NotificationCenter.default.publisher(for: .modesDidChange)) { _ in
             reloadLauncherModes()
         }
-        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)) { _ in
-            refreshMicrophonesAfterReconnect()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)) { _ in
-            refreshMicrophones()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .audioInputDevicesDidChange)) { _ in
             refreshMicrophones()
         }
         .sheet(item: $launcherHotkeyRecordingTarget) { target in
@@ -307,11 +306,27 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                 checkConflict: { code, mods in
                     launcherHotkeyConflict(for: target.id, code: code, modifiers: mods)
                 },
+                checkPrefixConflict: { code, mods in
+                    launcherHotkeyPrefixConflict(for: target.id, code: code, modifiers: mods)
+                },
                 onConfirm: { code, mods, style in
                     updateLauncherHotkey(code: code, modifiers: mods, style: style)
                     launcherHotkeyRecordingTarget = nil
                 },
                 onCancel: { launcherHotkeyRecordingTarget = nil }
+            )
+        }
+        .sheet(isPresented: $showMicrophonePrioritySheet) {
+            MicrophonePrioritySheet(
+                devices: availableMicrophones,
+                initialEntries: draftMicrophonePriorityEntries,
+                onCancel: {
+                    showMicrophonePrioritySheet = false
+                },
+                onSave: { entries in
+                    saveMicrophonePriority(entries)
+                    showMicrophonePrioritySheet = false
+                }
             )
         }
     }
@@ -403,13 +418,9 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                 .font(.system(size: 10, weight: .semibold))
                 .tracking(0.8)
                 .foregroundStyle(TF.settingsTextTertiary)
-            settingsSegmentedPicker(
+            settingsDropdown(
                 selection: $visualStyle,
-                options: [
-                    ("classic", L("线条", "Lines")),
-                    ("dual", L("粒子云", "Blocks")),
-                    ("timeline", L("电平", "Minimal")),
-                ]
+                options: RecordingVisualStyle.allCases.map { ($0.rawValue, $0.displayName) }
             )
         }
         .padding(.vertical, 6)
@@ -478,20 +489,32 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         .padding(.vertical, 6)
     }
 
+    private var cjkLatinSpacingRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L("中英文空格", "CJK-Latin Spacing").uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.8)
+                .foregroundStyle(TF.settingsTextTertiary)
+            settingsDropdown(
+                selection: Binding(
+                    get: { preserveCJKLatinSpacing ? "on" : "off" },
+                    set: { preserveCJKLatinSpacing = $0 == "on" }
+                ),
+                options: [
+                    ("on", L("保留", "Keep")),
+                    ("off", L("去掉", "Strip")),
+                ]
+            )
+        }
+        .padding(.vertical, 6)
+    }
+
     private var hoverPreviewRow: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 4) {
-                Text(L("悬停文字预览", "Hover Text Preview").uppercased())
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.8)
-                    .foregroundStyle(TF.settingsTextTertiary)
-                Text("|")
-                    .font(.system(size: 10))
-                    .foregroundStyle(TF.settingsTextTertiary.opacity(0.5))
-                Text(L("鼠标悬停悬浮条时显示完整文本", "Show full text when hovering the bar"))
-                    .font(.system(size: 10))
-                    .foregroundStyle(TF.settingsTextTertiary)
-            }
+            Text(L("悬停文字预览", "Hover Text Preview").uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.8)
+                .foregroundStyle(TF.settingsTextTertiary)
             settingsDropdown(
                 selection: Binding(
                     get: { hoverTranscriptPreview ? "on" : "off" },
@@ -530,52 +553,182 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                 .buttonStyle(.plain)
                 .help(L("刷新麦克风列表", "Refresh microphone list"))
             }
-            settingsDropdown(
-                selection: Binding(
-                    get: { selectedMicrophoneUID },
-                    set: { updateUserSelectedMicrophone($0) }
-                ),
-                options: [("", L("系统默认", "System Default"))] + availableMicrophones.map { ($0.uid, $0.name) }
-            )
+            microphonePreferenceDropdown
         }
         .padding(.vertical, 6)
     }
 
     private func refreshMicrophones() {
-        availableMicrophones = AudioCaptureEngine.availableAudioDevices()
-        let resolved = MicrophoneSelectionPolicy.resolveAfterDeviceRefresh(
-            selectedUID: selectedMicrophoneUID,
-            lastUserSelectedUID: lastUserSelectedMicrophoneUID,
-            availableUIDs: availableMicrophones.map(\.uid)
-        )
-        selectedMicrophoneUID = resolved.selectedUID
-        lastUserSelectedMicrophoneUID = resolved.lastUserSelectedUID
+        let devices = AudioCaptureEngine.availableAudioInputDevices()
+        availableMicrophones = devices
+        AudioInputDeviceMonitor.shared.replaceCachedDevices(devices)
     }
 
-    /// Refreshes microphone state immediately and after system enumeration settles.
-    private func refreshMicrophonesAfterReconnect() {
-        refreshMicrophones()
-        DispatchQueue.main.asyncAfter(deadline: .now() + MicrophoneSelectionPolicy.reconnectRefreshDelaySeconds) {
-            refreshMicrophones()
-        }
-    }
+    private var microphonePreferenceDropdown: some View {
+        Menu {
+            Button {
+                setMicrophoneSystemDefault()
+            } label: {
+                Label(
+                    L("跟随系统", "Follow System"),
+                    systemImage: microphonePreference == .systemDefault ? "checkmark" : "gearshape"
+                )
+            }
 
-    /// Records a user-selected microphone and updates persisted recovery state.
-    ///
-    /// Args:
-    ///   uid: UID selected from the settings dropdown. Empty means system default.
-    private func updateUserSelectedMicrophone(_ uid: String) {
-        let resolved = MicrophoneSelectionPolicy.userSelected(uid)
-        selectedMicrophoneUID = resolved.selectedUID
-        lastUserSelectedMicrophoneUID = resolved.lastUserSelectedUID
-        if resolved.lastUserSelectedUID.isEmpty {
-            RememberedMicrophoneProfileStore.clear()
-        } else {
-            RememberedMicrophoneProfileStore.replace(
-                deviceUID: resolved.lastUserSelectedUID,
-                focusWakeupEnabled: focusWakeupEnabled
+            if microphonePriorityEntries.isEmpty {
+                Button {
+                    openMicrophonePrioritySheet()
+                } label: {
+                    Label(L("指定优先级", "Set Priority"), systemImage: "list.number")
+                }
+            } else {
+                Divider()
+                Button {
+                    activateMicrophonePriority()
+                } label: {
+                    Label(
+                        microphonePriorityMenuLabel,
+                        systemImage: microphonePreference == .priority ? "checkmark" : "list.number"
+                    )
+                }
+                Button {
+                    openMicrophonePrioritySheet()
+                } label: {
+                    Label(L("修改优先级", "Edit Priority"), systemImage: "slider.horizontal.3")
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: microphonePreference == .priority ? "list.number" : "gearshape")
+                    .font(.system(size: 12))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                Text(microphonePreferenceLabel)
+                    .font(.system(size: 13))
+                    .foregroundStyle(TF.settingsText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(TF.settingsTextTertiary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(TF.settingsCardAlt)
             )
         }
+        .buttonStyle(.plain)
+    }
+
+    private var microphonePreference: AudioInputDevicePreferenceMode {
+        AudioInputDevicePreferenceMode(rawValue: microphonePreferenceMode) ?? .systemDefault
+    }
+
+    private var microphonePriorityEntries: [AudioInputDevicePreferenceEntry] {
+        AudioInputDevicePreferenceStore.priorityEntries(from: microphonePriorityEntriesStorage)
+    }
+
+    private var microphonePreferenceLabel: String {
+        guard microphonePreference == .priority, !microphonePriorityEntries.isEmpty else {
+            return L("跟随系统", "Follow System")
+        }
+        return L("当前优先级：\(microphonePrioritySummary)",
+                 "Priority: \(microphonePrioritySummary)")
+    }
+
+    private var microphonePriorityMenuLabel: String {
+        L("使用当前优先级", "Use Current Priority")
+    }
+
+    private var microphonePrioritySummary: String {
+        let names = microphonePriorityEntries.map { displayName(for: $0) }
+        let visibleNames = Array(names.prefix(2))
+        let hiddenCount = max(0, names.count - visibleNames.count)
+        let hiddenSummary = hiddenCount > 0 ? [L("另 \(hiddenCount) 个", "\(hiddenCount) more")] : []
+        return (visibleNames + hiddenSummary + [L("跟随系统", "System")]).joined(separator: L("、", ", "))
+    }
+
+    private func openMicrophonePrioritySheet() {
+        refreshMicrophones()
+        let currentEntries = refreshedPriorityEntries(microphonePriorityEntries)
+        draftMicrophonePriorityEntries = currentEntries.isEmpty
+            ? availableMicrophones.map { AudioInputDevicePreferenceEntry(uid: $0.uid, name: $0.name) }
+            : currentEntries
+        showMicrophonePrioritySheet = true
+    }
+
+    private func refreshedPriorityEntries(
+        _ entries: [AudioInputDevicePreferenceEntry]
+    ) -> [AudioInputDevicePreferenceEntry] {
+        entries.map { entry in
+            guard let device = availableMicrophones.first(where: { $0.uid == entry.uid }) else {
+                return entry
+            }
+            return AudioInputDevicePreferenceEntry(uid: entry.uid, name: device.name)
+        }
+    }
+
+    private func displayName(for entry: AudioInputDevicePreferenceEntry) -> String {
+        availableMicrophones.first(where: { $0.uid == entry.uid })?.name ?? entry.name
+    }
+
+    private func saveMicrophonePriority(_ entries: [AudioInputDevicePreferenceEntry]) {
+        let storage = AudioInputDevicePreferenceStore.storageValue(for: entries)
+        guard !storage.isEmpty else {
+            setMicrophoneSystemDefault()
+            return
+        }
+        AudioInputDevicePreferenceStore.savePriorityEntries(entries)
+        microphonePreferenceMode = AudioInputDevicePreferenceMode.priority.rawValue
+        microphonePriorityEntriesStorage = storage
+        syncRememberedMicrophoneProfile(with: entries)
+    }
+
+    private func setMicrophoneSystemDefault() {
+        AudioInputDevicePreferenceStore.resetToSystemDefault(clearPriority: true)
+        microphonePreferenceMode = AudioInputDevicePreferenceMode.systemDefault.rawValue
+        microphonePriorityEntriesStorage = ""
+        RememberedMicrophoneProfileStore.clear()
+        NotificationCenter.default.post(name: .rememberedMicrophoneProfileDidChange, object: nil)
+    }
+
+    /// Re-enables the saved microphone priority list and restarts dependent capture.
+    ///
+    /// Returns:
+    ///   Nothing. Updates persisted preference state and broadcasts the change.
+    private func activateMicrophonePriority() {
+        let entries = microphonePriorityEntries
+        guard !entries.isEmpty else { return }
+        AudioInputDevicePreferenceStore.savePriorityEntries(entries)
+        microphonePreferenceMode = AudioInputDevicePreferenceMode.priority.rawValue
+        syncRememberedMicrophoneProfile(with: entries)
+    }
+
+    /// Synchronizes MyType's Auto Focus profile with the priority-list selection.
+    ///
+    /// Args:
+    ///   entries: Ordered microphone preferences saved by the user.
+    ///
+    /// Returns:
+    ///   Nothing. Stores the currently resolvable preference and broadcasts the change.
+    private func syncRememberedMicrophoneProfile(
+        with entries: [AudioInputDevicePreferenceEntry]
+    ) {
+        let preferredUID = AudioInputDevicePreferenceStore.resolvedDevice(
+            devices: availableMicrophones,
+            priorityEntries: entries
+        )?.uid ?? entries.first?.uid
+        guard let preferredUID else {
+            RememberedMicrophoneProfileStore.clear()
+            NotificationCenter.default.post(name: .rememberedMicrophoneProfileDidChange, object: nil)
+            return
+        }
+        RememberedMicrophoneProfileStore.replace(
+            deviceUID: preferredUID,
+            focusWakeupEnabled: focusWakeupEnabled
+        )
         NotificationCenter.default.post(name: .rememberedMicrophoneProfileDidChange, object: nil)
     }
 
@@ -1042,11 +1195,44 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     ///   The conflicting mode, or `nil` when the hotkey is available.
     private func launcherHotkeyConflict(for targetId: UUID, code: Int?, modifiers: UInt64?) -> ProcessingMode? {
         guard let code else { return nil }
-        let normalizedModifiers = modifiers ?? 0
         return launcherModes.first { mode in
-            mode.id != targetId &&
-            mode.hotkeyCode == code &&
-            (mode.hotkeyModifiers ?? 0) == normalizedModifiers
+            guard mode.id != targetId, let otherCode = mode.hotkeyCode else {
+                return false
+            }
+            return ModeBinding.hotkeysAreEquivalent(
+                keyCode: code,
+                modifiers: modifiers,
+                otherKeyCode: otherCode,
+                otherModifiers: mode.hotkeyModifiers
+            )
+        }
+    }
+
+    /// Finds a launcher hotkey that has a modifier-prefix conflict.
+    ///
+    /// Args:
+    ///   targetId: Mode being edited.
+    ///   code: Captured key code.
+    ///   modifiers: Captured modifier mask.
+    ///
+    /// Returns:
+    ///   The conflicting mode, or `nil` when no prefix conflict exists.
+    private func launcherHotkeyPrefixConflict(
+        for targetId: UUID,
+        code: Int?,
+        modifiers: UInt64?
+    ) -> ProcessingMode? {
+        guard let code else { return nil }
+        return launcherModes.first { mode in
+            guard mode.id != targetId, let otherCode = mode.hotkeyCode else {
+                return false
+            }
+            return ModeBinding.hasModifierPrefixConflict(
+                keyCode: code,
+                modifiers: modifiers,
+                otherKeyCode: otherCode,
+                otherModifiers: mode.hotkeyModifiers
+            )
         }
     }
 
@@ -1264,6 +1450,229 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             setLoginItem(enabled: true)
         } else {
             launchAtLogin = status == .enabled
+        }
+    }
+}
+
+private struct MicrophonePrioritySheet: View {
+    let devices: [AudioInputDevice]
+    let initialEntries: [AudioInputDevicePreferenceEntry]
+    let onCancel: () -> Void
+    let onSave: ([AudioInputDevicePreferenceEntry]) -> Void
+
+    @State private var orderedEntries: [AudioInputDevicePreferenceEntry]
+
+    init(
+        devices: [AudioInputDevice],
+        initialEntries: [AudioInputDevicePreferenceEntry],
+        onCancel: @escaping () -> Void,
+        onSave: @escaping ([AudioInputDevicePreferenceEntry]) -> Void
+    ) {
+        self.devices = devices
+        self.initialEntries = initialEntries
+        self.onCancel = onCancel
+        self.onSave = onSave
+        _orderedEntries = State(initialValue: initialEntries)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Text(L("麦克风优先级", "Microphone Priority"))
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(TF.settingsText)
+                    Spacer()
+                    Label(L("末尾跟随系统", "System fallback"), systemImage: "gearshape")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(TF.settingsCardAlt.opacity(0.75)))
+                }
+
+                Text(L("点一行加入或移除，箭头调整顺序。",
+                       "Click a row to add or remove it; use arrows to reorder."))
+                    .font(.system(size: 11))
+                    .foregroundStyle(TF.settingsTextTertiary)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 5) {
+                    if allEntries.isEmpty {
+                        Text(L("当前没有可用输入设备。", "No input devices are currently available."))
+                            .font(.system(size: 12))
+                            .foregroundStyle(TF.settingsTextTertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                    } else {
+                        ForEach(allEntries) { entry in
+                            deviceRow(entry)
+                        }
+                    }
+                }
+                .padding(6)
+            }
+            .frame(height: listHeight)
+            .background(RoundedRectangle(cornerRadius: 10).fill(TF.settingsCardAlt.opacity(0.35)))
+
+            HStack(spacing: 10) {
+                Text(selectionFooterText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .lineLimit(1)
+                Spacer()
+                Button(L("取消", "Cancel"), action: onCancel)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TF.settingsText)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsCardAlt))
+
+                Button {
+                    onSave(orderedEntries)
+                } label: {
+                    Text(L("保存", "Save"))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 7)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(orderedEntries.isEmpty ? TF.settingsTextTertiary : TF.settingsAccentAmber)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(orderedEntries.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 460)
+        .background(TF.settingsBg)
+    }
+
+    private var allEntries: [AudioInputDevicePreferenceEntry] {
+        var result = orderedEntries
+        for device in devices where !result.contains(where: { $0.uid == device.uid }) {
+            result.append(AudioInputDevicePreferenceEntry(uid: device.uid, name: device.name))
+        }
+        return result
+    }
+
+    private var listHeight: CGFloat {
+        guard !allEntries.isEmpty else {
+            return 52
+        }
+        let visibleRows = min(allEntries.count, 5)
+        let rowHeight: CGFloat = 40
+        let rowSpacing: CGFloat = 5
+        let verticalPadding: CGFloat = 12
+        return CGFloat(visibleRows) * rowHeight
+            + CGFloat(max(visibleRows - 1, 0)) * rowSpacing
+            + verticalPadding
+    }
+
+    private var selectionFooterText: String {
+        L("已选 \(orderedEntries.count) 个，最后自动跟随系统",
+          "\(orderedEntries.count) selected, then system fallback")
+    }
+
+    private func deviceRow(_ entry: AudioInputDevicePreferenceEntry) -> some View {
+        let selectedIndex = orderedEntries.firstIndex(where: { $0.uid == entry.uid })
+        let device = devices.first { $0.uid == entry.uid }
+        return HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                if let selectedIndex {
+                    Text("\(selectedIndex + 1)")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(TF.settingsNavActive))
+                } else {
+                    Image(systemName: "circle")
+                        .font(.system(size: 13))
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .frame(width: 22, height: 22)
+                }
+
+                Text(device?.name ?? entry.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TF.settingsText)
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                Text(device.map { $0.category.displayName } ?? L("未连接", "Offline"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(TF.settingsBg.opacity(0.72)))
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                toggleEntry(entry)
+            }
+
+            if let selectedIndex {
+                HStack(spacing: 2) {
+                    iconButton("chevron.up", disabled: selectedIndex == 0) {
+                        moveEntry(from: selectedIndex, by: -1)
+                    }
+                    iconButton("chevron.down", disabled: selectedIndex == orderedEntries.count - 1) {
+                        moveEntry(from: selectedIndex, by: 1)
+                    }
+                    iconButton("minus.circle", disabled: false) {
+                        orderedEntries.remove(at: selectedIndex)
+                    }
+                }
+            } else {
+                iconButton("plus.circle", disabled: false) {
+                    toggleEntry(entry)
+                }
+            }
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 6)
+        .frame(height: 40)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(selectedIndex == nil ? TF.settingsCardAlt.opacity(0.72) : TF.settingsCardAlt)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(selectedIndex == nil ? Color.clear : TF.settingsNavActive.opacity(0.22), lineWidth: 1)
+        )
+    }
+
+    private func iconButton(_ systemName: String, disabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(disabled ? TF.settingsTextTertiary.opacity(0.4) : TF.settingsTextTertiary)
+                .frame(width: 32, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+    }
+
+    private func moveEntry(from index: Int, by offset: Int) {
+        let newIndex = index + offset
+        guard orderedEntries.indices.contains(index), orderedEntries.indices.contains(newIndex) else {
+            return
+        }
+        let entry = orderedEntries.remove(at: index)
+        orderedEntries.insert(entry, at: newIndex)
+    }
+
+    private func toggleEntry(_ entry: AudioInputDevicePreferenceEntry) {
+        if let index = orderedEntries.firstIndex(where: { $0.uid == entry.uid }) {
+            orderedEntries.remove(at: index)
+        } else {
+            orderedEntries.append(entry)
         }
     }
 }

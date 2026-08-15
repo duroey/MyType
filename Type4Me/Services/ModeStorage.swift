@@ -65,6 +65,19 @@ struct ModeStorage {
                 }
                 return d
             }
+            if mode.id == ProcessingMode.selectionAskId {
+                var d = ProcessingMode.selectionAsk
+                d.hotkeyCode = mode.hotkeyCode
+                d.hotkeyModifiers = mode.hotkeyModifiers
+                d.hotkeyStyle = mode.hotkeyStyle
+                if mode.prompt != ProcessingMode.selectionAsk.prompt,
+                   !selectionAskPromptIsLegacy(mode.prompt) {
+                    d.name = mode.name
+                    d.processingLabel = mode.processingLabel
+                    d.prompt = mode.prompt
+                }
+                return d
+            }
             if mode.id == ProcessingMode.translate.id {
                 return migrateSeededDefaultPrompt(
                     mode,
@@ -103,9 +116,17 @@ struct ModeStorage {
         }
 
         // Ensure required built-in modes always exist.
+        // direct + formalWriting (the original two) are inserted at their canonical positions
+        // for existing users who already have them; any newly-added builtin is appended at the
+        // end so it doesn't shove itself between the user's customized modes.
         let resultIds = Set(result.map { $0.id })
+        let originalBuiltinIds: Set<UUID> = [
+            ProcessingMode.directId,
+            ProcessingMode.formalWritingId,
+        ]
         for builtin in ProcessingMode.builtins where !resultIds.contains(builtin.id) {
-            if let idx = ProcessingMode.builtins.firstIndex(where: { $0.id == builtin.id }) {
+            if originalBuiltinIds.contains(builtin.id),
+               let idx = ProcessingMode.builtins.firstIndex(where: { $0.id == builtin.id }) {
                 let insertAt = min(idx, result.count)
                 result.insert(builtin, at: insertAt)
             } else {
@@ -113,17 +134,24 @@ struct ModeStorage {
             }
         }
 
-        // One-time seed of agentMode for existing installs
-        // (custom defaults are not auto-injected like builtins, so we seed once then respect the user's edits)
-        let agentSeedKey = "tf_agentModeSeeded"
-        if !UserDefaults.standard.bool(forKey: agentSeedKey) {
-            if !result.contains(where: { $0.id == ProcessingMode.agentModeId }) {
-                result.append(ProcessingMode.agentMode)
-                // Persist immediately so the seeded mode survives even if the
-                // user quits before triggering any save path.
-                try? save(result)
+        // One-time seeds for deletable default modes on existing installs.
+        // Once seeded, deleting one is respected and will not re-inject it.
+        let seededDefaults: [(mode: ProcessingMode, key: String)] = [
+            (.translateToChinese, "tf_translateToChineseModeSeeded"),
+            (.agentMode, "tf_agentModeSeeded"),
+        ]
+        var seededAnyMode = false
+        for seed in seededDefaults where !UserDefaults.standard.bool(forKey: seed.key) {
+            if !result.contains(where: { $0.id == seed.mode.id }) {
+                result.append(seed.mode)
+                seededAnyMode = true
             }
-            UserDefaults.standard.set(true, forKey: agentSeedKey)
+            UserDefaults.standard.set(true, forKey: seed.key)
+        }
+        if seededAnyMode {
+            // Persist immediately so seeded modes survive even if the user
+            // quits before triggering another save path.
+            try? save(result)
         }
 
         // One-time seed of agentRouterMode for existing installs.
@@ -167,5 +195,13 @@ struct ModeStorage {
         migrated.prompt = fallbackPrompt
         migrated.isBuiltin = false
         return migrated
+    }
+
+    private func selectionAskPromptIsLegacy(_ prompt: String) -> Bool {
+        prompt.contains("固定询问：“这句话是什么意思？”")
+            || prompt.contains("先直接解释选中文本的核心含义")
+            || prompt.contains("请用中文回答，允许使用 Markdown")
+            || (!prompt.contains("# 用户语音问题") && prompt.contains("# 选中文本"))
+            || (prompt.contains("你是语音问答助手") && !prompt.contains("{conversation}"))
     }
 }

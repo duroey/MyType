@@ -128,7 +128,7 @@ enum NoiseFloorCalibrator {
         samples.withLock { $0.removeAll(keepingCapacity: true) }
         FocusWakeupLearningStore.resetForNoiseCalibration()
         let engine = AudioCaptureEngine()
-        engine.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
+        engine.selectedDeviceUID = AudioInputDevicePreferenceStore.resolvedCachedDeviceUID()
         engine.onAudioFrame = { frame in
             let rms = rms16(frame)
             samples.withLock { $0.append(rms) }

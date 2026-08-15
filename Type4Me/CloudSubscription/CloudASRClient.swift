@@ -9,9 +9,9 @@ enum CloudASRError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .unsupportedProvider: return "CloudASRClient requires CloudASRConfig"
-        case .notAuthenticated: return "Please log in to mytype Cloud"
-        case .invalidRegion: return "Could not determine region"
+        case .unsupportedProvider: return L("MyType Cloud 识别配置无效", "CloudASRClient requires CloudASRConfig")
+        case .notAuthenticated: return L("请先登录 MyType Cloud", "Please log in to MyType Cloud")
+        case .invalidRegion: return L("无法确定服务区域", "Could not determine region")
         }
     }
 }
@@ -63,7 +63,7 @@ actor CloudASRClient: SpeechRecognizer {
         if region == .cn {
             // China: speak Volcengine protocol through our proxy
             let volcConfig = VolcanoASRConfig(credentials: [
-                "appKey": "cloud", "accessKey": "cloud", "resourceId": VolcanoASRConfig.resourceIdSeedASR
+                "apiKey": "cloud", "resourceId": VolcanoASRConfig.resourceIdSeedASR
             ])!
             let client = VolcASRClient()
             try await client.connect(config: volcConfig, options: proxyOptions)

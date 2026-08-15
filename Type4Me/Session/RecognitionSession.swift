@@ -21,6 +21,13 @@ actor RecognitionSession {
         case finishing
         case injecting
         case postProcessing  // Phase 3
+        case recovering
+    }
+
+    enum RecoveryHotkeyAction: Equatable, Sendable {
+        case notRecovering
+        case prompted
+        case interrupted
     }
 
     private(set) var state: SessionState = .idle
@@ -68,22 +75,73 @@ actor RecognitionSession {
 
     /// Return the appropriate LLM client for the currently selected provider.
     private func currentLLMClient() -> any LLMClient {
-        #if HAS_CLOUD_SUBSCRIPTION
-        if isCloudMode { return CloudLLMClient() }
-        #endif
-        let provider = KeychainService.selectedLLMProvider
-        if provider == .claude {
-            return ClaudeChatClient()
-        }
-        return DoubaoChatClient(provider: provider)
+        LLMRuntime.currentClient(isCloudMode: isCloudModeForLLM)
     }
 
     /// Load LLM credentials from KeychainService.
     private func loadEffectiveLLMConfig() -> LLMConfig? {
+        LLMRuntime.currentConfig(isCloudMode: isCloudModeForLLM)
+    }
+
+    private var isCloudModeForLLM: Bool {
         #if HAS_CLOUD_SUBSCRIPTION
-        if isCloudMode { return LLMConfig(apiKey: "", model: "cloud") }
+        return isCloudMode
+        #else
+        return false
         #endif
-        return KeychainService.loadLLMConfig()
+    }
+
+    private func currentASRModelLabel(for provider: ASRProvider) -> String? {
+        let providerName = provider.displayName
+
+        if provider == .sherpa {
+            return "\(providerName) · \(ModelManager.selectedStreamingModel.displayName)"
+        }
+
+        guard let credentials = KeychainService.loadASRConfig(for: provider)?.toCredentials() else {
+            return providerName
+        }
+
+        let modelKeys = ["model", "resourceId", "devPid", "lmId"]
+        let model = modelKeys
+            .compactMap { credentials[$0]?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+
+        guard let model else { return providerName }
+        return "\(providerName) · \(model)"
+    }
+
+    private static func volcanoConfigFromEnvironment(
+        _ environment: [String: String]
+    ) -> VolcanoASRConfig? {
+        var credentials = [
+            "resourceId": environment["VOLC_RESOURCE_ID"]
+                ?? VolcanoASRConfig.resourceIdSeedASR,
+        ]
+
+        if let apiKey = nonEmptyEnvironmentValue("VOLC_API_KEY", in: environment) {
+            credentials["authMode"] = VolcanoASRConfig.authModeAPIKey
+            credentials["apiKey"] = apiKey
+        } else if let appKey = nonEmptyEnvironmentValue("VOLC_APP_KEY", in: environment),
+                  let accessKey = nonEmptyEnvironmentValue("VOLC_ACCESS_KEY", in: environment) {
+            credentials["authMode"] = VolcanoASRConfig.authModeLegacy
+            credentials["appKey"] = appKey
+            credentials["accessKey"] = accessKey
+        } else {
+            return nil
+        }
+
+        return VolcanoASRConfig(credentials: credentials)
+    }
+
+    private static func nonEmptyEnvironmentValue(
+        _ key: String,
+        in environment: [String: String]
+    ) -> String? {
+        guard let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else { return nil }
+        return value
     }
 
     /// Pre-initialize audio subsystem so the first recording starts instantly.
@@ -120,6 +178,8 @@ actor RecognitionSession {
         switch provider {
         case .volcano:
             return "https://openspeech.bytedance.com"
+        case .stepfunBatch:
+            return "https://api.stepfun.com"
         case .soniox:
             return "https://stt-rt.soniox.com"
         case .deepgram:
@@ -182,6 +242,10 @@ actor RecognitionSession {
     private var currentTranscript: RecognitionTranscript = .empty
     private var eventConsumptionTask: Task<Void, Never>?
     private var maxDurationTask: Task<Void, Never>?
+    private var asrCleanupTask: Task<Void, Never>?
+    private var asrCleanupGeneration: Int?
+    private var finalTranscriptTimeoutTask: Task<Void, Never>?
+    private var firstStreamingTextTimeoutTask: Task<Void, Never>?
     private var hasEmittedReadyForCurrentSession = false
     private var audioChunkContinuation: AsyncStream<Data>.Continuation?
     private var audioChunkSenderTask: Task<Void, Never>?
@@ -190,6 +254,15 @@ actor RecognitionSession {
     private var usesExternalAudioInput = false
     private var externalFrameBuffer: ExternalAudioFrameBuffer?
     private var externalPendingAudioBuffer: AudioChunkBuffer?
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryInterruptPromptShown = false
+    private var recoveryRecordId: String?
+    private var recoveryCreatedAt: Date?
+    private var recoveryPartialText = ""
+    private var recoveryDuration: Double = 0
+    private var recoveryModeName: String?
+    private var recoveryProvider: ASRProvider = .volcano
+    private var recoveryASRModel: String?
 
     /// Flipped to true when mic level exceeds threshold during recording.
     /// When false at stop time, we skip the full ASR teardown (no speech = nothing to finalize).
@@ -215,8 +288,10 @@ actor RecognitionSession {
     private var speculativeLLMTask: Task<String?, Never>?
     private var speculativeLLMText: String = ""
     private var speculativeDebounceTask: Task<Void, Never>?
+    private var speculativeThrottle = SpeculativeLLMThrottle()
     /// Stores the last LLM error from the early/fresh LLM task, consumed once by stopRecording().
     private var pendingLLMError: Error?
+    private var pendingSelectionAskConversationContext = ""
     /// When true, skip text injection (paste) but still save to clipboard & history.
     private var injectionAborted = false
     /// Continuation resumed when a final (isFinal) transcript arrives during stop.
@@ -244,9 +319,47 @@ actor RecognitionSession {
             await startRecording()
         case .recording:
             await stopRecording()
+        case .recovering:
+            _ = await handleRecoveryHotkeyPress()
         default:
             logger.warning("toggleRecording ignored in state: \(String(describing: self.state))")
         }
+    }
+
+    func handleRecoveryHotkeyPress() async -> RecoveryHotkeyAction {
+        guard state == .recovering else { return .notRecovering }
+
+        if !recoveryInterruptPromptShown {
+            recoveryInterruptPromptShown = true
+            onASREvent?(.recoveryPrompt(
+                text: recoveryPartialText,
+                message: L(
+                    "正在恢复上一次识别。继续按下将打断当前恢复并重新开始录音。",
+                    "Recovering the previous dictation. Press again to interrupt recovery and start a new recording."
+                )
+            ))
+            return .prompted
+        }
+
+        await interruptRecoveryForRestart()
+        return .interrupted
+    }
+
+    private func interruptRecoveryForRestart() async {
+        DebugFileLogger.log("recovery interrupted by hotkey")
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        if !recoveryPartialText.isEmpty {
+            await saveRecoveryHistory(status: "recovery_interrupted", finalText: recoveryPartialText)
+        }
+        onASREvent?(.recoveryInterrupted(
+            text: recoveryPartialText,
+            message: L("已停止恢复，开始新的录音", "Recovery stopped. Starting a new recording.")
+        ))
+        clearRecoveryState()
+        state = .idle
+        currentTranscript = .empty
+        warmUpASRConnection()
     }
 
     // MARK: - Start
@@ -266,7 +379,7 @@ actor RecognitionSession {
         autoStopThresholdOverride: Float? = nil,
         externalAudioInput: Bool = false
     ) async {
-        if state == .finishing || state == .injecting || state == .postProcessing {
+        if state == .finishing || state == .injecting || state == .postProcessing || state == .recovering {
             NSLog("[Session] startRecording: blocked, current session still processing (state=%@)", String(describing: state))
             DebugFileLogger.log("startRecording blocked: still processing state=\(state)")
             return
@@ -299,6 +412,9 @@ actor RecognitionSession {
         #endif
 
         let effectiveMode = ASRProviderRegistry.resolvedMode(for: mode, provider: provider)
+        if effectiveMode.executionKind != .selectionAsk {
+            pendingSelectionAskConversationContext = ""
+        }
         sessionGeneration &+= 1
         let myGeneration = sessionGeneration
 
@@ -306,6 +422,7 @@ actor RecognitionSession {
         self.recordingStartTime = nil
         hasEmittedReadyForCurrentSession = false
         injectionAborted = false
+        speculativeThrottle.reset()
         pendingLLMError = nil
         lastStreamingError = nil
         self.autoStopOnSilence = autoStopOnSilence
@@ -352,15 +469,15 @@ actor RecognitionSession {
                     config = savedConfig
                     NSLog("[Session] Loaded %@ credentials from secure store", provider.rawValue)
                 } else if provider == .volcano,
-                          let appKey = ProcessInfo.processInfo.environment["VOLC_APP_KEY"],
-                          let accessKey = ProcessInfo.processInfo.environment["VOLC_ACCESS_KEY"] {
+                          let volcConfig = Self.volcanoConfigFromEnvironment(
+                              ProcessInfo.processInfo.environment
+                          ) {
                     // Env var fallback (volcano only, for dev convenience)
-                    let resourceId = ProcessInfo.processInfo.environment["VOLC_RESOURCE_ID"] ?? VolcanoASRConfig.resourceIdSeedASR
-                    let volcConfig = VolcanoASRConfig(credentials: [
-                        "appKey": appKey, "accessKey": accessKey, "resourceId": resourceId,
-                    ])!
                     do {
-                        try KeychainService.saveASRCredentials(appKey: appKey, accessKey: accessKey, resourceId: resourceId)
+                        try KeychainService.saveASRCredentials(
+                            for: .volcano,
+                            values: volcConfig.toCredentials()
+                        )
                         NSLog("[Session] Loaded credentials from env vars and persisted to secure store")
                     } catch {
                         NSLog("[Session] WARNING: env var credentials loaded but failed to persist: %@", String(describing: error))
@@ -427,7 +544,6 @@ actor RecognitionSession {
         // Load hotwords
         let hotwords = HotwordStorage.loadEffective()
         let biasSettings = ASRBiasSettingsStorage.load()
-        let needsLLM = !effectiveMode.prompt.isEmpty
         let requestOptions = ASRRequestOptions(
             enablePunc: true,
             hotwords: hotwords,
@@ -500,7 +616,14 @@ actor RecognitionSession {
             }
 
             do {
-                audioEngine.selectedDeviceUID = UserDefaults.standard.string(forKey: "tf_selectedMicrophoneUID")
+                let selectedDeviceUID = AudioInputDevicePreferenceStore.resolvedCachedDeviceUID()
+                let preferenceMode = AudioInputDevicePreferenceStore.mode().rawValue
+                let priorityUIDs = AudioInputDevicePreferenceStore.priorityEntries().map(\.uid).joined(separator: ",")
+                audioEngine.selectedDeviceUID = selectedDeviceUID
+                DebugFileLogger.log(
+                    "audio input selected uid=\(selectedDeviceUID ?? "system-default") " +
+                    "mode=\(preferenceMode) priority=[\(priorityUIDs)]"
+                )
                 try audioEngine.start()
                 NSLog("[Session] Audio engine started OK")
                 DebugFileLogger.log("audio engine started OK")
@@ -612,6 +735,9 @@ actor RecognitionSession {
 
         // Safety: auto-stop after maxRecordingDuration to prevent unbounded memory use
         maxDurationTask?.cancel()
+        asrCleanupTask?.cancel()
+        asrCleanupTask = nil
+        asrCleanupGeneration = nil
         maxDurationTask = Task { [weak self, maxRecordingDuration] in
             try? await Task.sleep(for: .seconds(maxRecordingDuration))
             guard let self, !Task.isCancelled else { return }
@@ -622,12 +748,23 @@ actor RecognitionSession {
         }
     }
 
+    func setSelectionAskConversationContext(_ context: String) {
+        pendingSelectionAskConversationContext = context
+    }
+
     /// Auto-stop triggered by max recording duration timer.
     private func autoStopIfRecording() async {
         guard state == .recording else { return }
         DebugFileLogger.log("max recording duration reached (\(maxRecordingDuration)s), auto-stopping")
         stoppedByMaxDuration = true
         await stopRecording()
+    }
+
+    private func clearASRCleanupTask(generation: Int) {
+        if asrCleanupGeneration == generation {
+            asrCleanupTask = nil
+            asrCleanupGeneration = nil
+        }
     }
 
     /// Whether the current session was auto-stopped by max duration limit.
@@ -705,6 +842,172 @@ actor RecognitionSession {
     func abortInjection() {
         injectionAborted = true
         DebugFileLogger.log("abortInjection: injection will be skipped")
+    }
+
+    /// Parse a Mac Action LLM reply for a `<tool_call>{...}</tool_call>`, dispatch
+    /// the action via `ActionRegistry`, and return both the user-facing message
+    /// and a status. The floating bar uses the status to pick an icon/color
+    /// (✓ green / ✗ red / ? amber).
+    private func dispatchMacAction(llmReply: String) async -> (message: String, status: MacActionResultStatus) {
+        guard let toolCall = ToolCallParser.parse(llmReply) else {
+            DebugFileLogger.log("macAction: no tool_call in LLM reply: \(llmReply.prefix(120))")
+            return (L("未匹配到操作", "No matching action"), .unsure)
+        }
+        DebugFileLogger.log("macAction: dispatching \(toolCall.name) args=\(toolCall.arguments)")
+        guard let result = await ActionRegistry.dispatch(name: toolCall.name, args: toolCall.arguments) else {
+            DebugFileLogger.log("macAction: unknown action name \(toolCall.name)")
+            return (L("未知操作：\(toolCall.name)", "Unknown action: \(toolCall.name)"), .failure)
+        }
+        if result.success {
+            DebugFileLogger.log("macAction: success \(toolCall.name): \(result.displayMessage)")
+            return (result.displayMessage, .success)
+        } else {
+            DebugFileLogger.log("macAction: failed \(toolCall.name): \(result.errorMessage ?? "")")
+            return (result.errorMessage ?? L("操作失败", "Action failed"), .failure)
+        }
+    }
+
+    /// Persist history, emit floating-bar event + `.completed`, and reset
+    /// session state — the post-LLM finishing path used when Mac Action mode
+    /// dispatched (or attempted to dispatch) an action. This deliberately skips
+    /// the text-injection block that the normal post-LLM path runs.
+    private func completeMacAction(
+        message: String,
+        status: MacActionResultStatus,
+        rawText: String,
+        recordingStartTime: Date?,
+        activeProvider: ASRProvider,
+        myGeneration: Int
+    ) async {
+        let recordId = UUID().uuidString
+        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let historyStatus: String = {
+            switch status {
+            case .success: return "action_success"
+            case .failure: return "action_failed"
+            case .unsure:  return "action_unmatched"
+            }
+        }()
+        await historyStore.insert(HistoryRecord(
+            id: recordId,
+            createdAt: Date(),
+            durationSeconds: duration,
+            rawText: rawText,
+            processingMode: currentMode.name,
+            processedText: message,
+            finalText: message,
+            status: historyStatus,
+            characterCount: message.count,
+            asrProvider: activeProvider.displayName,
+            asrModel: currentASRModelLabel(for: activeProvider)
+        ))
+
+        onASREvent?(.macActionResult(message: message, status: status))
+        onASREvent?(.completed)
+
+        if sessionGeneration == myGeneration, state != .idle {
+            state = .idle
+            hasEmittedReadyForCurrentSession = false
+            currentTranscript = .empty
+            warmUpASRConnection()
+        }
+        resetSpeculativeLLM()
+        SystemVolumeManager.restore()
+    }
+
+    private func completeSelectionAsk(
+        questionText: String,
+        recordingStartTime: Date?,
+        activeProvider: ASRProvider,
+        myGeneration: Int
+    ) async {
+        let question = questionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextSource = SelectionAskPromptBuilder.contextSource(from: promptContext)
+        let contextText = SelectionAskPromptBuilder.contextText(from: promptContext)
+        let conversationContext = pendingSelectionAskConversationContext
+        pendingSelectionAskConversationContext = ""
+
+        guard !question.isEmpty else {
+            onASREvent?(.selectionAskStarted(question: "", selectedText: contextText))
+            onASREvent?(.selectionAskAnswerDelta(L("没有识别到问题，请重试。", "No question was recognized. Please try again.")))
+            onASREvent?(.selectionAskAnswerCompleted)
+            onASREvent?(.completed)
+            finishSelectionAskSession(myGeneration: myGeneration)
+            return
+        }
+
+        guard let llmConfig = loadEffectiveLLMConfig() else {
+            onASREvent?(.selectionAskStarted(question: question, selectedText: contextText))
+            onASREvent?(.selectionAskAnswerDelta(L("请先在设置中配置 LLM。", "Please configure an LLM provider in Settings first.")))
+            onASREvent?(.selectionAskAnswerCompleted)
+            onASREvent?(.completed)
+            finishSelectionAskSession(myGeneration: myGeneration)
+            return
+        }
+
+        state = .postProcessing
+        onASREvent?(.selectionAskStarted(question: question, selectedText: contextText))
+
+        let client = currentLLMClient()
+        let effectiveContext = PromptContext(selectedText: contextText, clipboardText: "")
+        let prompt = SelectionAskPromptBuilder.requestText(
+            mode: currentMode,
+            context: effectiveContext,
+            question: question,
+            conversationContext: conversationContext
+        )
+        DebugFileLogger.log("""
+        selectionAsk LLM request
+        provider=\(KeychainService.selectedLLMProvider.rawValue)
+        model=\(llmConfig.model)
+        contextSource=\(contextSource.rawValue)
+        question=\(question)
+        selectedRaw=\(promptContext.selectedText)
+        clipboardChars=\(promptContext.clipboardText.count)
+        contextChars=\(contextText.count)
+        conversationChars=\(conversationContext.count)
+        prompt:
+        \(prompt)
+        """)
+        do {
+            _ = try await client.processStreaming(
+                text: prompt,
+                prompt: "{text}",
+                config: llmConfig
+            ) { [weak self] delta in
+                await self?.emitSelectionAskDelta(delta)
+            }
+            onASREvent?(.selectionAskAnswerCompleted)
+        } catch {
+            onASREvent?(.selectionAskAnswerDelta(userFacingLLMError(error)))
+            onASREvent?(.selectionAskAnswerCompleted)
+        }
+
+        onASREvent?(.completed)
+        finishSelectionAskSession(myGeneration: myGeneration)
+    }
+
+    private func emitSelectionAskDelta(_ delta: String) {
+        guard !delta.isEmpty else { return }
+        onASREvent?(.selectionAskAnswerDelta(delta))
+    }
+
+    private func finishSelectionAskSession(myGeneration: Int) {
+        if sessionGeneration == myGeneration, state != .idle {
+            state = .idle
+            hasEmittedReadyForCurrentSession = false
+            currentTranscript = .empty
+            warmUpASRConnection()
+        }
+        resetSpeculativeLLM()
+        SystemVolumeManager.restore()
+    }
+
+    private func userFacingLLMError(_ error: Error) -> String {
+        if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
+            return localized
+        }
+        return error.localizedDescription
     }
 
     func stopRecording() async {
@@ -820,10 +1123,14 @@ actor RecognitionSession {
                     // Drain events + disconnect in background so post-teardown can start
                     let evtTask = eventConsumptionTask
                     eventConsumptionTask = nil
-                    Task {
-                        if let evtTask { _ = await withTimeout(.seconds(3)) { await evtTask.value } }
+                    asrCleanupTask?.cancel()
+                    asrCleanupGeneration = myGeneration
+                    asrCleanupTask = Task { [weak self, myGeneration] in
+                        if let evtTask { _ = await self?.withTimeout(.seconds(3)) { await evtTask.value } }
+                        guard !Task.isCancelled else { return }
                         await client.disconnect()
                         DebugFileLogger.log("stop: phase 2 background cleanup done")
+                        await self?.clearASRCleanupTask(generation: myGeneration)
                     }
                     self.asrClient = nil
                 }
@@ -835,7 +1142,7 @@ actor RecognitionSession {
         // Keep speculative LLM task alive — we'll compare its input text
         // against the final ASR transcript after full teardown.
         cancelSpeculativeLLM()
-        var needsLLM = !currentMode.prompt.isEmpty
+        var needsLLM = !currentMode.prompt.isEmpty && currentMode.executionKind == .recording
 
         // Early label override for short text exemption (语音润色 only).
         // Use streaming transcript to update UI immediately, before ASR teardown,
@@ -870,12 +1177,16 @@ actor RecognitionSession {
                 // Run drain + disconnect in background so LLM can start immediately.
                 DebugFileLogger.log("stop: isFinal received +\(ContinuousClock.now - stopT0)")
                 let evtTask = eventConsumptionTask
-                Task {
+                asrCleanupTask?.cancel()
+                asrCleanupGeneration = myGeneration
+                asrCleanupTask = Task { [weak self, myGeneration] in
                     if let evtTask {
-                        _ = await withTimeout(.seconds(3)) { await evtTask.value }
+                        _ = await self?.withTimeout(.seconds(3)) { await evtTask.value }
                     }
+                    guard !Task.isCancelled else { return }
                     await client.disconnect()
                     DebugFileLogger.log("stop: ASR background cleanup done")
+                    await self?.clearASRCleanupTask(generation: myGeneration)
                 }
             } else {
                 // Non-streaming or isFinal timeout: fall back to full drain.
@@ -917,10 +1228,13 @@ actor RecognitionSession {
                 onASREvent?(.processingLabelOverride(L("校准中", "Calibrating")))
             }
 
-            DebugFileLogger.log("stop: needsLLM=\(needsLLM) mode=\(currentMode.name) text=\(finalASRText.count)chars specMatch=\(finalASRText == speculativeLLMText)")
+            let speculativeDiff = TranscriptDiff.classify(source: speculativeLLMText, final: finalASRText)
+            DebugFileLogger.log(
+                "stop: needsLLM=\(needsLLM) mode=\(currentMode.name) text=\(finalASRText.count)chars specDiff=\(speculativeDiff.type.rawValue)"
+            )
             if needsLLM && !finalASRText.isEmpty {
-                if finalASRText == speculativeLLMText, let specTask = speculativeLLMTask {
-                    // Final transcript matches speculative input — reuse (may already be done!)
+                if speculativeDiff.canReuseLLMResult, let specTask = speculativeLLMTask {
+                    // Final transcript is semantically equivalent to speculative input — reuse (may already be done!)
                     earlyLLMTask = specTask
                     state = .postProcessing
                     DebugFileLogger.log("stop: reusing speculative LLM +\(ContinuousClock.now - stopT0)")
@@ -983,8 +1297,8 @@ actor RecognitionSession {
                 ? (externalFrameBuffer?.recordedAudio() ?? Data())
                 : audioEngine.getRecordedAudio()
             if !fullAudio.isEmpty, let config = currentConfig {
-                onASREvent?(.processingResult(text: partialText.isEmpty ? "重新识别中..." : partialText))
-                if let batchText = await attemptBatchFallback(audio: fullAudio, config: config) {
+                onASREvent?(.processingResult(text: partialText.isEmpty ? L("重新识别中...", "Retrying recognition...") : partialText))
+                if let batchText = await attemptBatchFallback(audio: fullAudio, config: config, provider: activeProvider) {
                     currentTranscript = RecognitionTranscript(
                         confirmedSegments: [batchText],
                         partialText: "",
@@ -1009,6 +1323,16 @@ actor RecognitionSession {
             var finalText = effectiveText
             var processedText: String? = nil
             var llmFailed = false
+
+            if currentMode.executionKind == .selectionAsk {
+                await completeSelectionAsk(
+                    questionText: rawText,
+                    recordingStartTime: recordingStartTime,
+                    activeProvider: activeProvider,
+                    myGeneration: myGeneration
+                )
+                return
+            }
 
             // Apply snippet replacements before LLM (e.g. "我的邮箱" → actual email)
             finalText = SnippetStorage.applyEffective(to: finalText, bundleId: targetBundleId)
@@ -1091,6 +1415,18 @@ actor RecognitionSession {
                 if let result = earlyResult, !result.isEmpty {
                     DebugFileLogger.log("stop: early LLM result received \(result.count) chars +\(ContinuousClock.now - stopT0)")
                     let cleaned = result.collapsingExtraSpaces
+                    if currentMode.id == ProcessingMode.macActionId {
+                        let action = await dispatchMacAction(llmReply: cleaned)
+                        await completeMacAction(
+                            message: action.message,
+                            status: action.status,
+                            rawText: rawText,
+                            recordingStartTime: recordingStartTime,
+                            activeProvider: activeProvider,
+                            myGeneration: myGeneration
+                        )
+                        return
+                    }
                     processedText = cleaned
                     finalText = cleaned
                     onASREvent?(.processingResult(text: cleaned))
@@ -1140,6 +1476,18 @@ actor RecognitionSession {
 
                     if let result = llmResult {
                         let cleaned = result.collapsingExtraSpaces
+                        if currentMode.id == ProcessingMode.macActionId {
+                            let action = await dispatchMacAction(llmReply: cleaned)
+                            await completeMacAction(
+                                message: action.message,
+                                status: action.status,
+                                rawText: rawText,
+                                recordingStartTime: recordingStartTime,
+                                activeProvider: activeProvider,
+                                myGeneration: myGeneration
+                            )
+                            return
+                        }
                         processedText = cleaned
                         finalText = cleaned
                         onASREvent?(.processingResult(text: cleaned))
@@ -1170,7 +1518,7 @@ actor RecognitionSession {
             let aborted = injectionAborted
             let onEvent = self.onASREvent
             let injectLog = "stop: injecting method=clipboard len=\(finalText.count) +\(ContinuousClock.now - stopT0)"
-            let injectionOutcome: InjectionOutcome = await withCheckedContinuation { continuation in
+            _ = await withCheckedContinuation { continuation in
                 Task.detached {
                     let outcome: InjectionOutcome
                     if aborted {
@@ -1218,8 +1566,10 @@ actor RecognitionSession {
                 finalText: finalText,
                 status: status,
                 characterCount: finalText.count,
-                asrProvider: activeProvider.displayName
+                asrProvider: activeProvider.displayName,
+                asrModel: currentASRModelLabel(for: activeProvider)
             ))
+            KeychainService.addASRUsage(seconds: duration)
 
             // Note: injectionAborted and llmFailed info is already conveyed
             // through the .finalized event's InjectionOutcome / completionMessage.
@@ -1248,6 +1598,186 @@ actor RecognitionSession {
         logger.info("Session complete, injected \(effectiveText.count) chars")
     }
 
+    // MARK: - Stream interruption recovery
+
+    private func beginStreamRecovery(trigger: String) async {
+        guard state == .recording else {
+            DebugFileLogger.log("recovery ignored: state=\(state) trigger=\(trigger)")
+            return
+        }
+
+        let myGeneration = sessionGeneration
+        let provider = activeProvider
+        let config = currentConfig
+        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let partialText = normalizedRecoveryText(currentTranscript.displayText)
+        let asrModel = currentASRModelLabel(for: provider)
+
+        DebugFileLogger.log("recovery started trigger=\(trigger) partial=\(partialText.count) chars")
+        state = .recovering
+        recoveryInterruptPromptShown = false
+        recoveryRecordId = UUID().uuidString
+        recoveryCreatedAt = Date()
+        recoveryPartialText = partialText
+        recoveryDuration = duration
+        recoveryModeName = currentMode == .direct ? nil : currentMode.name
+        recoveryProvider = provider
+        recoveryASRModel = asrModel
+
+        maxDurationTask?.cancel()
+        maxDurationTask = nil
+        cancelSpeculativeLLM()
+        SystemVolumeManager.restore()
+
+        audioEngine.stop()
+        audioEngine.onAudioChunk = nil
+        audioEngine.onAudioLevel = nil
+        await finishAudioChunkPipeline(timeout: .milliseconds(250))
+        let fullAudio = audioEngine.getRecordedAudio()
+
+        eventConsumptionTask?.cancel()
+        eventConsumptionTask = nil
+        if let client = asrClient {
+            Task.detached { await client.disconnect() }
+        }
+        asrClient = nil
+        uploadFailureFlag = nil
+        lastStreamingError = nil
+
+        if !partialText.isEmpty {
+            await saveRecoveryHistory(status: "stream_partial_saved", finalText: partialText)
+            injectRecoveryPartial(partialText)
+        }
+
+        onASREvent?(.recoveryStarted(
+            text: partialText,
+            message: L(
+                "连接中断，已保留当前文字，正在用整段录音重试",
+                "Connection interrupted. Current text was saved; retrying with the full recording."
+            )
+        ))
+
+        guard sessionGeneration == myGeneration, state == .recovering else { return }
+        guard !fullAudio.isEmpty, let config else {
+            await finishRecovery(
+                recoveredText: nil,
+                generation: myGeneration,
+                failureMessage: L(
+                    "连接中断，已保留部分识别结果",
+                    "Connection interrupted. Partial recognition was saved."
+                )
+            )
+            return
+        }
+
+        recoveryTask?.cancel()
+        recoveryTask = Task {
+            let recovered = await self.attemptBatchFallback(
+                audio: fullAudio,
+                config: config,
+                provider: provider
+            )
+            await self.finishRecovery(
+                recoveredText: recovered,
+                generation: myGeneration,
+                failureMessage: L(
+                    "连接中断，已保留部分识别结果",
+                    "Connection interrupted. Partial recognition was saved."
+                )
+            )
+        }
+    }
+
+    private func finishRecovery(
+        recoveredText: String?,
+        generation: Int,
+        failureMessage: String
+    ) async {
+        guard state == .recovering, generation == sessionGeneration, !Task.isCancelled else {
+            return
+        }
+
+        let recovered = recoveredText.map(normalizedRecoveryText)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let recovered, !recovered.isEmpty {
+            injectionEngine.copyToClipboard(recovered)
+            currentTranscript = RecognitionTranscript(
+                confirmedSegments: [recovered],
+                partialText: "",
+                authoritativeText: recovered,
+                isFinal: true
+            )
+            await saveRecoveryHistory(status: "stream_recovered", finalText: recovered)
+            KeychainService.addASRUsage(seconds: recoveryDuration)
+            onASREvent?(.recoverySucceeded(
+                text: recovered,
+                message: L("已恢复完整识别", "Full recognition recovered")
+            ))
+            DebugFileLogger.log("recovery succeeded \(recovered.count) chars")
+        } else {
+            if !recoveryPartialText.isEmpty {
+                await saveRecoveryHistory(status: "stream_partial_saved", finalText: recoveryPartialText)
+                KeychainService.addASRUsage(seconds: recoveryDuration)
+            }
+            onASREvent?(.recoveryFailed(text: recoveryPartialText, message: failureMessage))
+            DebugFileLogger.log("recovery failed, partial=\(recoveryPartialText.count) chars")
+        }
+
+        clearRecoveryState()
+        state = .idle
+        currentTranscript = .empty
+        resetSpeculativeLLM()
+        SystemVolumeManager.restore()
+        warmUpASRConnection()
+    }
+
+    private func normalizedRecoveryText(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .removingCJKLatinSpaces
+            .strippingTrailingPunctuation
+    }
+
+    private func injectRecoveryPartial(_ text: String) {
+        let engine = injectionEngine
+        Task.detached {
+            engine.preserveClipboard = false
+            _ = engine.inject(text)
+        }
+    }
+
+    private func saveRecoveryHistory(status: String, finalText: String) async {
+        let recordId = recoveryRecordId ?? UUID().uuidString
+        recoveryRecordId = recordId
+        await historyStore.insert(HistoryRecord(
+            id: recordId,
+            createdAt: recoveryCreatedAt ?? Date(),
+            durationSeconds: recoveryDuration,
+            rawText: recoveryPartialText,
+            processingMode: recoveryModeName,
+            processedText: nil,
+            finalText: finalText,
+            status: status,
+            characterCount: finalText.count,
+            asrProvider: recoveryProvider.displayName,
+            asrModel: recoveryASRModel
+        ))
+    }
+
+    private func clearRecoveryState() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryInterruptPromptShown = false
+        recoveryRecordId = nil
+        recoveryCreatedAt = nil
+        recoveryPartialText = ""
+        recoveryDuration = 0
+        recoveryModeName = nil
+        recoveryProvider = .volcano
+        recoveryASRModel = nil
+        currentConfig = nil
+    }
+
     // MARK: - ASR Events
 
     private func handleASREvent(_ event: RecognitionEvent, expectedGeneration: Int) {
@@ -1267,8 +1797,13 @@ actor RecognitionSession {
             break
         }
 
-        // Notify UI layer for all non-ready events
-        onASREvent?(event)
+        // Notify UI layer for all non-ready events. Streaming errors during
+        // recording become recoverable interruptions, not red error toasts.
+        if case .error = event, state == .recording {
+            // beginStreamRecovery surfaces the user-facing state.
+        } else {
+            onASREvent?(event)
+        }
 
         switch event {
         case .ready:
@@ -1280,21 +1815,28 @@ actor RecognitionSession {
                 speechDetected = true
                 if let cont = firstStreamingTextCont {
                     firstStreamingTextCont = nil
+                    firstStreamingTextTimeoutTask?.cancel()
+                    firstStreamingTextTimeoutTask = nil
                     cont.resume(returning: true)
                 }
             }
             if let cont = finalTranscriptCont, isTranscriptEffectivelyFinal {
                 finalTranscriptCont = nil
+                finalTranscriptTimeoutTask?.cancel()
+                finalTranscriptTimeoutTask = nil
                 cont.resume(returning: transcript.displayText)
             }
             logger.info("Transcript updated: \(transcript.displayText)")
-            if state == .recording && !currentMode.prompt.isEmpty {
+            if state == .recording && !currentMode.prompt.isEmpty && currentMode.executionKind == .recording {
                 scheduleSpeculativeLLM()
             }
 
         case .error(let error):
             lastStreamingError = error
             logger.error("ASR error: \(error)")
+            if state == .recording {
+                Task { await self.beginStreamRecovery(trigger: "ASR error: \(error)") }
+            }
 
         case .completed:
             logger.info("ASR stream completed")
@@ -1303,17 +1845,28 @@ actor RecognitionSession {
             // last update the server sent before closing.
             if let cont = finalTranscriptCont {
                 finalTranscriptCont = nil
+                finalTranscriptTimeoutTask?.cancel()
+                finalTranscriptTimeoutTask = nil
                 let text = currentTranscript.displayText
                 DebugFileLogger.log("stop: .completed resumed finalTranscriptCont (\(text.count) chars)")
                 cont.resume(returning: text.isEmpty ? nil : text)
             }
             if state == .recording {
-                NSLog("[Session] Server closed ASR while recording, initiating stop")
-                DebugFileLogger.log("server-initiated stop from recording state")
-                Task { await self.stopRecording() }
+                if lastStreamingError != nil || uploadFailureFlag?.failed == true {
+                    NSLog("[Session] Server closed ASR after interruption, initiating recovery")
+                    DebugFileLogger.log("server completed after streaming interruption")
+                    Task { await self.beginStreamRecovery(trigger: "ASR completed after interruption") }
+                } else if activeProvider != .grok {
+                    NSLog("[Session] Server closed ASR while recording, initiating stop")
+                    DebugFileLogger.log("server-initiated stop from recording state")
+                    Task { await self.stopRecording() }
+                }
             }
 
-        case .processingResult, .processingLabelOverride, .finalized:
+        case .processingResult, .processingLabelOverride, .recoveryStarted,
+             .recoveryPrompt, .recoverySucceeded, .recoveryFailed,
+             .recoveryInterrupted, .finalized, .macActionResult,
+             .selectionAskStarted, .selectionAskAnswerDelta, .selectionAskAnswerCompleted:
             break
         }
     }
@@ -1389,6 +1942,7 @@ actor RecognitionSession {
                 } catch {
                     DebugFileLogger.log("audio chunk send failed: \(error)")
                     failureFlag.failed = true
+                    Task { await self.beginStreamRecovery(trigger: "audio chunk send failed: \(error)") }
                     // If send fails, stop pumping — connection is dead.
                     break
                 }
@@ -1443,30 +1997,71 @@ actor RecognitionSession {
 
     // MARK: - Speculative LLM
 
+    private var isSpeculativeLLMEnabled: Bool {
+        let provider = KeychainService.selectedLLMProvider
+        guard provider.supportsSpeculativeProcessing else { return false }
+        if let override = UserDefaults.standard.object(forKey: "tf_enableSpeculativeLLM") as? Bool {
+            return override
+        }
+        return true
+    }
+
     /// Debounce: after each transcript update, wait 800ms of silence before
     /// speculatively sending current text to LLM. If the user is still
     /// speaking, the timer resets.
     private func scheduleSpeculativeLLM() {
+        guard isSpeculativeLLMEnabled else { return }
         #if HAS_CLOUD_SUBSCRIPTION
         if isCloudMode { return }
         #endif
-        speculativeDebounceTask?.cancel()
-        speculativeDebounceTask = Task {
-            try? await Task.sleep(for: .milliseconds(800))
-            guard !Task.isCancelled, state == .recording else { return }
-            await fireSpeculativeLLM()
-        }
-    }
-
-    private func fireSpeculativeLLM() async {
         var text = currentTranscript.composedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         text = SnippetStorage.applyEffective(to: text, bundleId: targetBundleId)
-        guard !text.isEmpty, text != speculativeLLMText else { return }
-        guard let llmConfig = loadEffectiveLLMConfig() else { return }
+        scheduleSpeculativeLLM(text: text)
+    }
 
-        // Cancel previous speculative call if text changed
-        speculativeLLMTask?.cancel()
+    private func scheduleSpeculativeLLM(text: String) {
+        guard state == .recording else { return }
+        switch speculativeThrottle.submit(text) {
+        case .tooShort:
+            DebugFileLogger.log("speculative LLM: skipped reason=tooShort len=\(text.count)")
+            speculativeDebounceTask?.cancel()
+            speculativeDebounceTask = nil
+            return
+        case .duplicate:
+            DebugFileLogger.log("speculative LLM: skipped reason=duplicate len=\(text.count)")
+            speculativeDebounceTask?.cancel()
+            speculativeDebounceTask = nil
+            return
+        case .deltaTooSmall:
+            DebugFileLogger.log(
+                "speculative LLM: skipped reason=deltaTooSmall len=\(text.count) last=\(speculativeThrottle.lastStartedText.count)"
+            )
+            speculativeDebounceTask?.cancel()
+            speculativeDebounceTask = nil
+            return
+        case .queued:
+            DebugFileLogger.log("speculative LLM: queued pending len=\(text.count)")
+            return
+        case .debounce:
+            break
+        }
+
+        speculativeDebounceTask?.cancel()
+        speculativeDebounceTask = Task { [text] in
+            try? await Task.sleep(for: SpeculativeLLMThrottle.debounceDuration)
+            guard !Task.isCancelled, state == .recording else { return }
+            await fireSpeculativeLLM(text: text)
+        }
+    }
+
+    private func fireSpeculativeLLM(text: String) async {
+        guard speculativeThrottle.beginDebouncedRequest(for: text) else { return }
+        guard let llmConfig = loadEffectiveLLMConfig() else {
+            _ = speculativeThrottle.requestCompleted(input: text)
+            return
+        }
+
         speculativeLLMText = text
         let prompt = promptContext.expandContextVariables(currentMode.prompt)
 
@@ -1477,9 +2072,19 @@ actor RecognitionSession {
                 let result = try await client.process(
                     text: text, prompt: prompt, config: llmConfig
                 )
+                guard !Task.isCancelled else {
+                    _ = self.speculativeThrottle.requestCompleted(input: text)
+                    return nil
+                }
                 DebugFileLogger.log("speculative LLM: done \(result.count) chars")
+                if let pending = self.speculativeThrottle.requestCompleted(input: text),
+                   self.state == .recording {
+                    self.scheduleSpeculativeLLM(text: pending)
+                }
                 return result
             } catch {
+                _ = self.speculativeThrottle.requestCompleted(input: text)
+                guard !Task.isCancelled else { return nil }
                 DebugFileLogger.log("speculative LLM: failed \(error)")
                 self.setPendingLLMError(error)
                 return nil
@@ -1503,6 +2108,7 @@ actor RecognitionSession {
         speculativeLLMTask?.cancel()
         speculativeLLMTask = nil
         speculativeLLMText = ""
+        speculativeThrottle.reset()
     }
 
     /// Clears state used by focus wakeup silence auto-stop.
@@ -1800,14 +2406,29 @@ actor RecognitionSession {
             return currentTranscript.displayText
         }
         return await withCheckedContinuation { continuation in
+            self.finalTranscriptTimeoutTask?.cancel()
             self.finalTranscriptCont = continuation
-            Task {
+            self.finalTranscriptTimeoutTask = Task { [weak self] in
                 try? await Task.sleep(for: timeout)
-                if let cont = self.finalTranscriptCont {
-                    self.finalTranscriptCont = nil
-                    cont.resume(returning: nil)
-                }
+                guard let self, !Task.isCancelled else { return }
+                await self.resumeFinalTranscriptOnTimeout()
             }
+        }
+    }
+
+    private func resumeFinalTranscriptOnTimeout() {
+        if let cont = finalTranscriptCont {
+            finalTranscriptCont = nil
+            finalTranscriptTimeoutTask = nil
+            cont.resume(returning: nil)
+        }
+    }
+
+    private func resumeFirstStreamingTextOnTimeout() {
+        if let cont = firstStreamingTextCont {
+            firstStreamingTextCont = nil
+            firstStreamingTextTimeoutTask = nil
+            cont.resume(returning: false)
         }
     }
 
@@ -1829,13 +2450,12 @@ actor RecognitionSession {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty { return true }
         return await withCheckedContinuation { continuation in
+            self.firstStreamingTextTimeoutTask?.cancel()
             self.firstStreamingTextCont = continuation
-            Task {
+            self.firstStreamingTextTimeoutTask = Task { [weak self] in
                 try? await Task.sleep(for: timeout)
-                if let cont = self.firstStreamingTextCont {
-                    self.firstStreamingTextCont = nil
-                    cont.resume(returning: false)
-                }
+                guard let self, !Task.isCancelled else { return }
+                await self.resumeFirstStreamingTextOnTimeout()
             }
         }
     }
@@ -1852,9 +2472,11 @@ actor RecognitionSession {
 
     /// Try to transcribe full audio via the same provider.
     /// Soniox uses its async REST API (faster for complete audio); others use a fresh streaming connection.
-    private func attemptBatchFallback(audio: Data, config: any ASRProviderConfig) async -> String? {
-        let provider = activeProvider
-
+    private func attemptBatchFallback(
+        audio: Data,
+        config: any ASRProviderConfig,
+        provider: ASRProvider
+    ) async -> String? {
         // Soniox: use async REST API instead of re-streaming
         if provider == .soniox, let sonioxConfig = config as? SonioxASRConfig {
             let bypass = ProxyBypassMode.current.bypassASR
@@ -1955,16 +2577,25 @@ actor RecognitionSession {
 
         if let cont = firstStreamingTextCont {
             firstStreamingTextCont = nil
+            firstStreamingTextTimeoutTask?.cancel()
+            firstStreamingTextTimeoutTask = nil
             cont.resume(returning: false)
         }
         if let cont = finalTranscriptCont {
             finalTranscriptCont = nil
+            finalTranscriptTimeoutTask?.cancel()
+            finalTranscriptTimeoutTask = nil
             cont.resume(returning: nil)
         }
         eventConsumptionTask?.cancel()
         eventConsumptionTask = nil
         maxDurationTask?.cancel()
         maxDurationTask = nil
+        asrCleanupTask?.cancel()
+        asrCleanupTask = nil
+        asrCleanupGeneration = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
         resetSpeculativeLLM()
         resetAutoStopState()
 
@@ -1991,6 +2622,7 @@ actor RecognitionSession {
         currentConfig = nil
         uploadFailureFlag = nil
         lastStreamingError = nil
+        clearRecoveryState()
         SystemVolumeManager.restore()
     }
 
@@ -1998,25 +2630,46 @@ actor RecognitionSession {
 
 // MARK: - String helpers
 
-private extension String {
+// `internal` (not `private`) so the text-normalization rules can be unit-tested
+// via `@testable import Type4Me` (see RecognitionSessionTests).
+extension String {
     /// Collapse runs of 2+ spaces into a single space.
     /// LLMs sometimes insert extra spaces between CJK and Latin text.
     var collapsingExtraSpaces: String {
         replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
     }
 
-    /// Remove unwanted spaces around CJK characters.
-    /// Chinese text never uses inter-word spaces, so any space adjacent to a
-    /// CJK character is noise from ASR token boundaries or LLM formatting.
-    /// Two rules cover all 5 CJK-involving combinations (中↔中, 中↔英, 英↔中,
-    /// 中↔符, 符↔中) while leaving pure English "hello world" intact.
+    /// Remove spurious spaces that hug a CJK character, while preserving the
+    /// space between a CJK character and an adjacent Latin letter or digit
+    /// (Pangu spacing, e.g. "最新的 prompt 提交" stays intact — see issue #186).
+    ///
+    /// Chinese text uses no inter-word spaces, so a space between two CJK
+    /// characters — or between a CJK character and punctuation — is noise from
+    /// ASR token boundaries or LLM formatting and is removed (中↔中, 中↔符,
+    /// 符↔中). A space between a CJK character and an ASCII letter/digit is
+    /// intentional and is kept (中↔英, 英↔中, 中↔数). Pure English
+    /// "hello world" is untouched.
     var removingCJKLatinSpaces: String {
         let cjk = "[\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uF900-\\uFAFF]"
+        let preserveCJKLatinSpacing = UserDefaults.standard.object(forKey: "tf_preserveCJKLatinSpacing") as? Bool ?? true
+        guard preserveCJKLatinSpacing else {
+            var s = self
+            s = s.replacingOccurrences(of: "(?<=\(cjk)) +(?=\\S)", with: "", options: .regularExpression)
+            s = s.replacingOccurrences(of: "(?<=\\S) +(?=\(cjk))", with: "", options: .regularExpression)
+            return s
+        }
+        // A neighbour that should hug the CJK character with no space: anything
+        // that is neither whitespace nor an ASCII letter/digit (i.e. another CJK
+        // char, punctuation, or a symbol). Latin letters/digits are excluded so
+        // Pangu spacing is preserved.
+        let glue = "[^\\sA-Za-z0-9]"
         var s = self
-        // Space after CJK, before any non-whitespace: "你 好" / "你 ," → "你好" / "你,"
-        s = s.replacingOccurrences(of: "(?<=\(cjk)) +(?=\\S)", with: "", options: .regularExpression)
-        // Space before CJK, after any non-whitespace: ", 你" / "Max 你" → ",你" / "Max你"
-        s = s.replacingOccurrences(of: "(?<=\\S) +(?=\(cjk))", with: "", options: .regularExpression)
+        // Space after CJK, before a non-letter/digit: "你 好" / "你 ，" → "你好" / "你，"
+        // ("最新的 prompt" keeps its space because 'p' is a letter.)
+        s = s.replacingOccurrences(of: "(?<=\(cjk)) +(?=\(glue))", with: "", options: .regularExpression)
+        // Space before CJK, after a non-letter/digit: "， 你" → "，你"
+        // ("Max 你" / "3 个" keep their space because 'x' / '3' are letter/digit.)
+        s = s.replacingOccurrences(of: "(?<=\(glue)) +(?=\(cjk))", with: "", options: .regularExpression)
         return s
     }
 

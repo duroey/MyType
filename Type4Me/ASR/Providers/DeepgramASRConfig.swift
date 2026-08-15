@@ -9,6 +9,8 @@ struct DeepgramASRConfig: ASRProviderConfig, Sendable {
 
     static let supportedModels = [
         "nova-3",
+        "nova-3-general",
+        "nova-3-medical",
         "nova-2",
         "nova-2-general",
         "nova-2-meeting",
@@ -22,13 +24,13 @@ struct DeepgramASRConfig: ASRProviderConfig, Sendable {
     ]
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "apiKey", label: "API Key", placeholder: L("粘贴 API Key", "Paste your API Key"), isSecure: true, isOptional: false, defaultValue: ""),
-        CredentialField(key: "model", label: "Model", placeholder: defaultModel, isSecure: false, isOptional: false, defaultValue: defaultModel,
+        CredentialField(key: "apiKey", label: L("API Key", "API Key"), placeholder: L("粘贴 API Key", "Paste your API Key"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "model", label: L("模型", "Model"), placeholder: defaultModel, isSecure: false, isOptional: false, defaultValue: defaultModel,
             options: supportedModels.map { FieldOption(value: $0, label: $0) }),
-        CredentialField(key: "language", label: "Language", placeholder: defaultLanguage, isSecure: false, isOptional: false, defaultValue: defaultLanguage,
+        CredentialField(key: "language", label: L("语言", "Language"), placeholder: defaultLanguage, isSecure: false, isOptional: false, defaultValue: defaultLanguage,
             options: supportedLanguages.map { FieldOption(value: $0, label: $0) }),
         CredentialField(key: "numerals", label: L("数字转换", "Numerals"), placeholder: "false", isSecure: false, isOptional: true, defaultValue: "false",
-            options: [FieldOption(value: "true", label: "On"), FieldOption(value: "false", label: "Off")]),
+            options: [FieldOption(value: "true", label: L("开", "On")), FieldOption(value: "false", label: L("关", "Off"))]),
     ]}
 
     let apiKey: String

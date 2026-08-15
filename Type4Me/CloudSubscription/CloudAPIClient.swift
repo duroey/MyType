@@ -65,7 +65,7 @@ final class CloudAPIClient {
         }
 
         guard let http = response as? HTTPURLResponse else {
-            throw CloudAPIError.serverError("Invalid response")
+            throw CloudAPIError.serverError(L("响应无效", "Invalid response"))
         }
 
         if http.statusCode == 401 {
@@ -81,7 +81,7 @@ final class CloudAPIClient {
 
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
-            throw CloudAPIError.serverError("HTTP \(http.statusCode): \(body)")
+            throw CloudAPIError.serverError(L("HTTP \(http.statusCode)：\(body)", "HTTP \(http.statusCode): \(body)"))
         }
 
         return data

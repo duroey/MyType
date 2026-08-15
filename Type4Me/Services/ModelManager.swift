@@ -271,9 +271,9 @@ actor ModelManager {
 
         var displayName: String {
             switch self {
-            case .onlineParaformer:  return "Streaming ASR"
-            case .offlineParaformer: return "Offline ASR"
-            case .punctuation:       return "Punctuation"
+            case .onlineParaformer:  return L("流式识别", "Streaming ASR")
+            case .offlineParaformer: return L("离线识别", "Offline ASR")
+            case .punctuation:       return L("标点恢复", "Punctuation")
             }
         }
     }
@@ -564,14 +564,17 @@ actor ModelManager {
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> (URL, URLResponse) {
         try await withCheckedThrowingContinuation { continuation in
-            var resumed = false
+            let didResume = OSAllocatedUnfairLock(initialState: false)
             let delegate = DownloadProgressDelegate(
                 onProgress: { fraction in
                     onProgress(fraction * 0.9)
                 },
                 onComplete: { location, response, error in
-                    guard !resumed else { return }
-                    resumed = true
+                    guard didResume.withLock({
+                        guard !$0 else { return false }
+                        $0 = true
+                        return true
+                    }) else { return }
                     if let error {
                         continuation.resume(throwing: error)
                         return
@@ -596,7 +599,7 @@ actor ModelManager {
             config.waitsForConnectivity = true
             config.httpMaximumConnectionsPerHost = 1
             let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-            Task { await self.storeSession(session, forKey: key) }
+            storeSession(session, forKey: key)
 
             // Resume from previous partial download if available
             if let data = existingResumeData {

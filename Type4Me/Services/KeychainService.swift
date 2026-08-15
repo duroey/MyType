@@ -226,13 +226,15 @@ enum KeychainService {
     ) throws -> [String: String]? {
         let dict = loadAll()
         let storageKey = asrStorageKey(for: provider)
-        let plaintext = dict[storageKey] as? [String: String] ?? [:]
+        let plaintext = stringDictionary(dict[storageKey])
         let fields = ASRProviderRegistry.configType(for: provider)?.credentialFields ?? []
         let secure = fields.contains(where: \.isSecure)
             ? try loadSecureValuesCheckingKeychain(account: storageKey)
             : [:]
         let merged = plaintext.merging(secure) { _, secure in secure }
-        return merged.isEmpty ? nil : merged
+        let legacy = provider == .volcano ? legacyVolcanoASRCredentials(in: dict) : [:]
+        let compatible = compatibleASRCredentials(for: provider, stored: merged, legacy: legacy)
+        return compatible.isEmpty ? nil : compatible
     }
 
     static func loadASRConfig(for provider: ASRProvider) -> (any ASRProviderConfig)? {
@@ -290,14 +292,6 @@ enum KeychainService {
     }
 
     // MARK: - Legacy ASR convenience (volcano-specific, kept for migration)
-
-    static func saveASRCredentials(appKey: String, accessKey: String, resourceId: String) throws {
-        try saveASRCredentials(for: .volcano, values: [
-            "appKey": appKey,
-            "accessKey": accessKey,
-            "resourceId": resourceId,
-        ])
-    }
 
     static func loadASRConfig() -> VolcanoASRConfig? {
         loadASRConfig(for: .volcano) as? VolcanoASRConfig
@@ -373,13 +367,15 @@ enum KeychainService {
     ) throws -> [String: String]? {
         let dict = loadAll()
         let storageKey = llmStorageKey(for: provider)
-        let plaintext = dict[storageKey] as? [String: String] ?? [:]
+        let plaintext = stringDictionary(dict[storageKey])
         let fields = LLMProviderRegistry.configType(for: provider)?.credentialFields ?? []
         let secure = fields.contains(where: \.isSecure)
             ? try loadSecureValuesCheckingKeychain(account: storageKey)
             : [:]
         let merged = plaintext.merging(secure) { _, secure in secure }
-        return merged.isEmpty ? nil : merged
+        let legacy = provider == .doubao ? legacyDoubaoLLMCredentials(in: dict) : [:]
+        let compatible = compatibleLLMCredentials(for: provider, stored: merged, legacy: legacy)
+        return compatible.isEmpty ? nil : compatible
     }
 
     static func loadLLMProviderConfig(for provider: LLMProvider) -> (any LLMProviderConfig)? {
@@ -408,6 +404,21 @@ enum KeychainService {
         return config.toLLMConfig()
     }
 
+    // MARK: - ASR Usage Tracking (local)
+
+    private static let asrUsageKey = "tf_asrUsageSeconds"
+
+    /// Total ASR usage in seconds (local estimate).
+    static var asrUsageSeconds: Double {
+        get { UserDefaults.standard.double(forKey: asrUsageKey) }
+        set { UserDefaults.standard.set(newValue, forKey: asrUsageKey) }
+    }
+
+    /// Add seconds from a completed ASR session.
+    static func addASRUsage(seconds: Double) {
+        asrUsageSeconds += seconds
+    }
+
     // MARK: - Migration (call once at app launch)
 
     /// Migrate legacy flat keys to provider-grouped format,
@@ -415,28 +426,32 @@ enum KeychainService {
     static func migrateIfNeeded() {
         migrateAppSupportDirectory()
         migrateUserDefaults()
+        migrateStoredCredentials()
+    }
+
+    static func migrateStoredCredentials() {
         lock.lock()
         defer { lock.unlock() }
         let dict = _loadAllUnlocked()
 
         var migrated = false
         var mutableDict = dict
+        var legacyExternalKeysToClean = Set<String>()
 
         // Migrate ASR: tf_appKey/tf_accessKey/tf_resourceId → tf_asr_volcano
-        if let appKey = dict["tf_appKey"] as? String, !appKey.isEmpty,
-           dict[asrStorageKey(for: .volcano)] == nil {
-            let accessKey = dict["tf_accessKey"] as? String ?? ""
-            let resourceId = dict["tf_resourceId"] as? String ?? "volc.bigasr.sauc.duration"
-            mutableDict[asrStorageKey(for: .volcano)] = [
-                "appKey": appKey,
-                "accessKey": accessKey,
-                "resourceId": resourceId,
-            ]
-            mutableDict.removeValue(forKey: "tf_appKey")
-            mutableDict.removeValue(forKey: "tf_accessKey")
-            mutableDict.removeValue(forKey: "tf_resourceId")
-            migrated = true
-            NSLog("[KeychainService] Migrated legacy ASR credentials to tf_asr_volcano")
+        let legacyASRKeys = ["tf_appKey", "tf_accessKey", "tf_resourceId"]
+        let legacyASR = legacyVolcanoASRCredentials(in: dict)
+        if !legacyASR.isEmpty {
+            let storageKey = asrStorageKey(for: .volcano)
+            let current = stringDictionary(mutableDict[storageKey])
+            let repaired = compatibleASRCredentials(for: .volcano, stored: current, legacy: legacyASR)
+            if repaired != current {
+                mutableDict[storageKey] = repaired
+                migrated = true
+                NSLog("[KeychainService] Migrated legacy ASR credentials to tf_asr_volcano")
+            }
+            migrated = removeLegacyFileKeys(legacyASRKeys, from: &mutableDict) || migrated
+            legacyExternalKeysToClean.formUnion(legacyASRKeys)
         }
 
         // Migrate mistakenly stored Bailian ASR credentials from tf_asr_aliyun → tf_asr_bailian
@@ -452,30 +467,20 @@ enum KeychainService {
             NSLog("[KeychainService] Migrated Bailian ASR credentials from tf_asr_aliyun → tf_asr_bailian")
         }
 
-        // Migrate LLM: tf_llmEndpointId → tf_llmModel
-        if let endpointId = dict["tf_llmEndpointId"] as? String, !endpointId.isEmpty,
-           dict["tf_llmModel"] == nil {
-            mutableDict["tf_llmModel"] = endpointId
-            mutableDict.removeValue(forKey: "tf_llmEndpointId")
-            migrated = true
-            NSLog("[KeychainService] Migrated tf_llmEndpointId → tf_llmModel")
-        }
-
-        // Migrate LLM: flat keys → tf_llm_doubao (provider-grouped)
-        if let apiKey = dict["tf_llmApiKey"] as? String, !apiKey.isEmpty,
-           dict[llmStorageKey(for: .doubao)] == nil {
-            let model = (dict["tf_llmModel"] as? String) ?? ""
-            let baseURL = (dict["tf_llmBaseURL"] as? String) ?? ""
-            mutableDict[llmStorageKey(for: .doubao)] = [
-                "apiKey": apiKey,
-                "model": model,
-                "baseURL": baseURL.isEmpty ? LLMProvider.doubao.defaultBaseURL : baseURL,
-            ]
-            mutableDict.removeValue(forKey: "tf_llmApiKey")
-            mutableDict.removeValue(forKey: "tf_llmModel")
-            mutableDict.removeValue(forKey: "tf_llmBaseURL")
-            migrated = true
-            NSLog("[KeychainService] Migrated flat LLM keys to tf_llm_doubao")
+        // Migrate LLM: tf_llmApiKey/tf_llmModel/tf_llmEndpointId/tf_llmBaseURL → tf_llm_doubao
+        let legacyLLMKeys = ["tf_llmApiKey", "tf_llmModel", "tf_llmEndpointId", "tf_llmBaseURL"]
+        let legacyLLM = legacyDoubaoLLMCredentials(in: dict)
+        if !legacyLLM.isEmpty {
+            let storageKey = llmStorageKey(for: .doubao)
+            let current = stringDictionary(mutableDict[storageKey])
+            let repaired = compatibleLLMCredentials(for: .doubao, stored: current, legacy: legacyLLM)
+            if repaired != current {
+                mutableDict[storageKey] = repaired
+                migrated = true
+                NSLog("[KeychainService] Migrated flat LLM keys to tf_llm_doubao")
+            }
+            migrated = removeLegacyFileKeys(legacyLLMKeys, from: &mutableDict) || migrated
+            legacyExternalKeysToClean.formUnion(legacyLLMKeys)
         }
 
         // Migrate MiniMax CN: api.minimax.chat → api.minimaxi.com (old domain was incorrect)
@@ -491,11 +496,37 @@ enum KeychainService {
             NSLog("[KeychainService] Migrated MiniMax CN base URL: api.minimax.chat → api.minimaxi.com")
         }
 
+        let defaultsRepaired = repairCredentialDefaults(in: &mutableDict)
         let secureFieldsMigrated = migrateSecureCredentialGroups(in: &mutableDict)
 
-        if migrated || secureFieldsMigrated {
-            try? saveAll(mutableDict)
-            cachedCredentials = mutableDict
+        if migrated || defaultsRepaired || secureFieldsMigrated {
+            do {
+                try saveAll(mutableDict)
+                cachedCredentials = mutableDict
+                cleanLegacyExternalCredentialSources(legacyExternalKeysToClean)
+            } catch {
+                NSLog("[KeychainService] Failed to persist credential migration: %@", error.localizedDescription)
+            }
+        } else {
+            cleanLegacyExternalCredentialSources(legacyExternalKeysToClean)
+        }
+    }
+
+    private static func removeLegacyFileKeys(_ keys: [String], from dict: inout [String: Any]) -> Bool {
+        var changed = false
+        for key in keys {
+            if dict.removeValue(forKey: key) != nil {
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    private static func cleanLegacyExternalCredentialSources(_ keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+        for key in keys {
+            UserDefaults.standard.removeObject(forKey: key)
+            _ = deleteSecureValue(service: keychainScalarService, account: key)
         }
     }
 
@@ -807,6 +838,145 @@ enum KeychainService {
             }
         }
         return (plaintext, secure)
+    }
+
+    static func compatibleASRCredentials(
+        for provider: ASRProvider,
+        stored: [String: String],
+        legacy: [String: String] = [:]
+    ) -> [String: String] {
+        let fields = ASRProviderRegistry.configType(for: provider)?.credentialFields ?? []
+        var values = compatibleCredentialValues(
+            stored: stored,
+            legacy: legacy,
+            fields: fields
+        )
+        if provider == .volcano, !values.isEmpty {
+            if let explicitMode = stored["authMode"] ?? legacy["authMode"],
+               explicitMode == VolcanoASRConfig.authModeAPIKey
+                || explicitMode == VolcanoASRConfig.authModeLegacy {
+                values["authMode"] = explicitMode
+            } else {
+                values.removeValue(forKey: "authMode")
+                values["authMode"] = VolcanoASRConfig.inferredAuthMode(in: values)
+            }
+        }
+        return values
+    }
+
+    static func compatibleLLMCredentials(
+        for provider: LLMProvider,
+        stored: [String: String],
+        legacy: [String: String] = [:]
+    ) -> [String: String] {
+        let fields = LLMProviderRegistry.configType(for: provider)?.credentialFields ?? []
+        return compatibleCredentialValues(stored: stored, legacy: legacy, fields: fields)
+    }
+
+    private static func compatibleCredentialValues(
+        stored: [String: String],
+        legacy: [String: String],
+        fields: [CredentialField]
+    ) -> [String: String] {
+        var result: [String: String] = [:]
+        mergeNonEmpty(legacy, into: &result)
+        mergeNonEmpty(stored, into: &result)
+
+        guard !result.isEmpty else { return [:] }
+        for field in fields where !field.defaultValue.isEmpty {
+            if result[field.key]?.isEmpty != false {
+                result[field.key] = field.defaultValue
+            }
+        }
+        return result
+    }
+
+    private static func mergeNonEmpty(_ values: [String: String], into result: inout [String: String]) {
+        for (key, value) in values where !value.isEmpty {
+            result[key] = value
+        }
+    }
+
+    private static func stringDictionary(_ value: Any?) -> [String: String] {
+        guard let dict = value as? [String: Any] else {
+            return value as? [String: String] ?? [:]
+        }
+        var result: [String: String] = [:]
+        for (key, value) in dict {
+            if let string = value as? String {
+                result[key] = string
+            }
+        }
+        return result
+    }
+
+    private static func legacyVolcanoASRCredentials(in dict: [String: Any]) -> [String: String] {
+        var values: [String: String] = [:]
+        setLegacyValue("tf_appKey", as: "appKey", in: dict, values: &values)
+        setLegacyValue("tf_accessKey", as: "accessKey", in: dict, values: &values)
+        setLegacyValue("tf_resourceId", as: "resourceId", in: dict, values: &values)
+        return values
+    }
+
+    private static func legacyDoubaoLLMCredentials(in dict: [String: Any]) -> [String: String] {
+        var values: [String: String] = [:]
+        setLegacyValue("tf_llmApiKey", as: "apiKey", in: dict, values: &values)
+        if let model = legacyString("tf_llmModel", in: dict)
+            ?? legacyString("tf_llmEndpointId", in: dict) {
+            values["model"] = model
+        }
+        setLegacyValue("tf_llmBaseURL", as: "baseURL", in: dict, values: &values)
+        return values
+    }
+
+    private static func setLegacyValue(
+        _ legacyKey: String,
+        as targetKey: String,
+        in dict: [String: Any],
+        values: inout [String: String]
+    ) {
+        if let value = legacyString(legacyKey, in: dict) {
+            values[targetKey] = value
+        }
+    }
+
+    private static func legacyString(_ key: String, in dict: [String: Any]) -> String? {
+        let candidates = [
+            dict[key] as? String,
+            UserDefaults.standard.string(forKey: key),
+            loadSecureString(service: keychainScalarService, account: key),
+        ]
+        return candidates.compactMap { value in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false ? trimmed : nil
+        }.first
+    }
+
+    @discardableResult
+    private static func repairCredentialDefaults(in dict: inout [String: Any]) -> Bool {
+        var changed = false
+        for provider in ASRProvider.allCases {
+            let storageKey = asrStorageKey(for: provider)
+            let current = stringDictionary(dict[storageKey])
+            guard !current.isEmpty else { continue }
+            let repaired = compatibleASRCredentials(for: provider, stored: current)
+            if repaired != current {
+                dict[storageKey] = repaired
+                changed = true
+            }
+        }
+
+        for provider in LLMProvider.allCases {
+            let storageKey = llmStorageKey(for: provider)
+            let current = stringDictionary(dict[storageKey])
+            guard !current.isEmpty else { continue }
+            let repaired = compatibleLLMCredentials(for: provider, stored: current)
+            if repaired != current {
+                dict[storageKey] = repaired
+                changed = true
+            }
+        }
+        return changed
     }
 
     @discardableResult

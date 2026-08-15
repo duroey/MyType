@@ -4,7 +4,7 @@
 
 macOS menu bar voice input tool with dual-engine local ASR, multi-provider cloud ASR, and LLM post-processing.
 Local ASR: SenseVoice via native sherpa-onnx (streaming) + Qwen3-ASR (final calibration, Python WebSocket service managed by `SenseVoiceServerManager`).
-Cloud ASR: 8 providers implemented (Volcano, OpenAI, Deepgram, AssemblyAI, ElevenLabs, Soniox, Bailian, Baidu).
+Cloud ASR: 9 providers implemented (Volcano, StepFun batch, OpenAI, Deepgram, AssemblyAI, ElevenLabs, Soniox, Bailian, Baidu).
 Swift Package Manager project, no Xcode project file. Optional `sherpa-onnx.xcframework` for punctuation restoration.
 
 ## Build & Run
@@ -80,10 +80,10 @@ All subscription/cloud-proxy code lives in `Type4Me/CloudSubscription/` (13 file
 
 Multi-provider ASR support via `ASRProvider` enum + `ASRProviderConfig` protocol + `ASRProviderRegistry`.
 
-- `ASRProvider` enum: 15 cases + conditional `cloud` case (sherpa/openai/azure/google/aws/deepgram/assemblyai/elevenlabs/volcano/aliyun/bailian/tencent/baidu/iflytek/custom, plus `cloud` when `HAS_CLOUD_SUBSCRIPTION`)
+- `ASRProvider` enum: 16 cases + conditional `cloud` case (sherpa/openai/azure/google/aws/deepgram/assemblyai/elevenlabs/volcano/stepfunBatch/aliyun/bailian/tencent/baidu/iflytek/custom, plus `cloud` when `HAS_CLOUD_SUBSCRIPTION`)
 - Each provider has its own Config type (e.g., `SherpaASRConfig`, `VolcanoASRConfig`) defining `credentialFields` for dynamic UI rendering
 - `ASRProviderRegistry`: maps provider to config type + client factory; `capabilities` indicates availability and streaming support
-- **Fully implemented**: sherpa (local, batch), volcano (streaming), deepgram (streaming), assemblyai (streaming), elevenlabs (streaming), soniox (streaming), bailian (streaming), baidu (streaming), openai (batch)
+- **Fully implemented**: sherpa (local, batch), volcano (streaming), StepFun (batch; Step Plan or standard endpoint), deepgram (streaming), assemblyai (streaming), elevenlabs (streaming), soniox (streaming), bailian (streaming), baidu (streaming), openai (batch)
 - **Config only (no client)**: azure, google, aws, aliyun, tencent, iflytek, custom
 
 ### Adding a New Provider

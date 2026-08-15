@@ -6,9 +6,9 @@ struct IflytekASRConfig: ASRProviderConfig, Sendable {
     static var displayName: String { L("讯飞", "iFLYTEK") }
 
     static var credentialFields: [CredentialField] {[
-        CredentialField(key: "appId", label: "App ID", placeholder: L("应用 ID", "App ID"), isSecure: false, isOptional: false, defaultValue: ""),
-        CredentialField(key: "apiKey", label: "API Key", placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
-        CredentialField(key: "apiSecret", label: "API Secret", placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "appId", label: L("App ID", "App ID"), placeholder: L("应用 ID", "App ID"), isSecure: false, isOptional: false, defaultValue: ""),
+        CredentialField(key: "apiKey", label: L("API Key", "API Key"), placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
+        CredentialField(key: "apiSecret", label: L("API Secret", "API Secret"), placeholder: L("密钥", "Secret"), isSecure: true, isOptional: false, defaultValue: ""),
     ]}
 
     let appId: String

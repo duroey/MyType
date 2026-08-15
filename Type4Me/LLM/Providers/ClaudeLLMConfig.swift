@@ -8,7 +8,7 @@ struct ClaudeLLMConfig: LLMProviderConfig, Sendable {
         let models = LLMProvider.claude.modelOptions
         return [
             CredentialField(
-                key: "apiKey", label: "API Key",
+                key: "apiKey", label: L("API Key", "API Key"),
                 placeholder: "sk-ant-...",
                 isSecure: true, isOptional: false, defaultValue: ""
             ),
@@ -20,7 +20,7 @@ struct ClaudeLLMConfig: LLMProviderConfig, Sendable {
                 options: models, allowCustomInput: true
             ),
             CredentialField(
-                key: "baseURL", label: "Base URL",
+                key: "baseURL", label: L("Base URL", "Base URL"),
                 placeholder: "https://api.anthropic.com/v1",
                 isSecure: false, isOptional: true, defaultValue: "https://api.anthropic.com/v1"
             ),

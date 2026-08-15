@@ -4,16 +4,16 @@ import os
 actor ClaudeChatClient: LLMClient {
 
     private let logger = Logger(subsystem: "com.mytype.llm", category: "ClaudeChatClient")
+    private let session: URLSession
+    private let metricsDelegate: LLMURLSessionMetricsDelegate
 
-    private var session: URLSession {
-        let config = URLSessionConfiguration.default
-        // Cap total request duration (including streaming) to 60s so a stalled
-        // server can't hang the for-await loop indefinitely.
-        config.timeoutIntervalForResource = 60
-        if ProxyBypassMode.current.bypassLLM {
-            config.connectionProxyDictionary = [:]
-        }
-        return URLSession(configuration: config)
+    init(bypassProxy: Bool = ProxyBypassMode.current.bypassLLM) {
+        let resources = LLMURLSessionFactory.make(
+            providerID: LLMProvider.claude.rawValue,
+            bypassProxy: bypassProxy
+        )
+        session = resources.session
+        metricsDelegate = resources.metricsDelegate
     }
 
     /// Pre-establish TCP+TLS connection so the first real request skips handshake.
@@ -26,8 +26,21 @@ actor ClaudeChatClient: LLMClient {
         logger.info("Claude connection pre-warmed to \(baseURL)")
     }
 
+    func invalidate() async {
+        session.invalidateAndCancel()
+    }
+
     /// Process text through Anthropic Messages API (streaming).
     func process(text: String, prompt: String, config: LLMConfig) async throws -> String {
+        return try await processStreaming(text: text, prompt: prompt, config: config) { _ in }
+    }
+
+    func processStreaming(
+        text: String,
+        prompt: String,
+        config: LLMConfig,
+        onDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return text }
         let finalPrompt = prompt.replacingOccurrences(of: "{text}", with: trimmedText)
@@ -76,6 +89,7 @@ actor ClaudeChatClient: LLMClient {
             case "content_block_delta":
                 if let delta = event.delta, let text = delta.text {
                     result += text
+                    await onDelta(text)
                 }
             case "message_stop":
                 break

@@ -2,12 +2,34 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && /bin/pwd -P)"
-APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/MyType.app}"
-APP_NAME="${APP_NAME:-MyType}"
-APP_EXECUTABLE="Type4Me"
-APP_ICON_NAME="AppIcon"
-APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.mytype.app}"
-APP_VERSION="${APP_VERSION:-1.9.3}"
+APP_FLAVOR="${APP_FLAVOR:-mytype}"  # mytype, public, or personal
+
+case "$APP_FLAVOR" in
+    mytype)
+        APP_NAME="${APP_NAME:-MyType}"
+        APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.mytype.app}"
+        URL_SCHEME="${URL_SCHEME:-mytype}"
+        ;;
+    public)
+        APP_NAME="${APP_NAME:-Type4Me}"
+        APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.type4me.app}"
+        URL_SCHEME="${URL_SCHEME:-type4me}"
+        ;;
+    personal)
+        APP_NAME="${APP_NAME:-Type4Me CtriXin}"
+        APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.ctrixin.type4me}"
+        URL_SCHEME="${URL_SCHEME:-type4me-ctrixin}"
+        ;;
+    *)
+        echo "ERROR: Unknown APP_FLAVOR=$APP_FLAVOR (expected mytype, public, or personal)"
+        exit 1
+        ;;
+esac
+
+APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/${APP_NAME}.app}"
+APP_EXECUTABLE="${APP_EXECUTABLE:-Type4Me}"
+APP_ICON_NAME="${APP_ICON_NAME:-AppIcon}"
+APP_VERSION="${APP_VERSION:-2.0.0}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 VARIANT="${VARIANT:-cloud}"    # cloud or local
@@ -20,6 +42,25 @@ INFO_PLIST="$APP_PATH/Contents/Info.plist"
 ENTITLEMENTS="$PROJECT_DIR/entitlements.plist"
 LOCAL_SIGNING_IDENTITY="${LOCAL_SIGNING_IDENTITY:-MyType}"
 
+codesign_file() {
+    local target="$1"
+    shift
+    if [ "$SIGNING_IDENTITY" = "-" ]; then
+        return 0
+    fi
+    codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY" "$@" "$target"
+}
+
+codesign_macho_tree() {
+    local root="$1"
+    [ -d "$root" ] || return 0
+    while IFS= read -r f; do
+        if file "$f" | grep -q "Mach-O"; then
+            codesign_file "$f"
+        fi
+    done < <(find "$root" -type f \( -name "*.dylib" -o -name "*.so" -o -perm -111 \))
+}
+
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     SIGNING_IDENTITY="$CODESIGN_IDENTITY"
 elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
@@ -30,6 +71,11 @@ elif security find-certificate -c "$LOCAL_SIGNING_IDENTITY" >/dev/null 2>&1 \
     && security find-key -l "$LOCAL_SIGNING_IDENTITY" >/dev/null 2>&1; then
     SIGNING_IDENTITY="$LOCAL_SIGNING_IDENTITY"
     echo "Using local signing identity: $SIGNING_IDENTITY"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Apple Development"; then
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/')
+    echo "Using Apple Development: $SIGNING_IDENTITY"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Type4Me Dev"; then
+    SIGNING_IDENTITY="Type4Me Dev"
 else
     echo "ERROR: No signing identity found. Create '$LOCAL_SIGNING_IDENTITY' or explicitly set CODESIGN_IDENTITY='-' for ad-hoc signing."
     exit 1
@@ -49,13 +95,32 @@ else
     swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64 2>&1 | grep -E "Build complete|Build succeeded|error:|warning:" || true
 fi
 
-if [ "$ARCH" = "arm64" ] && [ -f "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me" ]; then
-    BINARY="$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me"
-elif [ -f "$PROJECT_DIR/.build/apple/Products/Release/Type4Me" ]; then
-    BINARY="$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
-elif [ -f "$PROJECT_DIR/.build/release/Type4Me" ]; then
-    BINARY="$PROJECT_DIR/.build/release/Type4Me"
+BINARY=""
+if [ "$ARCH" = "arm64" ]; then
+    # arm64 builds can leave a stale universal artifact under .build/apple.
+    for candidate in \
+        "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me" \
+        "$PROJECT_DIR/.build/release/Type4Me" \
+        "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
+    do
+        if [ -f "$candidate" ]; then
+            BINARY="$candidate"
+            break
+        fi
+    done
 else
+    for candidate in \
+        "$PROJECT_DIR/.build/apple/Products/Release/Type4Me" \
+        "$PROJECT_DIR/.build/release/Type4Me"
+    do
+        if [ -f "$candidate" ]; then
+            BINARY="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$BINARY" ]; then
     BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Type4Me' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
 fi
 
@@ -120,7 +185,7 @@ cat >"$INFO_PLIST" <<EOF
             <string>${APP_BUNDLE_ID}</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>mytype</string>
+                <string>${URL_SCHEME}</string>
             </array>
         </dict>
     </array>
@@ -205,13 +270,28 @@ WRAPPER
         chmod +x "$APP_PATH/Contents/MacOS/qwen3-asr-server"
         # Remove .dist-info dirs that confuse codesign's bundle detection
         find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+        # MLX resolves mlx.metallib relative to libmlx.dylib in some frozen
+        # layouts. Keep a copy next to libmlx.dylib to avoid runtime discovery
+        # failures when PyInstaller places it under mlx/lib/.
+        MLX_METALLIB=$(find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -name "mlx.metallib" -type f | head -1 || true)
+        MLX_INTERNAL="$APP_PATH/Contents/Resources/qwen3-asr-server-dist/_internal"
+        if [ -n "$MLX_METALLIB" ] && [ -f "$MLX_INTERNAL/libmlx.dylib" ] && [ ! -f "$MLX_INTERNAL/mlx.metallib" ]; then
+            cp "$MLX_METALLIB" "$MLX_INTERNAL/mlx.metallib"
+        fi
         # Keep mlx.metallib in the bundle.  Even in JIT mode (MLX_METAL_JIT=ON)
         # the small (~2-5MB) metallib is required for MLX initialization.
         # JIT mode ensures the metallib uses only core shaders compatible with
         # macOS 14+; additional kernels are compiled from embedded source at
         # runtime for the host's Metal version.
-        find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.metallib" -o -perm +111 \) \
-            -exec codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "${SIGNING_IDENTITY}" {} \; 2>/dev/null || true
+        codesign_macho_tree "$APP_PATH/Contents/Resources/qwen3-asr-server-dist"
+        QWEN3_FROZEN_EXE="$APP_PATH/Contents/Resources/qwen3-asr-server-dist/qwen3-asr-server"
+        if [ -f "$QWEN3_FROZEN_EXE" ]; then
+            QWEN3_EXE_SIGN_ARGS=()
+            if [ -f "$ENTITLEMENTS" ]; then
+                QWEN3_EXE_SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+            fi
+            codesign_file "$QWEN3_FROZEN_EXE" "${QWEN3_EXE_SIGN_ARGS[@]}"
+        fi
         echo "qwen3-asr-server bundled and signed."
     else
         echo "WARNING: qwen3-asr-server dist not found at $QWEN3_DIST (Qwen3 calibration will be unavailable)"
@@ -219,11 +299,18 @@ WRAPPER
 
     echo "Local variant: all models bundled."
 else
+    rm -rf "$APP_PATH/Contents/Resources/Models" \
+           "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" \
+           "$APP_PATH/Contents/MacOS/qwen3-asr-server"
     echo "Cloud variant: skipping model bundling."
 fi
 
 # Copy third-party licenses
 cp "$PROJECT_DIR/Type4Me/Resources/THIRD_PARTY_LICENSES.txt" "$APP_PATH/Contents/Resources/" 2>/dev/null || true
+
+# CloudDocs/Finder can attach provenance or FinderInfo xattrs to copied resources.
+# Developer ID signing rejects those as resource-fork detritus, so scrub before signing.
+xattr -cr "$APP_PATH" 2>/dev/null || true
 
 # Sign the app bundle. Skip if already signed with the same identity to preserve
 # Keychain ACLs and Accessibility TCC records across rebuilds.
@@ -243,11 +330,25 @@ if [ "$NEEDS_SIGN" = "1" ]; then
     find "$APP_PATH/Contents/Frameworks" \
         -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) \
         -exec codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY" {} \; 2>/dev/null || true
+    codesign_macho_tree "$APP_PATH/Contents/Resources/qwen3-asr-server-dist"
 
     # Sign the wrapper script in Contents/MacOS
     Q3_WRAPPER="$APP_PATH/Contents/MacOS/qwen3-asr-server"
     if [ -f "$Q3_WRAPPER" ]; then
-        codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY" "$Q3_WRAPPER"
+        Q3_WRAPPER_SIGN_ARGS=()
+        if [ -f "$ENTITLEMENTS" ]; then
+            Q3_WRAPPER_SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+        fi
+        codesign_file "$Q3_WRAPPER" "${Q3_WRAPPER_SIGN_ARGS[@]}"
+    fi
+
+    Q3_FROZEN_EXE="$APP_PATH/Contents/Resources/qwen3-asr-server-dist/qwen3-asr-server"
+    if [ -f "$Q3_FROZEN_EXE" ]; then
+        Q3_FROZEN_SIGN_ARGS=()
+        if [ -f "$ENTITLEMENTS" ]; then
+            Q3_FROZEN_SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+        fi
+        codesign_file "$Q3_FROZEN_EXE" "${Q3_FROZEN_SIGN_ARGS[@]}"
     fi
 
     # Sign the main app bundle with hardened runtime + entitlements
@@ -263,7 +364,7 @@ if [ "$NEEDS_SIGN" = "1" ]; then
     codesign --verify --strict "$APP_PATH" && echo "Signature verified." || { echo "ERROR: Signature verification failed"; exit 1; }
 fi
 
-echo "Variant: $VARIANT | Arch: $ARCH"
+echo "Flavor: $APP_FLAVOR | Variant: $VARIANT | Arch: $ARCH"
 
 # Remove quarantine flag that macOS adds to downloaded apps.
 # This flag can silently prevent Accessibility permission from working.

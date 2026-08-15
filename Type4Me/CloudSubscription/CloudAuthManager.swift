@@ -179,9 +179,9 @@ enum CloudAuthError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notConfigured: return "mytype Cloud is not configured"
-        case .invalidCode: return "Invalid or expired verification code"
-        case .serverError(let msg): return "Server error: \(msg)"
+        case .notConfigured: return L("MyType Cloud 尚未配置", "MyType Cloud is not configured")
+        case .invalidCode: return L("验证码无效或已过期", "Invalid or expired verification code")
+        case .serverError(let msg): return L("服务器错误：\(msg)", "Server error: \(msg)")
         }
     }
 }

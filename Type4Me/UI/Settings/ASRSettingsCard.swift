@@ -32,6 +32,21 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
         ASRProviderRegistry.configType(for: selectedASRProvider)?.credentialFields ?? []
     }
 
+    private var displayedASRFields: [CredentialField] {
+        guard selectedASRProvider == .volcano else { return currentASRFields }
+        let authMode = VolcanoASRConfig.inferredAuthMode(in: effectiveASRValues)
+        return currentASRFields.filter { field in
+            switch field.key {
+            case "apiKey":
+                return authMode == VolcanoASRConfig.authModeAPIKey
+            case "appKey", "accessKey":
+                return authMode == VolcanoASRConfig.authModeLegacy
+            default:
+                return true
+            }
+        }
+    }
+
     private var isZeroCredentialProvider: Bool {
         currentASRFields.isEmpty && !selectedASRProvider.isLocal
     }
@@ -78,29 +93,41 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
         case .volcano:
             return [
                 (L("配置指南", "Setup guide"), L("查看", "view"), URL(string: "https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr")!),
+                ("API Key", L("获取", "get"), URL(string: "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default")!),
+                (L("官方文档", "Docs"), L("查看", "view"), URL(string: "https://www.volcengine.com/docs/6561/1354869?lang=zh")!),
             ]
         case .deepgram:
             return [
                 (L("可用模型", "Models"), L("查看", "view"), URL(string: "https://developers.deepgram.com/docs/models-languages-overview/")!),
-                ("API Key", L("获取", "get"), URL(string: "https://developers.deepgram.com/docs/create-additional-api-keys")!),
+                (L("API Key", "API Key"), L("获取", "get"), URL(string: "https://developers.deepgram.com/docs/create-additional-api-keys")!),
             ]
         case .assemblyai:
             return [
                 (L("可用模型", "Models"), L("查看", "view"), URL(string: "https://www.assemblyai.com/docs/getting-started/models")!),
-                ("API Key", L("获取", "get"), URL(string: "https://www.assemblyai.com/docs/faq/how-to-get-your-api-key")!),
+                (L("API Key", "API Key"), L("获取", "get"), URL(string: "https://www.assemblyai.com/docs/faq/how-to-get-your-api-key")!),
             ]
         case .elevenlabs:
             return [
-                ("API Key", L("获取", "get"), URL(string: "https://elevenlabs.io/app/settings/api-keys")!),
+                (L("API Key", "API Key"), L("获取", "get"), URL(string: "https://elevenlabs.io/app/settings/api-keys")!),
+            ]
+        case .grok:
+            return [
+                ("API Key", L("获取", "get"), URL(string: "https://console.x.ai/team/default/api-keys")!),
+                (L("文档", "Docs"), L("查看", "view"), URL(string: "https://docs.x.ai/developers/model-capabilities/audio/speech-to-text")!),
             ]
         case .soniox:
             return [
-                ("API Key", L("获取", "get"), URL(string: "https://console.soniox.com")!),
+                (L("API Key", "API Key"), L("获取", "get"), URL(string: "https://console.soniox.com")!),
             ]
         case .bailian:
             return [
                 (L("可用模型", "Models"), L("查看", "view"), URL(string: "https://help.aliyun.com/zh/model-studio/fun-asr-realtime-websocket-api")!),
-                ("API Key", L("获取", "get"), URL(string: "https://help.aliyun.com/zh/model-studio/get-api-key")!),
+                (L("API Key", "API Key"), L("获取", "get"), URL(string: "https://help.aliyun.com/zh/model-studio/get-api-key")!),
+            ]
+        case .stepfunBatch:
+            return [
+                (L("接入文档", "Setup guide"), L("查看", "view"), URL(string: "https://platform.stepfun.com/docs/zh/api-reference/audio/asr-sse")!),
+                ("API Key", L("获取", "get"), URL(string: "https://platform.stepfun.com/interface-key")!),
             ]
         default:
             return []
@@ -119,8 +146,18 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
 
     private var currentProviderNote: String? {
         switch selectedASRProvider {
+        case .volcano:
+            return L(
+                "新版控制台使用 API Key；旧版控制台继续使用 App ID + Access Token。选择 API Key 时优先走新版鉴权。",
+                "Use an API Key with the new console, or App ID + Access Token with the legacy console. API Key mode uses the new authentication flow."
+            )
         case .deepgram:
             return L("受接口限制，热词仅取前 30 个", "Due to API limits, only the first 30 hotwords are used")
+        case .stepfunBatch:
+            return L(
+                "松开快捷键后提交完整录音；Step Plan 与标准按量付费需显式选择",
+                "The complete recording is submitted after you release the hotkey; explicitly choose Step Plan or standard pay-as-you-go"
+            )
         default:
             return nil
         }
@@ -156,6 +193,12 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                 }
                 .padding(.bottom, 4)
             }
+            if let note = currentProviderNote {
+                Text(note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .padding(.bottom, 4)
+            }
             SettingsDivider()
 
             if selectedASRProvider.isLocal {
@@ -172,35 +215,39 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                     dynamicCredentialFields
                 }
 
-                HStack(spacing: 8) {
-                    Spacer()
-                    testButton(L("测试连接", "Test"), status: asrTestStatus) { testASRConnection() }
-                        .disabled(
-                            !hasASRCredentials
-                                || !isASRProviderAvailable
-                                || credentialReadError != nil
-                        )
-                    if isZeroCredentialProvider {
-                        EmptyView()
-                    } else if hasASRCredentials && !isEditingASR {
-                        secondaryButton(L("修改", "Edit")) {
-                            testTask?.cancel()
-                            asrTestStatus = .idle
-                            asrCredentialValues = [:]
-                            editedFields = []
-                            isEditingASR = true
-                        }
-                    } else {
-                        if hasASRCredentials && hasStoredASR {
-                            secondaryButton(L("取消", "Cancel")) {
+                VStack(alignment: .trailing, spacing: 0) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Spacer()
+                        testButton(
+                            L("测试连接", "Test"),
+                            status: asrTestStatus,
+                            isEnabled: hasASRCredentials
+                                && isASRProviderAvailable
+                                && credentialReadError == nil
+                        ) { testASRConnection() }
+                        if isZeroCredentialProvider {
+                            EmptyView()
+                        } else if hasASRCredentials && !isEditingASR {
+                            secondaryButton(L("修改", "Edit")) {
                                 testTask?.cancel()
                                 asrTestStatus = .idle
-                                loadASRCredentials()
+                                asrCredentialValues = [:]
+                                editedFields = []
+                                isEditingASR = true
                             }
+                        } else {
+                            if hasASRCredentials && hasStoredASR {
+                                secondaryButton(L("取消", "Cancel")) {
+                                    testTask?.cancel()
+                                    asrTestStatus = .idle
+                                    loadASRCredentials()
+                                }
+                            }
+                            primaryButton(L("保存", "Save")) { saveASRCredentials() }
+                                .disabled(!hasASRCredentials || credentialReadError != nil)
                         }
-                        primaryButton(L("保存", "Save")) { saveASRCredentials() }
-                            .disabled(!hasASRCredentials || credentialReadError != nil)
                     }
+                    testStatusMessage(status: asrTestStatus)
                 }
                 .padding(.top, 12)
 
@@ -216,9 +263,6 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                         .foregroundStyle(TF.settingsAccentAmber)
                         .padding(.top, 4)
                 }
-
-
-
             }
         }
         .task {
@@ -325,10 +369,13 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                     serverRunning = false
                 }
             }
-            // Start both servers when user explicitly switches to local ASR
+            // Start local services when user explicitly switches to local ASR.
+            // Preserve the user's SenseVoice preview preference; if both engines
+            // were off, keep Qwen3 final enabled so local ASR still has an engine.
             if newProvider == .sherpa {
-                sensevoiceEnabled = true
-                qwen3FinalEnabled = true
+                if !sensevoiceEnabled && !qwen3FinalEnabled {
+                    qwen3FinalEnabled = true
+                }
                 startServer()
             }
         }
@@ -337,7 +384,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     // MARK: - Credential Fields
 
     private var dynamicCredentialFields: some View {
-        let fields = currentASRFields
+        let fields = displayedASRFields
         let rows = stride(from: 0, to: fields.count, by: 2).map { i in
             Array(fields[i..<min(i+2, fields.count)])
         }
@@ -402,7 +449,7 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
 
     private var asrSummaryRows: [(String, String)] {
         var rows: [(String, String)] = []
-        for field in currentASRFields {
+        for field in displayedASRFields {
             let val = asrCredentialValues[field.key] ?? ""
             guard !val.isEmpty else { continue }
             let displayValue: String
@@ -438,13 +485,17 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
         VStack(alignment: .leading, spacing: 12) {
             if localModelAvailable {
                 HStack(spacing: 12) {
-                    // Left: 流式识别引擎 (always on)
-                    staticEngineBlock(
+                    // Left: 流式识别引擎
+                    localEngineBlock(
                         icon: "waveform",
                         name: "SenseVoice",
                         subtitle: L("流式识别引擎", "Streaming Engine"),
-                        description: L("基础识别模型，流式识别，支持实时展示。内存占用约 500MB。",
-                                       "Base model, streaming ASR, real-time display. ~500MB memory.")
+                        description: L("录音期间实时出字。关闭后仅使用 Qwen3-ASR 最终识别，可释放约 500MB 内存。",
+                                       "Real-time preview while recording. Turn it off to use only Qwen3-ASR final transcription and free ~500MB."),
+                        isRunning: sensevoiceEnabled,
+                        isToggling: false,
+                        onStart: { toggleSenseVoice(true) },
+                        onStop: { toggleSenseVoice(false) }
                     )
 
                     // Right: 精准识别引擎
@@ -642,9 +693,17 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     }
 
     private func toggleSenseVoice(_ enabled: Bool) {
-        // SenseVoice is native sherpa-onnx, no server process to manage.
+        if !enabled && !qwen3FinalEnabled {
+            guard hasQwen3ASR else { return }
+            toggleQwen3(true)
+        }
         sensevoiceEnabled = enabled
-        serverRunning = enabled
+        serverRunning = enabled || qwen3Running
+        if !enabled {
+            #if HAS_SHERPA_ONNX
+            SenseVoiceASRClient.releaseCachedModels()
+            #endif
+        }
     }
 
     private func toggleQwen3(_ enabled: Bool) {
@@ -660,6 +719,9 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
                 } catch {
                     NSLog("[ASRSettings] Qwen3 start failed: %@", String(describing: error))
                     qwen3FinalEnabled = false
+                    if !sensevoiceEnabled {
+                        sensevoiceEnabled = true
+                    }
                     qwen3StartError = extractStartError(error)
                 }
             } else {
@@ -870,6 +932,9 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
     }
 
     private static func describeConnectionError(_ error: Error) -> String {
+        if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
+            return localized
+        }
         if let volc = error as? VolcASRError, case .serverRejected(_, let message) = volc {
             return message ?? L("服务器拒绝连接", "Server rejected")
         }
@@ -878,14 +943,33 @@ struct ASRSettingsCard: View, SettingsCardHelpers {
             return code.map { "\(desc) (\($0))" } ?? desc
         }
         if let urlError = error as? URLError {
+            if let response = (urlError as NSError).userInfo["NSErrorFailingURLResponseKey"] as? HTTPURLResponse {
+                return httpStatusMessage(statusCode: response.statusCode)
+            }
             switch urlError.code {
             case .notConnectedToInternet: return L("网络未连接", "No internet")
             case .timedOut: return L("连接超时", "Timed out")
             case .cannotFindHost, .cannotConnectToHost: return L("无法连接服务器", "Cannot reach server")
+            case .badServerResponse:
+                return L("服务器响应异常，请检查鉴权凭证是否正确", "Bad server response — check your credentials")
             default: return urlError.localizedDescription
             }
         }
         return L("连接失败", "Connection failed") + ": " + error.localizedDescription
+    }
+
+    private static func httpStatusMessage(statusCode: Int) -> String {
+        switch statusCode {
+        case 401:
+            return L("鉴权凭证无效或已禁用", "Invalid or disabled credentials") + " (HTTP 401)"
+        case 403:
+            return L("鉴权凭证无权限访问该服务", "Credentials not authorized for this service") + " (HTTP 403)"
+        case 429:
+            return L("请求过于频繁", "Too many requests") + " (HTTP 429)"
+        default:
+            let reason = HTTPURLResponse.localizedString(forStatusCode: statusCode)
+            return L("服务器拒绝连接", "Server rejected connection") + " (HTTP \(statusCode): \(reason))"
+        }
     }
 
     private func currentASRRequestOptions(enablePunc: Bool) -> ASRRequestOptions {

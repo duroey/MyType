@@ -189,4 +189,73 @@ final class HistoryStoreTests: XCTestCase {
         let text = String(data: data, encoding: .utf8) ?? ""
         return text.split(separator: "\n").filter { $0.contains(path) }.count
     }
+
+    func testUsageBreakdownGroupsByProviderAndPeriods() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let records: [HistoryRecord] = [
+            HistoryRecord(
+                id: "soniox-now", createdAt: now.addingTimeInterval(-60), durationSeconds: 30,
+                rawText: "a", processingMode: nil, processedText: nil,
+                finalText: "a", status: "completed", characterCount: 1, asrProvider: "Soniox",
+                asrModel: "Soniox · stt-rt-v5"
+            ),
+            HistoryRecord(
+                id: "soniox-week", createdAt: now.addingTimeInterval(-3 * 24 * 60 * 60), durationSeconds: 90,
+                rawText: "b", processingMode: nil, processedText: nil,
+                finalText: "b", status: "completed", characterCount: 1, asrProvider: "Soniox",
+                asrModel: "Soniox · stt-rt-v5"
+            ),
+            HistoryRecord(
+                id: "openai-month", createdAt: now.addingTimeInterval(-10 * 24 * 60 * 60), durationSeconds: 120,
+                rawText: "c", processingMode: nil, processedText: nil,
+                finalText: "c", status: "completed", characterCount: 1, asrProvider: "OpenAI"
+            ),
+            HistoryRecord(
+                id: "old", createdAt: now.addingTimeInterval(-40 * 24 * 60 * 60), durationSeconds: 300,
+                rawText: "d", processingMode: nil, processedText: nil,
+                finalText: "d", status: "completed", characterCount: 1, asrProvider: "Old"
+            ),
+            HistoryRecord(
+                id: "elevenlabs-scribe", createdAt: now.addingTimeInterval(-2 * 24 * 60 * 60), durationSeconds: 45,
+                rawText: "e", processingMode: nil, processedText: nil,
+                finalText: "e", status: "completed", characterCount: 1, asrProvider: "ElevenLabs",
+                asrModel: "ElevenLabs · scribe_v2_realtime"
+            ),
+            HistoryRecord(
+                id: "elevenlabs-default", createdAt: now.addingTimeInterval(-40 * 24 * 60 * 60), durationSeconds: 75,
+                rawText: "f", processingMode: nil, processedText: nil,
+                finalText: "f", status: "completed", characterCount: 1, asrProvider: "ElevenLabs",
+                asrModel: "ElevenLabs"
+            ),
+            HistoryRecord(
+                id: "unknown", createdAt: now.addingTimeInterval(-60), durationSeconds: 60,
+                rawText: "g", processingMode: nil, processedText: nil,
+                finalText: "g", status: "completed", characterCount: 1, asrProvider: nil
+            )
+        ]
+
+        for record in records {
+            await store.insert(record)
+        }
+
+        let rows = await store.getUsageBreakdown(now: now)
+        let byModel = Dictionary(uniqueKeysWithValues: rows.map { ($0.modelName, $0) })
+
+        XCTAssertEqual(byModel["Soniox · stt-rt-v5"]?.lastDayDuration ?? 0, 30, accuracy: 0.01)
+        XCTAssertEqual(byModel["Soniox · stt-rt-v5"]?.last7DaysDuration ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(byModel["Soniox · stt-rt-v5"]?.last30DaysDuration ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(byModel["Soniox · stt-rt-v5"]?.allTimeDuration ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(byModel["OpenAI"]?.lastDayDuration ?? 0, 0, accuracy: 0.01)
+        XCTAssertEqual(byModel["OpenAI"]?.last7DaysDuration ?? 0, 0, accuracy: 0.01)
+        XCTAssertEqual(byModel["OpenAI"]?.last30DaysDuration ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(byModel["OpenAI"]?.allTimeDuration ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(byModel["Old"]?.last30DaysDuration ?? 0, 0, accuracy: 0.01)
+        XCTAssertEqual(byModel["Old"]?.allTimeDuration ?? 0, 300, accuracy: 0.01)
+        XCTAssertEqual(rows.filter { $0.modelName == "ElevenLabs" }.count, 1)
+        XCTAssertEqual(byModel["ElevenLabs"]?.recordCount, 2)
+        XCTAssertEqual(byModel["ElevenLabs"]?.last30DaysDuration ?? 0, 45, accuracy: 0.01)
+        XCTAssertEqual(byModel["ElevenLabs"]?.allTimeDuration ?? 0, 120, accuracy: 0.01)
+        XCTAssertEqual(rows.last?.modelName, L("未知", "Unknown"))
+        XCTAssertEqual(rows.dropLast().map(\.allTimeDuration), rows.dropLast().map(\.allTimeDuration).sorted(by: >))
+    }
 }

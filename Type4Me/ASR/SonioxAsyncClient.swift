@@ -151,7 +151,7 @@ enum SonioxAsyncClient {
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let fileId = json?["id"] as? String else {
-            throw SonioxAsyncError.invalidResponse("Missing file id")
+            throw SonioxAsyncError.invalidResponse(L("缺少文件 ID", "Missing file id"))
         }
         return fileId
     }
@@ -169,7 +169,7 @@ enum SonioxAsyncClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         var config: [String: Any] = [
-            "model": "stt-async-v4",
+            "model": SonioxASRConfig.asyncModel,
             "file_id": fileId,
             "language_hints": ["zh", "en"],
             "language_hints_strict": true,
@@ -195,7 +195,7 @@ enum SonioxAsyncClient {
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let transcriptionId = json?["id"] as? String else {
-            throw SonioxAsyncError.invalidResponse("Missing transcription id")
+            throw SonioxAsyncError.invalidResponse(L("缺少转写 ID", "Missing transcription id"))
         }
         return transcriptionId
     }
@@ -246,7 +246,7 @@ enum SonioxAsyncClient {
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let tokens = json?["tokens"] as? [[String: Any]] else {
-            throw SonioxAsyncError.invalidResponse("Missing tokens")
+            throw SonioxAsyncError.invalidResponse(L("缺少识别 token", "Missing tokens"))
         }
 
         let text = tokens
@@ -316,10 +316,10 @@ enum SonioxAsyncError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidResponse(let msg): return "Soniox async: \(msg)"
-        case .transcriptionFailed(let msg): return "Soniox async failed: \(msg)"
-        case .httpError(let status, let body): return "Soniox async HTTP \(status): \(body)"
-        case .timeout: return "Soniox async transcription timed out"
+        case .invalidResponse(let msg): return L("Soniox 异步识别返回无效：\(msg)", "Soniox async: \(msg)")
+        case .transcriptionFailed(let msg): return L("Soniox 异步识别失败：\(msg)", "Soniox async failed: \(msg)")
+        case .httpError(let status, let body): return L("Soniox 异步识别 HTTP \(status)：\(body)", "Soniox async HTTP \(status): \(body)")
+        case .timeout: return L("Soniox 异步识别超时", "Soniox async transcription timed out")
         }
     }
 }

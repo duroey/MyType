@@ -14,9 +14,11 @@ enum ASRProvider: String, CaseIterable, Codable, Sendable {
     case deepgram
     case assemblyai
     case elevenlabs
+    case grok
     case soniox
     // China
     case volcano
+    case stepfunBatch
     case aliyun
     case bailian
     case tencent
@@ -32,7 +34,7 @@ enum ASRProvider: String, CaseIterable, Codable, Sendable {
     var displayName: String {
         switch self {
         case .sherpa:   return L("SenseVoice 流式 + Qwen3 ASR 校准", "SenseVoice Streaming + Qwen3 ASR")
-        case .apple:    return "Apple Speech"
+        case .apple:    return L("Apple 语音识别", "Apple Speech")
         case .openai:   return "OpenAI"
         case .azure:    return "Azure Speech"
         case .google:   return "Google Cloud STT"
@@ -40,8 +42,10 @@ enum ASRProvider: String, CaseIterable, Codable, Sendable {
         case .deepgram: return "Deepgram"
         case .assemblyai: return "AssemblyAI"
         case .elevenlabs: return "ElevenLabs"
+        case .grok:     return "Grok"
         case .soniox:   return "Soniox"
         case .volcano:  return L("火山引擎 (Doubao)", "Volcano (Doubao)")
+        case .stepfunBatch: return L("阶跃星辰（非实时）", "StepFun (Batch)")
         case .aliyun:   return L("阿里云", "Alibaba Cloud")
         case .bailian:  return L("阿里云百炼", "Alibaba Cloud Bailian")
         case .tencent:  return L("腾讯云", "Tencent Cloud")

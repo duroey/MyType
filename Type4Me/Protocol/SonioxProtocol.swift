@@ -8,11 +8,11 @@ enum SonioxProtocolError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint:
-            return "Failed to build Soniox WebSocket URL"
+            return L("无法生成 Soniox WebSocket URL", "Failed to build Soniox WebSocket URL")
         case .invalidMessage:
-            return "Invalid Soniox streaming message"
+            return L("Soniox 流式消息无效", "Invalid Soniox streaming message")
         case .invalidStartMessage:
-            return "Invalid Soniox start message"
+            return L("Soniox 启动消息无效", "Invalid Soniox start message")
         }
     }
 }
@@ -39,6 +39,7 @@ enum SonioxProtocol {
 
     private static let endpoint = "wss://stt-rt.soniox.com/transcribe-websocket"
     private static let ignoredMarkerTokens: Set<String> = ["<end>", "<fin>"]
+    private static let maxEndpointDelayMs = 2000
 
     static func buildWebSocketURL(override: String? = nil) throws -> URL {
         let urlString = override ?? endpoint
@@ -59,7 +60,8 @@ enum SonioxProtocol {
             "sample_rate": 16000,
             "num_channels": 1,
             "enable_endpoint_detection": true,
-            "max_endpoint_delay_ms": 10000,
+            "endpoint_sensitivity": config.endpointSensitivity,
+            "max_endpoint_delay_ms": maxEndpointDelayMs,
             "language_hints": ["zh", "en"],
             "language_hints_strict": true,
         ]

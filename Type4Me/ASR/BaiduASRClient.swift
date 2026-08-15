@@ -9,14 +9,14 @@ enum BaiduASRError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider:
-            return "BaiduASRClient requires BaiduASRConfig"
+            return L("百度识别配置无效", "BaiduASRClient requires BaiduASRConfig")
         case .handshakeTimedOut:
-            return "Baidu realtime ASR WebSocket handshake timed out"
+            return L("百度实时识别握手超时", "Baidu realtime ASR WebSocket handshake timed out")
         case .closedBeforeHandshake(let code, let reason):
             if let reason, !reason.isEmpty {
-                return "Baidu realtime ASR WebSocket closed before handshake completed (\(code)): \(reason)"
+                return L("百度实时识别连接在握手完成前关闭（\(code)）：\(reason)", "Baidu realtime ASR WebSocket closed before handshake completed (\(code)): \(reason)")
             }
-            return "Baidu realtime ASR WebSocket closed before handshake completed (\(code))"
+            return L("百度实时识别连接在握手完成前关闭（\(code)）", "Baidu realtime ASR WebSocket closed before handshake completed (\(code))")
         }
     }
 }

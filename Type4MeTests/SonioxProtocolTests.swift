@@ -14,7 +14,8 @@ final class SonioxProtocolTests: XCTestCase {
     func testBuildStartMessage_includesPCMConfigAndContextTerms() throws {
         let config = try XCTUnwrap(SonioxASRConfig(credentials: [
             "apiKey": "soniox_test_key",
-            "model": "stt-rt-v4",
+            "model": "stt-rt-v5",
+            "endpointSensitivity": "-0.5",
         ]))
 
         let message = try SonioxProtocol.buildStartMessage(
@@ -29,11 +30,13 @@ final class SonioxProtocolTests: XCTestCase {
         )
 
         XCTAssertEqual(payload["api_key"] as? String, "soniox_test_key")
-        XCTAssertEqual(payload["model"] as? String, "stt-rt-v4")
+        XCTAssertEqual(payload["model"] as? String, "stt-rt-v5")
         XCTAssertEqual(payload["audio_format"] as? String, "pcm_s16le")
         XCTAssertEqual(payload["sample_rate"] as? Int, 16000)
         XCTAssertEqual(payload["num_channels"] as? Int, 1)
         XCTAssertEqual(payload["enable_endpoint_detection"] as? Bool, true)
+        XCTAssertEqual(payload["endpoint_sensitivity"] as? Double, -0.5)
+        XCTAssertEqual(payload["max_endpoint_delay_ms"] as? Int, 2000)
 
         // Language hints
         let hints = try XCTUnwrap(payload["language_hints"] as? [String])

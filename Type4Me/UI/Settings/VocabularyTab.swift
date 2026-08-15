@@ -133,7 +133,7 @@ struct VocabularyTab: View {
         ScrollViewReader { proxy in
         VStack(alignment: .leading, spacing: 0) {
             SettingsSectionHeader(
-                label: "VOCABULARY",
+                label: L("词汇", "VOCABULARY"),
                 title: L("词汇管理", "Vocabulary"),
                 description: L("热词提升识别准确率，片段替换实现语音快捷输入。", "Hotwords improve recognition accuracy. Snippets enable voice shortcuts.")
             )
