@@ -76,6 +76,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let showDock = UserDefaults.standard.object(forKey: "tf_showDockIcon") as? Bool ?? true
         NSApp.setActivationPolicy(showDock ? .regular : .accessory)
         KeychainService.migrateIfNeeded()
+        do {
+            let outcome = try BundledCredentialBootstrap.importIfAvailable()
+            if case .completed(let asrImported, let llmImported) = outcome {
+                NSLog(
+                    "[BundledCredentialBootstrap] Import completed ASR=%@ LLM=%@",
+                    asrImported.description,
+                    llmImported.description
+                )
+            }
+        } catch {
+            NSLog(
+                "[BundledCredentialBootstrap] Import failed: %@",
+                error.localizedDescription
+            )
+        }
         HotwordStorage.migrateIfNeeded()
         SnippetStorage.migrateIfNeeded()
         AudioInputDevicePreferenceStore.migrateIfNeeded()

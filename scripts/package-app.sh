@@ -34,6 +34,7 @@ APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 VARIANT="${VARIANT:-cloud}"    # cloud or local
 ARCH="${ARCH:-universal}"      # arm64 or universal
+BUNDLED_CREDENTIALS_FILE="${BUNDLED_CREDENTIALS_FILE:-}"
 MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-mytype 需要访问麦克风以录制语音并将其转换为文本。}"
 SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-mytype 需要语音识别权限以将你的语音转写为文字。}"
 APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-mytype 需要辅助功能权限来注入转写文字到其他应用}"
@@ -195,6 +196,29 @@ EOF
 
 mkdir -p "$APP_PATH/Contents/Resources/Sounds"
 cp "$PROJECT_DIR/Type4Me/Resources/Sounds/"*.wav "$APP_PATH/Contents/Resources/Sounds/" 2>/dev/null || true
+
+BUNDLED_CREDENTIALS_RESOURCE="$APP_PATH/Contents/Resources/MyTypeCredentials.json"
+rm -f "$BUNDLED_CREDENTIALS_RESOURCE"
+if [ -n "$BUNDLED_CREDENTIALS_FILE" ]; then
+    if [ ! -f "$BUNDLED_CREDENTIALS_FILE" ]; then
+        echo "ERROR: Bundled credential payload does not exist"
+        exit 1
+    fi
+    if ! swift -e '
+        import Foundation
+        let url = URL(fileURLWithPath: CommandLine.arguments[1])
+        let data = try Data(contentsOf: url)
+        _ = try JSONSerialization.jsonObject(with: data)
+    ' "$BUNDLED_CREDENTIALS_FILE" >/dev/null 2>&1; then
+        echo "ERROR: Bundled credential payload is not valid JSON"
+        exit 1
+    fi
+    cp "$BUNDLED_CREDENTIALS_FILE" "$BUNDLED_CREDENTIALS_RESOURCE"
+    chmod 600 "$BUNDLED_CREDENTIALS_RESOURCE"
+    echo "Bundled credential bootstrap: enabled"
+else
+    echo "Bundled credential bootstrap: disabled"
+fi
 
 # --- Models and local ASR server (local variant only) ---
 if [ "$VARIANT" = "local" ]; then
