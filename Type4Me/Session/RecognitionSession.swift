@@ -364,6 +364,24 @@ actor RecognitionSession {
 
     // MARK: - Start
 
+    /// Resolves the prompt context required by a recording mode.
+    ///
+    /// Args:
+    ///   executionKind: Execution behavior of the effective processing mode.
+    ///   capture: Asynchronous provider used to capture selection context.
+    ///
+    /// Returns:
+    ///   Captured context for Selection Ask, or an empty context for recording modes.
+    static func resolvePromptContext(
+        for executionKind: ProcessingMode.ExecutionKind,
+        capture: @Sendable () async -> PromptContext = { await PromptContext.capture() }
+    ) async -> PromptContext {
+        guard executionKind == .selectionAsk else {
+            return PromptContext(selectedText: "", clipboardText: "")
+        }
+        return await capture()
+    }
+
     /// Starts a recognition session.
     ///
     /// Args:
@@ -551,8 +569,8 @@ actor RecognitionSession {
             bypassProxy: ProxyBypassMode.current.bypassASR
         )
 
-        // Capture prompt context while the user's selection is still active.
-        promptContext = await PromptContext.capture()
+        // Only Selection Ask consumes selected text; other modes must not block recording on capture.
+        promptContext = await Self.resolvePromptContext(for: effectiveMode.executionKind)
         guard sessionGeneration == myGeneration else {
             DebugFileLogger.log("startRecording: zombie detected after capture, bailing")
             return

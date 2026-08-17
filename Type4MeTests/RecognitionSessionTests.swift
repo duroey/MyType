@@ -1,6 +1,20 @@
 import XCTest
 @testable import Type4Me
 
+private actor PromptContextCaptureSpy {
+    private(set) var callCount = 0
+    private let capturedContext: PromptContext
+
+    init(capturedContext: PromptContext) {
+        self.capturedContext = capturedContext
+    }
+
+    func capture() -> PromptContext {
+        callCount += 1
+        return capturedContext
+    }
+}
+
 final class RecognitionSessionTests: XCTestCase {
     override func tearDown() {
         KeychainService.selectedASRProvider = .volcano
@@ -69,6 +83,35 @@ final class RecognitionSessionTests: XCTestCase {
 
         let mode = await session.currentModeForTesting()
         XCTAssertEqual(mode.id, ProcessingMode.directId)
+    }
+
+    func testResolvePromptContextSkipsCaptureForRecordingMode() async {
+        let spy = PromptContextCaptureSpy(
+            capturedContext: PromptContext(selectedText: "stale selection", clipboardText: "stale clipboard")
+        )
+
+        let context = await RecognitionSession.resolvePromptContext(for: .recording) {
+            await spy.capture()
+        }
+        let callCount = await spy.callCount
+
+        XCTAssertEqual(callCount, 0)
+        XCTAssertTrue(context.selectedText.isEmpty)
+        XCTAssertTrue(context.clipboardText.isEmpty)
+    }
+
+    func testResolvePromptContextCapturesForSelectionAskMode() async {
+        let expected = PromptContext(selectedText: "selected text", clipboardText: "clipboard text")
+        let spy = PromptContextCaptureSpy(capturedContext: expected)
+
+        let context = await RecognitionSession.resolvePromptContext(for: .selectionAsk) {
+            await spy.capture()
+        }
+        let callCount = await spy.callCount
+
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(context.selectedText, expected.selectedText)
+        XCTAssertEqual(context.clipboardText, expected.clipboardText)
     }
 
     func testShouldAttemptBatchFallbackWhenStreamingErrorWasObserved() {
