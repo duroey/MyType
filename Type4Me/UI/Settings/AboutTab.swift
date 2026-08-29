@@ -2,17 +2,21 @@ import SwiftUI
 
 struct AboutTab: View {
 
+    var showsHeader = true
+
     @Environment(AppState.self) private var appState
     @Environment(AppUpdater.self) private var appUpdater
     @State private var showIssueReporter = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SettingsSectionHeader(
-                label: L("关于", "ABOUT"),
-                title: L("关于 MyType", "About MyType"),
-                description: L("语音，流畅输入。基于火山引擎大模型语音识别的 macOS 原生输入工具。", "Voice to text, seamlessly. A native macOS input tool powered by large-model ASR.")
-            )
+            if showsHeader {
+                SettingsSectionHeader(
+                    label: L("关于", "ABOUT"),
+                    title: L("关于 MyType", "About MyType"),
+                    description: L("语音，流畅输入。基于火山引擎大模型语音识别的 macOS 原生输入工具。", "Voice to text, seamlessly. A native macOS input tool powered by large-model ASR.")
+                )
+            }
 
             Spacer().frame(height: 8)
 

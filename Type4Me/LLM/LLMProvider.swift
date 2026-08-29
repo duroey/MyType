@@ -199,6 +199,9 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
         case .zhipu:
             // thinking: { type: "disabled" } (GLM-5.x / GLM-4.7)
             return .thinking
+        case .openrouter:
+            // reasoning: { effort: "none" }
+            return .reasoning
         case .ollama:
             // think: false
             return .think
@@ -206,7 +209,6 @@ enum LLMProvider: String, CaseIterable, Codable, Sendable {
             // OpenAI: defaults to none already for GPT-5.2+, risky for o3
             // Gemini: OpenAI-compat layer doesn't reliably support it
             // MiniMax: API doesn't support disabling reasoning (use needsReasoningSplit instead)
-            // OpenRouter: proxy, can't generically handle
             return nil
         }
     }
@@ -228,8 +230,41 @@ enum ThinkingDisableField: Equatable {
     case enableThinking
     /// `reasoning_effort: "none"` — providers that still expose OpenAI-style effort control
     case reasoningEffort
+    /// `reasoning: { effort: "none" }` — OpenRouter's unified reasoning control
+    case reasoning
     /// `think: false` — Ollama
     case think
+}
+
+// MARK: - Thinking Preference
+
+enum LLMThinkingPreference {
+    private static let sharedKey = "tf_disableThinking"
+    private static let openRouterKey = "tf_disableThinking_openrouter"
+
+    /// OpenRouter fronts models with different reasoning requirements, including
+    /// models where reasoning is mandatory. Keep its default provider-controlled
+    /// until the user explicitly opts out, while preserving the existing default
+    /// for direct providers.
+    static func isDisabled(
+        for provider: LLMProvider,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let key = provider == .openrouter ? openRouterKey : sharedKey
+        guard let value = defaults.object(forKey: key) as? Bool else {
+            return provider != .openrouter
+        }
+        return value
+    }
+
+    static func setDisabled(
+        _ disabled: Bool,
+        for provider: LLMProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        let key = provider == .openrouter ? openRouterKey : sharedKey
+        defaults.set(disabled, forKey: key)
+    }
 }
 
 // MARK: - Provider Config Protocol

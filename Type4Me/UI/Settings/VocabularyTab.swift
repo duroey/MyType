@@ -90,13 +90,75 @@ private struct ChromeTabShape: Shape {
     }
 }
 
+private struct VocabularyToolbarButton: View {
+    let title: String
+    let icon: String
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(TF.settingsTextSecondary)
+                .frame(width: 34, height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovered ? TF.settingsControlHover : TF.settingsControl)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.black.opacity(0.06), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .settingsTooltip(title)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                isHovered = hovering
+            }
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
+}
+
+private struct AddAppButtonAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>?
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
 struct VocabularyTab: View {
+
+    private enum VocabularyInputFocus: Hashable {
+        case hotword
+        case snippetTrigger
+        case snippetReplacement
+    }
+
+    @State private var selectedSection: VocabularySection = .hotwords
+    @State private var hoveredSection: VocabularySection?
+    @State private var isSearchExpanded = false
+    @State private var searchQuery = ""
+    @FocusState private var isSearchFocused: Bool
+    @FocusState private var focusedVocabularyInput: VocabularyInputFocus?
 
     // Hotwords (user file)
     @State private var hotwords: [String] = HotwordStorage.load()
     @State private var newHotword: String = ""
     @State private var showBulkHotwordsSheet = false
     @State private var bulkHotwordsText = ""
+    @State private var hoveredHotword: String?
+    @State private var editingHotword: String?
+    @State private var editingHotwordText = ""
 
     // Snippets (user file + built-in)
     @State private var snippets: [(trigger: String, value: String)] = SnippetStorage.load()
@@ -104,7 +166,11 @@ struct VocabularyTab: View {
     @State private var editReplacementText: String = ""
     @State private var newTriggerTexts: [String: String] = [:]
     @State private var newTrigger: String = ""
+    @State private var newSnippetTriggers: [String] = []
     @State private var newValue: String = ""
+    @State private var hoveredSnippetGroup: String? = nil
+    @State private var hoveredAppScopeKey: String? = nil
+    @State private var isAddAppHovered = false
     @State private var showBulkSnippetsSheet = false
     @State private var bulkSnippetsText = ""
 
@@ -131,175 +197,72 @@ struct VocabularyTab: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsSectionHeader(
-                label: L("词汇", "VOCABULARY"),
-                title: L("词汇管理", "Vocabulary"),
-                description: L("热词提升识别准确率，片段替换实现语音快捷输入。", "Hotwords improve recognition accuracy. Snippets enable voice shortcuts.")
-            )
+            VStack(alignment: .leading, spacing: 0) {
+                SettingsSectionHeader(
+                    label: L("词汇", "VOCABULARY"),
+                    title: L("词汇管理", "Vocabulary"),
+                    description: L("热词提升识别准确率，片段替换实现语音快捷输入。", "Hotwords improve recognition accuracy. Snippets enable voice shortcuts.")
+                )
 
-            // MARK: - Hotwords
-            HStack(spacing: 8) {
-                Text(L("ASR 热词", "ASR Hotwords"))
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(TF.settingsText)
-                sortToggle($hotwordSort)
-                bulkEditButton { showBulkHotwordsSheet = true }
-            }
-            .padding(.bottom, 4)
-
-            Text(L("添加热词，将被上传给识别引擎被优先识别。", "Added hotwords are uploaded to the ASR engine for priority recognition."))
-                .font(.system(size: 11))
-                .foregroundStyle(TF.settingsTextTertiary)
-                .padding(.bottom, 12)
-
-            // User hotwords
-            WrappingHStack(spacing: 6) {
-                ForEach(displayHotwords, id: \.self) { word in
-                    hotwordTag(word)
+                HStack(spacing: 16) {
+                    vocabularySectionPicker
+                    Spacer(minLength: 20)
+                    vocabularySectionToolbar
                 }
-
-                TextField(L("添加热词...", "Add hotword..."), text: $newHotword)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .frame(width: 100, height: 28)
-                    .padding(.horizontal, 8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(TF.settingsTextTertiary.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4]))
-                    )
-                    .onSubmit { addHotword() }
-            }
-
-            // Module separator
-            Spacer().frame(height: 20)
-            Divider()
-            Spacer().frame(height: 20)
-
-            // MARK: - Snippets
-            HStack(spacing: 8) {
-                Text(L("片段替换", "Snippets"))
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(TF.settingsText)
-                sortToggle($snippetSort)
-                bulkEditButton { showBulkSnippetsSheet = true }
-            }
-            .padding(.bottom, 4)
-
-            Text(L("本地执行规则，将任何文字替换成你想要的文字。", "Local rules that replace any text with what you want."))
-                .font(.system(size: 11))
-                .foregroundStyle(TF.settingsTextTertiary)
                 .padding(.bottom, 8)
 
-            // Tab bar (Chrome-style: feet sit on top of content area)
-            appScopeBar()
-                .zIndex(1)
+                Text(vocabularySectionDescription)
+                    .font(.system(size: 11))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .padding(.bottom, 18)
 
-            // Content area
-            VStack(alignment: .leading, spacing: 0) {
-                // Add new row
-                HStack(spacing: 8) {
-                    TextField(L("替换内容", "Replacement"), text: $newValue)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .frame(width: 152)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(TF.settingsTextTertiary.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4]))
-                        )
-
-                    Image(systemName: "arrow.left")
-                        .font(.system(size: 10))
-                        .foregroundStyle(TF.settingsTextTertiary)
-
-                    TextField(L("触发词", "Trigger"), text: $newTrigger)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .frame(width: 120)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(TF.settingsTextTertiary.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4]))
-                        )
-                        .onSubmit { addSnippet() }
-
-                    Button {
-                        addSnippet()
-                    } label: {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 16))
-                            .foregroundStyle(TF.settingsAccentGreen)
+                Group {
+                    switch selectedSection {
+                    case .hotwords:
+                        hotwordsSection
+                    case .snippets:
+                        snippetsSection
                     }
-                    .buttonStyle(.plain)
-                    .disabled(newTrigger.isEmpty || newValue.isEmpty)
                 }
-                .padding(.vertical, 8)
-
-                // Snippet list
-                ForEach(Array(displaySnippets.enumerated()), id: \.element.id) { index, group in
-                    SettingsDivider()
-                    snippetGroupView(group: group)
-                        .id("snippet-\(group.id)")
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(TF.settingsAccentGreen.opacity(0.15))
-                                .opacity(highlightedGroup == group.replacement ? 1 : 0)
-                        )
-                        .padding(.horizontal, -8)
-                }
-
-                if displaySnippets.isEmpty {
-                    Text(selectedAppScope != nil
-                         ? L("这个应用还没有专属片段，从上方添加。", "No app-specific snippets yet. Add one above.")
-                         : L("还没有片段，从上方添加。", "No snippets yet. Add one above."))
-                        .font(.system(size: 11))
-                        .foregroundStyle(TF.settingsTextTertiary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 16)
-                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
-            .background(
-                UnevenRoundedRectangle(
-                    topLeadingRadius: selectedAppScope == nil ? 0 : 10,
-                    bottomLeadingRadius: 10,
-                    bottomTrailingRadius: 10,
-                    topTrailingRadius: 10
-                )
-                .fill(TF.settingsBg)
-            )
-
-            Spacer()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .navigateToVocabulary)) { note in
-            guard let replacement = note.object as? String else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                withAnimation(.easeInOut(duration: 0.4)) {
-                    proxy.scrollTo("snippet-\(replacement)", anchor: .center)
+            .onReceive(NotificationCenter.default.publisher(for: .navigateToVocabulary)) { note in
+                if let request = note.object as? VocabularyNavigationRequest {
+                    applyNavigationRequest(request)
+                    return
                 }
-                withAnimation(.easeIn(duration: 0.3).delay(0.2)) {
-                    highlightedGroup = replacement
+                guard let replacement = note.object as? String else { return }
+                // Quick Correction always writes to the global snippet store.
+                // Reset view-only filters before resolving the scroll target so
+                // the newly added group is guaranteed to exist in the hierarchy.
+                searchQuery = ""
+                switchScope(to: nil)
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    selectedSection = .snippets
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    withAnimation(.easeOut(duration: 0.8)) {
-                        highlightedGroup = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    withAnimation(.easeInOut(duration: 0.4)) {
+                        proxy.scrollTo("snippet-\(replacement)", anchor: .center)
+                    }
+                    withAnimation(.easeIn(duration: 0.3).delay(0.2)) {
+                        highlightedGroup = replacement
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        withAnimation(.easeOut(duration: 0.8)) {
+                            highlightedGroup = nil
+                        }
                     }
                 }
             }
-        }
         } // ScrollViewReader
         .onAppear {
             hotwords = HotwordStorage.load()
             snippets = SnippetStorage.load()
             registeredApps = SnippetStorage.loadRegistry()
             seedExampleIfNeeded()
+            if let request = VocabularyNavigationCenter.shared.pendingRequest {
+                applyNavigationRequest(request)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: SnippetStorage.didChangeNotification)) { _ in
             if let bundleId = selectedAppScope {
@@ -345,61 +308,508 @@ struct VocabularyTab: View {
         }
     }
 
-    // MARK: - Sort Toggle
+    // MARK: - Primary Section Tabs
 
-    private func sortToggle(_ order: Binding<VocabSort>) -> some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.15)) {
-                order.wrappedValue.toggle()
-            }
-        } label: {
-            HStack(spacing: 3) {
-                Image(systemName: order.wrappedValue == .byTime ? "clock" : "textformat.abc")
-                    .font(.system(size: 9))
-                Text(order.wrappedValue == .byTime
-                     ? L("添加时间排序", "Sort by time added")
-                     : L("首字母排序", "Sort alphabetically"))
-                    .font(.system(size: 10))
-            }
-            .foregroundStyle(TF.settingsAccentBlue)
+    private var vocabularySectionPicker: some View {
+        HStack(spacing: 2) {
+            vocabularySectionButton(
+                .hotwords,
+                title: L("ASR 热词", "ASR Hotwords")
+            )
+            vocabularySectionButton(
+                .snippets,
+                title: L("片段替换", "Snippets")
+            )
         }
-        .buttonStyle(.plain)
+        .padding(4)
+        .background(
+            Capsule()
+                .fill(TF.settingsControl)
+        )
+        .fixedSize()
     }
 
-    private func bulkEditButton(action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 3) {
-                Image(systemName: "list.bullet.rectangle")
-                    .font(.system(size: 9))
-                Text(L("批量编辑", "Bulk Edit"))
-                    .font(.system(size: 10))
+    private func vocabularySectionButton(
+        _ section: VocabularySection,
+        title: String
+    ) -> some View {
+        let isSelected = selectedSection == section
+        let isHovered = hoveredSection == section
+
+        return Button {
+            withAnimation(.easeInOut(duration: 0.16)) {
+                selectedSection = section
             }
-            .foregroundStyle(TF.settingsAccentBlue)
+        } label: {
+            Text(title)
+                .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? TF.settingsText : TF.settingsTextSecondary)
+                .padding(.horizontal, 18)
+                .frame(height: 32)
+                .background(
+                    Capsule().fill(
+                        isSelected
+                            ? Color.white
+                            : (isHovered
+                               ? TF.settingsControlHover
+                               : Color.clear)
+                    )
+                )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                hoveredSection = hovering ? section : nil
+            }
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
+
+    private var vocabularySectionDescription: String {
+        switch selectedSection {
+        case .hotwords:
+            return L(
+                "添加热词，将被上传给识别引擎被优先识别。",
+                "Added hotwords are uploaded to the ASR engine for priority recognition."
+            )
+        case .snippets:
+            return L(
+                "本地执行规则，将任何文字替换成你想要的文字。",
+                "Local rules that replace any text with what you want."
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var vocabularySectionToolbar: some View {
+        switch selectedSection {
+        case .hotwords:
+            HStack(spacing: 7) {
+                vocabularySearchControl
+
+                VocabularyToolbarButton(
+                    title: hotwordSort == .byTime
+                        ? L("按添加时间排序", "Sort by time added")
+                        : L("按首字母排序", "Sort alphabetically"),
+                    icon: hotwordSort == .byTime ? "clock.arrow.circlepath" : "textformat.abc"
+                ) {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        hotwordSort.toggle()
+                    }
+                }
+
+                VocabularyToolbarButton(
+                    title: L("批量编辑", "Bulk Edit"),
+                    icon: "list.bullet.rectangle"
+                ) {
+                    showBulkHotwordsSheet = true
+                }
+            }
+        case .snippets:
+            HStack(spacing: 7) {
+                vocabularySearchControl
+
+                VocabularyToolbarButton(
+                    title: snippetSort == .byTime
+                        ? L("按添加时间排序", "Sort by time added")
+                        : L("按首字母排序", "Sort alphabetically"),
+                    icon: snippetSort == .byTime ? "clock.arrow.circlepath" : "textformat.abc"
+                ) {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        snippetSort.toggle()
+                    }
+                }
+
+                VocabularyToolbarButton(
+                    title: L("批量编辑", "Bulk Edit"),
+                    icon: "list.bullet.rectangle"
+                ) {
+                    showBulkSnippetsSheet = true
+                }
+            }
+        }
+    }
+
+    private var vocabularySearchControl: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(TF.settingsTextSecondary)
+
+            if isSearchExpanded {
+                TextField(L("搜索词汇", "Search vocabulary"), text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($isSearchFocused)
+                    .transition(.opacity)
+
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        searchQuery = ""
+                        isSearchExpanded = false
+                    }
+                    isSearchFocused = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, isSearchExpanded ? 10 : 0)
+        .frame(width: isSearchExpanded ? 190 : 34, height: 34)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(TF.settingsControl)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.black.opacity(0.06), lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .settingsTooltip(L("搜索", "Search"), isEnabled: !isSearchExpanded)
+        .onTapGesture {
+            guard !isSearchExpanded else { return }
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                isSearchExpanded = true
+            }
+            DispatchQueue.main.async {
+                isSearchFocused = true
+            }
+        }
+        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: isSearchExpanded)
+    }
+
+    private var hotwordAddControl: some View {
+        HStack(spacing: 10) {
+            TextField(L("输入新的热词", "Enter a new hotword"), text: $newHotword)
+                .focused($focusedVocabularyInput, equals: .hotword)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity)
+                .frame(height: 38)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(TF.settingsControl)
+                )
+                .onSubmit { addHotword() }
+
+            Button(action: addHotword) {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(newHotword.trimmingCharacters(in: .whitespaces).isEmpty
+                              ? TF.settingsTextTertiary
+                              : TF.settingsText)
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(newHotword.trimmingCharacters(in: .whitespaces).isEmpty)
+            .settingsTooltip(L("添加新热词", "Add new hotword"))
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(TF.settingsCard)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(TF.settingsBorder, lineWidth: 1)
+        )
+    }
+
+    private var hotwordsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            hotwordAddControl
+                .zIndex(3)
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 0) {
+                    WrappingHStack(spacing: 6) {
+                        ForEach(displayHotwords, id: \.self) { word in
+                            hotwordTag(word)
+                        }
+                    }
+
+                    if displayHotwords.isEmpty && isSearching {
+                        VStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 20))
+                                .foregroundStyle(TF.settingsTextTertiary)
+                            Text(L("没有匹配的热词", "No matching hotwords"))
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(TF.settingsTextSecondary)
+                            Text(L("尝试更换搜索关键词。", "Try a different search term."))
+                                .font(.system(size: 11))
+                                .foregroundStyle(TF.settingsTextTertiary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 30)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var snippetsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            appScopeBar()
+                .zIndex(4)
+
+            newSnippetEditor
+                .zIndex(3)
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(displaySnippets) { group in
+                        snippetGroupView(group: group)
+                            .id("snippet-\(group.id)")
+                    }
+
+                    if displaySnippets.isEmpty {
+                        snippetEmptyState
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.bottom, 4)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var newSnippetEditor: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                TextField(L("替换内容", "Replacement text"), text: $newValue)
+                    .focused($focusedVocabularyInput, equals: .snippetReplacement)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .padding(.horizontal, 12)
+                    .frame(width: 240, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(TF.settingsControl)
+                    )
+
+                Image(systemName: "arrow.left")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(TF.settingsTextTertiary)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(newSnippetTriggers, id: \.self) { trigger in
+                            draftTriggerTag(trigger)
+                        }
+
+                        TextField(
+                            L(
+                                "输入触发词，回车可继续添加",
+                                "Trigger · Return to add more"
+                            ),
+                            text: $newTrigger
+                        )
+                        .focused($focusedVocabularyInput, equals: .snippetTrigger)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .frame(minWidth: 130, idealWidth: 170)
+                        .onSubmit { stageNewSnippetTrigger() }
+                    }
+                    .padding(.horizontal, 10)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 38)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(TF.settingsControl)
+                )
+
+                Button(action: addSnippet) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 38, height: 38)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(canAddSnippet ? TF.settingsText : TF.settingsTextTertiary)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(!canAddSnippet)
+                .settingsTooltip(L("添加片段替换", "Add snippet"))
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(TF.settingsCard)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(TF.settingsBorder, lineWidth: 1)
+        )
+    }
+
+    private var canAddSnippet: Bool {
+        (!newSnippetTriggers.isEmpty || !newTrigger.trimmingCharacters(in: .whitespaces).isEmpty)
+            && !newValue.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private func draftTriggerTag(_ trigger: String) -> some View {
+        HStack(spacing: 5) {
+            Text(trigger)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(TF.settingsTextSecondary)
+            Button {
+                newSnippetTriggers.removeAll { $0 == trigger }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .frame(width: 13, height: 13)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.leading, 9)
+        .padding(.trailing, 6)
+        .frame(height: 26)
+        .background(Capsule().fill(Color.white.opacity(0.86)))
+        .overlay(Capsule().stroke(Color.black.opacity(0.05), lineWidth: 1))
+    }
+
+    private var snippetEmptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: isSearching ? "magnifyingglass" : "text.badge.plus")
+                .font(.system(size: 22, weight: .regular))
+                .foregroundStyle(TF.settingsTextTertiary)
+            Text(isSearching
+                 ? L("没有匹配的片段", "No matching snippets")
+                 : L("还没有片段替换规则", "No snippet rules yet"))
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(TF.settingsTextSecondary)
+            Text(isSearching
+                 ? L("尝试更换搜索关键词。", "Try a different search term.")
+                 : L("添加触发词，让常用内容一说即用。", "Add a trigger phrase to insert frequently used text instantly."))
+                .font(.system(size: 11))
+                .foregroundStyle(TF.settingsTextTertiary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 34)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.black.opacity(0.018))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(TF.settingsBorder, lineWidth: 1)
+        )
     }
 
     // MARK: - Hotword Tag
 
     private func hotwordTag(_ word: String) -> some View {
-        HStack(spacing: 4) {
-            Text(word)
-                .font(.system(size: 12))
-                .foregroundStyle(TF.settingsText)
-            Button {
-                removeHotword(word)
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(TF.settingsTextTertiary)
+        let isHovered = hoveredHotword == word
+        let isEditing = editingHotword == word
+
+        return HStack(spacing: 7) {
+            if isEditing {
+                TextField("", text: $editingHotwordText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(TF.settingsText)
+                    .frame(minWidth: 90)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .onSubmit { commitHotwordEdit(original: word) }
+
+                hotwordActionButton(
+                    icon: "checkmark",
+                    color: TF.settingsAccentGreen,
+                    help: L("保存", "Save")
+                ) {
+                    commitHotwordEdit(original: word)
+                }
+                hotwordActionButton(
+                    icon: "xmark",
+                    color: TF.settingsTextTertiary,
+                    help: L("取消", "Cancel")
+                ) {
+                    cancelHotwordEdit()
+                }
+            } else {
+                Text(word)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(TF.settingsText)
+
+                if isHovered {
+                    hotwordActionButton(
+                        icon: "pencil",
+                        color: TF.settingsTextSecondary,
+                        help: L("编辑", "Edit")
+                    ) {
+                        startHotwordEdit(word)
+                    }
+                    hotwordActionButton(
+                        icon: "trash",
+                        color: TF.settingsAccentRed,
+                        help: L("删除", "Delete")
+                    ) {
+                        removeHotword(word)
+                    }
+                }
             }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .padding(.leading, 14)
+        .padding(.trailing, isHovered || isEditing ? 8 : 14)
+        .frame(height: 38)
         .background(
-            RoundedRectangle(cornerRadius: 6).fill(TF.settingsBg)
+            Capsule()
+                .fill(isHovered || isEditing
+                      ? TF.settingsControlHover
+                      : TF.settingsControl)
         )
+        .overlay(
+            Capsule()
+                .stroke(isEditing ? TF.settingsText.opacity(0.18) : Color.black.opacity(0.05), lineWidth: 1)
+        )
+        .contentShape(Capsule())
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                hoveredHotword = hovering ? word : nil
+            }
+        }
+    }
+
+    private func hotwordActionButton(
+        icon: String,
+        color: Color,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(Color.white.opacity(0.78)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     // MARK: - Snippet Group View
@@ -411,18 +821,34 @@ struct VocabularyTab: View {
     }
 
     private var displayHotwords: [String] {
+        let filtered = hotwords.filter(matchesSearch)
         switch hotwordSort {
-        case .byTime: return hotwords
-        case .byAlpha: return hotwords.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        case .byTime: return filtered
+        case .byAlpha: return filtered.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         }
     }
 
     private var displaySnippets: [SnippetGroup] {
-        let groups = groupedSnippets
+        let groups = groupedSnippets.filter { group in
+            matchesSearch(group.replacement) || group.triggers.contains(where: matchesSearch)
+        }
         switch snippetSort {
         case .byTime: return groups
         case .byAlpha: return groups.sorted { $0.replacement.localizedCaseInsensitiveCompare($1.replacement) == .orderedAscending }
         }
+    }
+
+    private var isSearching: Bool {
+        !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func matchesSearch(_ value: String) -> Bool {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        return value.range(
+            of: query,
+            options: [.caseInsensitive, .diacriticInsensitive]
+        ) != nil
     }
 
     private var groupedSnippets: [SnippetGroup] {
@@ -445,214 +871,312 @@ struct VocabularyTab: View {
     }
 
     private func snippetGroupView(group: SnippetGroup) -> some View {
-        HStack(alignment: .center, spacing: 6) {
-            // Replacement (left side)
-            if editingGroupReplacement == group.replacement {
-                TextField("", text: $editReplacementText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .foregroundStyle(TF.settingsText)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .fixedSize()
-                    .frame(minWidth: 40)
-                    .background(RoundedRectangle(cornerRadius: 4).fill(TF.settingsCard))
-                    .onSubmit { commitGroupEdit(oldReplacement: group.replacement) }
-            } else {
-                HStack(spacing: 4) {
-                    if group.replacement == Self.builtinExampleReplacement {
-                        Text(L("示例", "Example"))
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(TF.settingsTextTertiary)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(TF.settingsCardAlt))
-                    }
-                    Text(group.replacement)
-                        .font(.system(size: 12))
+        let isHovered = hoveredSnippetGroup == group.replacement
+        let isEditing = editingGroupReplacement == group.replacement
+
+        return HStack(spacing: 10) {
+            Group {
+                if isEditing {
+                    TextField("", text: $editReplacementText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(TF.settingsText)
+                        .padding(.horizontal, 9)
+                        .frame(height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(TF.settingsBg)
+                        )
+                        .onSubmit { commitGroupEdit(oldReplacement: group.replacement) }
+                } else {
+                    HStack(spacing: 6) {
+                        Text(group.replacement)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(TF.settingsText)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+
+                        if group.replacement == Self.builtinExampleReplacement {
+                            Text(L("示例", "Example"))
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(TF.settingsTextTertiary)
+                                .padding(.horizontal, 6)
+                                .frame(height: 18)
+                                .background(Capsule().fill(TF.settingsCardAlt))
+                        }
+                    }
                 }
             }
+            .frame(width: 180, alignment: .leading)
 
             Image(systemName: "arrow.left")
-                .font(.system(size: 9))
+                .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(TF.settingsTextTertiary)
 
-            // Trigger words (right side, separated by vertical dividers)
-            WrappingHStack(alignment: .center, spacing: 4) {
-                ForEach(Array(group.triggers.enumerated()), id: \.element) { index, trigger in
-                    if index > 0 {
-                        Rectangle()
-                            .fill(TF.settingsTextTertiary.opacity(0.3))
-                            .frame(width: 1, height: 14)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(group.triggers, id: \.self) { trigger in
+                        triggerTag(
+                            trigger: trigger,
+                            replacement: group.replacement,
+                            showsRemove: isHovered || isEditing
+                        )
                     }
-                    triggerTag(trigger: trigger, replacement: group.replacement)
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(TF.settingsTextTertiary)
+                        TextField(
+                            L("添加触发词", "Add trigger"),
+                            text: newTriggerBinding(for: group.replacement)
+                        )
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .frame(width: 82)
+                        .onSubmit { addTriggerToGroup(replacement: group.replacement) }
+                    }
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .background(
+                        Capsule()
+                            .stroke(
+                                TF.settingsTextTertiary.opacity(0.28),
+                                style: StrokeStyle(lineWidth: 1, dash: [4])
+                            )
+                    )
                 }
-
-                Rectangle()
-                    .fill(TF.settingsTextTertiary.opacity(0.3))
-                    .frame(width: 1, height: 14)
-
-                TextField(L("添加...", "Add..."), text: newTriggerBinding(for: group.replacement))
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .frame(width: 60)
-                    .padding(.horizontal, 4)
-                    .onSubmit { addTriggerToGroup(replacement: group.replacement) }
             }
+            .frame(maxWidth: .infinity)
+            .frame(height: 28)
 
-            Spacer()
-
-            if editingGroupReplacement == group.replacement {
-                Button { commitGroupEdit(oldReplacement: group.replacement) } label: {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(TF.settingsAccentGreen)
-                }
-                .buttonStyle(.plain)
-
-                Button { editingGroupReplacement = nil } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(TF.settingsTextTertiary)
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button { startGroupEdit(replacement: group.replacement) } label: {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 9))
-                        .foregroundStyle(TF.settingsTextTertiary)
-                }
-                .buttonStyle(.plain)
-
-                Button { removeGroup(replacement: group.replacement) } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9))
-                        .foregroundStyle(TF.settingsTextTertiary)
-                }
-                .buttonStyle(.plain)
+            if isEditing {
+                snippetCardActionButton(
+                    icon: "checkmark",
+                    color: TF.settingsAccentGreen,
+                    tooltip: L("保存", "Save")
+                ) { commitGroupEdit(oldReplacement: group.replacement) }
+                snippetCardActionButton(
+                    icon: "xmark",
+                    color: TF.settingsTextTertiary,
+                    tooltip: L("取消", "Cancel")
+                ) { editingGroupReplacement = nil }
+            } else if isHovered {
+                snippetCardActionButton(
+                    icon: "pencil",
+                    color: TF.settingsTextSecondary,
+                    tooltip: L("编辑替换内容", "Edit replacement")
+                ) { startGroupEdit(replacement: group.replacement) }
+                snippetCardActionButton(
+                    icon: "trash",
+                    color: TF.settingsAccentRed,
+                    tooltip: L("删除整组", "Delete group")
+                ) { removeGroup(replacement: group.replacement) }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(highlightedGroup == group.replacement
+                      ? TF.settingsAccentGreen.opacity(0.10)
+                      : (isHovered || isEditing
+                         ? TF.settingsRowHover
+                         : TF.settingsCard))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(
+                    highlightedGroup == group.replacement
+                        ? TF.settingsAccentGreen.opacity(0.32)
+                        : (isHovered || isEditing ? Color.black.opacity(0.11) : TF.settingsBorder),
+                    lineWidth: 1
+                )
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .zIndex(isHovered || isEditing ? 3 : 0)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                hoveredSnippetGroup = hovering ? group.replacement : nil
+            }
+        }
     }
 
-    private func triggerTag(trigger: String, replacement: String) -> some View {
-        HStack(spacing: 3) {
-            Text(trigger)
-                .font(.system(size: 12))
-                .foregroundStyle(TF.settingsTextSecondary)
-            Button {
-                removeTrigger(trigger: trigger, replacement: replacement)
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(TF.settingsTextTertiary.opacity(0.6))
-            }
-            .buttonStyle(.plain)
+    private func snippetCardActionButton(
+        icon: String,
+        color: Color,
+        tooltip: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 24, height: 24)
+                .background(Circle().fill(TF.settingsCardAlt))
+                .contentShape(Circle())
         }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 4)
+        .buttonStyle(.plain)
+        .settingsTooltip(tooltip)
+    }
+
+    private func triggerTag(trigger: String, replacement: String, showsRemove: Bool) -> some View {
+        HStack(spacing: 6) {
+            Text(trigger)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(TF.settingsTextSecondary)
+
+            if showsRemove {
+                Button {
+                    removeTrigger(trigger: trigger, replacement: replacement)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .frame(width: 14, height: 14)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .settingsTooltip(L("删除触发词", "Remove trigger"))
+            }
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, showsRemove ? 6 : 10)
+        .frame(height: 26)
+        .background(Capsule().fill(TF.settingsControl))
+        .overlay(Capsule().stroke(Color.black.opacity(0.045), lineWidth: 1))
     }
 
     // MARK: - App Scope Bar
 
     private func appScopeBar() -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 0) {
-                // Global tab (with SF Symbol globe icon)
-                appScopeTab(
-                    label: L("全局生效", "Global"),
-                    bundleId: nil,
-                    icon: nil,
-                    systemIcon: "globe",
-                    isFirst: true
-                )
-
-                // Per-app tabs
-                ForEach(registeredApps) { app in
+            HStack(spacing: 8) {
+                HStack(spacing: 2) {
                     appScopeTab(
-                        label: app.name,
-                        bundleId: app.bundleId,
-                        icon: appIcon(for: app.bundleId)
+                        label: L("全局生效", "Global"),
+                        bundleId: nil,
+                        icon: nil,
+                        systemIcon: "globe"
                     )
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            removeAppScope(bundleId: app.bundleId)
-                        } label: {
-                            Label(L("移除", "Remove"), systemImage: "trash")
+
+                    ForEach(registeredApps) { app in
+                        appScopeTab(
+                            label: app.name,
+                            bundleId: app.bundleId,
+                            icon: appIcon(for: app.bundleId)
+                        )
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                removeAppScope(bundleId: app.bundleId)
+                            } label: {
+                                Label(L("移除", "Remove"), systemImage: "trash")
+                            }
                         }
                     }
                 }
+                .padding(4)
+                .background(
+                    Capsule()
+                        .fill(TF.settingsControl)
+                )
 
-                // Separator + add button (Chrome-style)
-                Divider()
-                    .frame(height: 14)
-                    .padding(.horizontal, 8)
-
-                Button {
-                    pickApp()
-                } label: {
+                Button { pickApp() } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(TF.settingsTextTertiary)
-                        .frame(width: 20, height: 20)
-                        .contentShape(Rectangle())
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            Circle().fill(
+                                isAddAppHovered
+                                    ? TF.settingsControlHover
+                                    : TF.settingsControl
+                            )
+                        )
+                        .overlay(Circle().stroke(Color.black.opacity(0.06), lineWidth: 1))
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .anchorPreference(key: AddAppButtonAnchorKey.self, value: .bounds) { $0 }
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.08)) {
+                        isAddAppHovered = hovering
+                    }
+                    if hovering {
+                        NSCursor.pointingHand.set()
+                    } else {
+                        NSCursor.arrow.set()
+                    }
+                }
+            }
+        }
+        .overlayPreferenceValue(AddAppButtonAnchorKey.self) { anchor in
+            GeometryReader { proxy in
+                if let anchor, isAddAppHovered {
+                    let buttonFrame = proxy[anchor]
+                    SettingsTooltipBubble(text: L("添加应用范围", "Add app scope"))
+                        .position(
+                            x: buttonFrame.midX,
+                            y: buttonFrame.maxY + 20
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                }
             }
         }
     }
 
-    private func appScopeTab(label: String, bundleId: String?, icon: NSImage?, systemIcon: String? = nil, isFirst: Bool = false) -> some View {
+    private func appScopeTab(
+        label: String,
+        bundleId: String?,
+        icon: NSImage?,
+        systemIcon: String? = nil
+    ) -> some View {
         let isSelected = selectedAppScope == bundleId
-        let fr: CGFloat = 6
+        let scopeKey = bundleId ?? "__global__"
+        let isHovered = hoveredAppScopeKey == scopeKey
+
         return Button {
             switchScope(to: bundleId)
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
                 if let systemIcon {
                     Image(systemName: systemIcon)
-                        .font(.system(size: 11))
+                        .font(.system(size: 11, weight: .medium))
                 } else if let icon {
                     Image(nsImage: icon)
                         .resizable()
                         .frame(width: 14, height: 14)
                 }
                 Text(label)
-                    .font(.system(size: 12))
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
                     .lineLimit(1)
-
-                // Close button on selected app tabs (not global)
-                if isSelected && bundleId != nil {
-                    Button {
-                        deletingAppBundleId = bundleId
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(TF.settingsTextTertiary)
-                    }
-                    .buttonStyle(.plain)
-                }
             }
-            .foregroundStyle(isSelected ? TF.settingsText : TF.settingsTextTertiary)
+            .foregroundStyle(isSelected ? TF.settingsText : TF.settingsTextSecondary)
             .padding(.horizontal, 14)
-            .padding(.top, isSelected ? 11 : 6)
-            .padding(.bottom, isSelected ? 5 : 6)
-            // Foot space: left foot only if not first tab
-            .padding(.leading, isSelected && !isFirst ? fr : 0)
-            .padding(.trailing, isSelected ? fr : 0)
-            .padding(.bottom, isSelected ? fr : 0)
-            .zIndex(isSelected ? 1 : 0)
+            .frame(height: 30)
             .background(
-                Group {
-                    if isSelected {
-                        ChromeTabShape(topRadius: 8, footRadius: fr, skipLeftFoot: isFirst)
-                            .fill(TF.settingsBg)
-                    }
-                }
+                Capsule().fill(
+                    isSelected
+                        ? Color.white
+                        : (isHovered
+                           ? TF.settingsControlHover
+                           : Color.clear)
+                )
             )
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                hoveredAppScopeKey = hovering ? scopeKey : nil
+            }
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
     }
 
     private func appIcon(for bundleId: String) -> NSImage? {
@@ -779,6 +1303,32 @@ struct VocabularyTab: View {
 
     // MARK: - Actions
 
+    private func applyNavigationRequest(_ request: VocabularyNavigationRequest) {
+        searchQuery = ""
+        isSearchExpanded = false
+        switchScope(to: nil)
+        selectedSection = request.section
+
+        switch request.section {
+        case .hotwords:
+            if let word = request.word { newHotword = word }
+        case .snippets:
+            newSnippetTriggers = []
+            newTrigger = request.trigger ?? ""
+            newValue = request.replacement ?? ""
+        }
+
+        VocabularyNavigationCenter.shared.consume(request)
+        DispatchQueue.main.async {
+            switch request.focus {
+            case .hotword: focusedVocabularyInput = .hotword
+            case .snippetTrigger: focusedVocabularyInput = .snippetTrigger
+            case .snippetReplacement: focusedVocabularyInput = .snippetReplacement
+            case nil: focusedVocabularyInput = nil
+            }
+        }
+    }
+
     private func addHotword() {
         let word = newHotword.trimmingCharacters(in: .whitespaces)
         guard !word.isEmpty, !hotwords.contains(word) else {
@@ -793,58 +1343,134 @@ struct VocabularyTab: View {
     private func removeHotword(_ word: String) {
         hotwords.removeAll { $0 == word }
         HotwordStorage.save(hotwords)
+        if editingHotword == word {
+            cancelHotwordEdit()
+        }
+    }
+
+    private func startHotwordEdit(_ word: String) {
+        editingHotword = word
+        editingHotwordText = word
+    }
+
+    private func cancelHotwordEdit() {
+        editingHotword = nil
+        editingHotwordText = ""
+    }
+
+    private func commitHotwordEdit(original: String) {
+        let updated = editingHotwordText.trimmingCharacters(in: .whitespaces)
+        guard !updated.isEmpty else {
+            cancelHotwordEdit()
+            return
+        }
+        guard !hotwords.contains(where: {
+            $0 != original && $0.localizedCaseInsensitiveCompare(updated) == .orderedSame
+        }) else {
+            return
+        }
+        guard let index = hotwords.firstIndex(of: original) else {
+            cancelHotwordEdit()
+            return
+        }
+
+        hotwords[index] = updated
+        HotwordStorage.save(hotwords)
+        cancelHotwordEdit()
     }
 
     private func addSnippet() {
-        let trigger = newTrigger.trimmingCharacters(in: .whitespaces)
-        let value = newValue.trimmingCharacters(in: .whitespaces)
-        guard !trigger.isEmpty, !value.isEmpty else { return }
-        guard !snippets.contains(where: { $0.trigger == trigger }) else { return }
-        snippets.append((trigger: trigger, value: value))
+        let value = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+
+        let candidates = newSnippetTriggers + parsedNewSnippetTriggers(from: newTrigger)
+        var accepted: [String] = []
+        for trigger in candidates {
+            let isDuplicate = accepted.contains {
+                $0.localizedCaseInsensitiveCompare(trigger) == .orderedSame
+            } || snippets.contains {
+                $0.trigger.localizedCaseInsensitiveCompare(trigger) == .orderedSame
+            }
+            if !isDuplicate {
+                accepted.append(trigger)
+            }
+        }
+        guard !accepted.isEmpty else { return }
+
+        for trigger in accepted {
+            snippets.append((trigger: trigger, value: value))
+        }
         saveCurrentSnippets()
         newTrigger = ""
+        newSnippetTriggers = []
         newValue = ""
+    }
+
+    private func stageNewSnippetTrigger() {
+        let candidates = parsedNewSnippetTriggers(from: newTrigger)
+        for trigger in candidates {
+            let isDuplicate = newSnippetTriggers.contains {
+                $0.localizedCaseInsensitiveCompare(trigger) == .orderedSame
+            } || snippets.contains {
+                $0.trigger.localizedCaseInsensitiveCompare(trigger) == .orderedSame
+            }
+            if !isDuplicate {
+                newSnippetTriggers.append(trigger)
+            }
+        }
+        newTrigger = ""
+    }
+
+    private func parsedNewSnippetTriggers(from input: String) -> [String] {
+        input
+            .components(separatedBy: CharacterSet(charactersIn: ",，\n"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     // MARK: - Bulk Hotwords Sheet
 
     private var bulkHotwordsSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            // Header
+        VStack(alignment: .leading, spacing: 18) {
             HStack {
                 Text(L("批量管理热词", "Bulk Edit Hotwords"))
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(TF.settingsText)
                 Spacer()
                 Button {
                     showBulkHotwordsSheet = false
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 18))
-                        .foregroundStyle(TF.settingsTextTertiary)
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(TF.settingsControl)
+                        )
                 }
                 .buttonStyle(.plain)
             }
 
-            // Description
             Text(L("每行一个热词，保存后将覆盖所有自定义热词。", "One hotword per line. Saving will replace all custom hotwords."))
                 .font(.system(size: 12))
                 .foregroundStyle(TF.settingsTextTertiary)
 
-            // Text editor
             TextEditor(text: $bulkHotwordsText)
                 .font(.system(size: 13))
                 .foregroundStyle(TF.settingsText)
                 .scrollContentBackground(.hidden)
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsBg))
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(TF.settingsControl)
+                )
                 .frame(minHeight: 300, maxHeight: 400)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(TF.settingsTextTertiary.opacity(0.2), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(TF.settingsBorder, lineWidth: 1)
                 )
 
-            // Stats
             HStack {
                 Text(L("\(bulkHotwordsLines.count) 条热词", "\(bulkHotwordsLines.count) hotwords"))
                     .font(.system(size: 11))
@@ -852,18 +1478,23 @@ struct VocabularyTab: View {
                 Spacer()
             }
 
-            // Actions
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 Spacer()
                 Button {
                     showBulkHotwordsSheet = false
                 } label: {
                     Text(L("取消", "Cancel"))
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(TF.settingsTextSecondary)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 7)
-                        .contentShape(Rectangle())
+                        .frame(minWidth: 76, minHeight: 34)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(TF.settingsControl)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(TF.settingsBorder, lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
 
@@ -873,18 +1504,20 @@ struct VocabularyTab: View {
                     Text(L("保存", "Save"))
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsAccentAmber))
-                        .contentShape(Rectangle())
+                        .frame(minWidth: 76, minHeight: 34)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(TF.settingsText)
+                        )
                 }
                 .buttonStyle(.plain)
                 .disabled(bulkHotwordsLines.isEmpty && hotwords.isEmpty)
+                .opacity(bulkHotwordsLines.isEmpty && hotwords.isEmpty ? 0.38 : 1)
             }
         }
-        .padding(20)
-        .frame(width: 480)
-        .background(TF.settingsCardAlt)
+        .padding(24)
+        .frame(width: 500)
+        .background(TF.settingsWindowBackground)
     }
 
     private var bulkHotwordsLines: [String] {
@@ -895,7 +1528,14 @@ struct VocabularyTab: View {
     }
 
     private func saveBulkHotwords() {
-        let newWords = bulkHotwordsLines
+        var seen = Set<String>()
+        let newWords = bulkHotwordsLines.filter { word in
+            let identity = word.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            )
+            return seen.insert(identity).inserted
+        }
         hotwords = newWords
         HotwordStorage.save(newWords)
         showBulkHotwordsSheet = false
@@ -943,18 +1583,23 @@ struct VocabularyTab: View {
     }
 
     private var bulkSnippetsSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 18) {
             HStack {
                 Text(L("批量编辑片段替换", "Bulk Edit Snippets"))
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(TF.settingsText)
                 Spacer()
                 Button {
                     showBulkSnippetsSheet = false
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 18))
-                        .foregroundStyle(TF.settingsTextTertiary)
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(TF.settingsControl)
+                        )
                 }
                 .buttonStyle(.plain)
             }
@@ -967,12 +1612,15 @@ struct VocabularyTab: View {
                 .font(.system(size: 13))
                 .foregroundStyle(TF.settingsText)
                 .scrollContentBackground(.hidden)
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsBg))
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(TF.settingsControl)
+                )
                 .frame(minHeight: 300, maxHeight: 400)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(TF.settingsTextTertiary.opacity(0.2), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(TF.settingsBorder, lineWidth: 1)
                 )
 
             HStack {
@@ -982,17 +1630,23 @@ struct VocabularyTab: View {
                 Spacer()
             }
 
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 Spacer()
                 Button {
                     showBulkSnippetsSheet = false
                 } label: {
                     Text(L("取消", "Cancel"))
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(TF.settingsTextSecondary)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 7)
-                        .contentShape(Rectangle())
+                        .frame(minWidth: 76, minHeight: 34)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(TF.settingsControl)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(TF.settingsBorder, lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
 
@@ -1005,17 +1659,18 @@ struct VocabularyTab: View {
                     Text(L("保存", "Save"))
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsAccentAmber))
-                        .contentShape(Rectangle())
+                        .frame(minWidth: 76, minHeight: 34)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(TF.settingsText)
+                        )
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(20)
-        .frame(width: 520)
-        .background(TF.settingsCardAlt)
+        .padding(24)
+        .frame(width: 540)
+        .background(TF.settingsWindowBackground)
     }
 
 }

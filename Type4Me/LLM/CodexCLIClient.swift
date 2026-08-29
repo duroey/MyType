@@ -2,10 +2,33 @@ import Foundation
 import os
 
 actor CodexCLIClient: LLMClient {
+    static let shared = CodexCLIClient()
+
     private let logger = Logger(subsystem: "com.type4me.llm", category: "CodexCLIClient")
+    private var appServerSession: CodexAppServerSession?
 
     func warmUp(baseURL: String) async {
         _ = baseURL
+        guard appServerSession == nil,
+              let executable = try? CodexCLIRuntimeLocator.locate()
+        else { return }
+
+        let session = CodexAppServerSession(executable: executable)
+        appServerSession = session
+        do {
+            try await session.warmUp()
+            logger.info("Codex App Server warmed up")
+        } catch {
+            logger.warning("Codex App Server warm-up failed; exec fallback remains available: \(error.localizedDescription)")
+            await session.shutdown()
+            appServerSession = nil
+        }
+    }
+
+    func invalidate() async {
+        guard let session = appServerSession else { return }
+        appServerSession = nil
+        await session.shutdown()
     }
 
     func process(text: String, prompt: String, config: LLMConfig) async throws -> String {
@@ -13,6 +36,51 @@ actor CodexCLIClient: LLMClient {
         guard !trimmedText.isEmpty else { return text }
 
         let executable = try CodexCLIRuntimeLocator.locate()
+        let finalPrompt = CodexCLIInvocation.wrappedPrompt(
+            text: trimmedText,
+            transformationPrompt: prompt
+        )
+        let startedAt = ContinuousClock.now
+
+        let session = appServerSession ?? CodexAppServerSession(executable: executable)
+        appServerSession = session
+        do {
+            let data = try await session.transform(prompt: finalPrompt, model: config.model)
+            let result = try Self.decodeResult(from: data)
+            DebugFileLogger.log("codex app server: completed +\(ContinuousClock.now - startedAt) chars=\(result.count) model=\(config.model)")
+            return result.strippingThinkTags()
+        } catch is CancellationError {
+            await resetAppServer(session)
+            throw CancellationError()
+        } catch CodexCLIError.timedOut {
+            await resetAppServer(session)
+            throw CodexCLIError.timedOut
+        } catch {
+            logger.warning("Codex App Server unavailable; falling back to codex exec: \(error.localizedDescription)")
+            await resetAppServer(session)
+        }
+
+        return try await processOneShot(
+            executable: executable,
+            prompt: finalPrompt,
+            model: config.model,
+            startedAt: startedAt
+        )
+    }
+
+    private func resetAppServer(_ session: CodexAppServerSession) async {
+        if appServerSession === session {
+            appServerSession = nil
+        }
+        await session.shutdown()
+    }
+
+    private func processOneShot(
+        executable: URL,
+        prompt: String,
+        model: String,
+        startedAt: ContinuousClock.Instant
+    ) async throws -> String {
         let workspace = FileManager.default.temporaryDirectory
             .appendingPathComponent("Type4Me-Codex-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
@@ -27,19 +95,15 @@ actor CodexCLIClient: LLMClient {
         let errorHandle = try FileHandle(forWritingTo: errorURL)
         defer { try? errorHandle.close() }
 
-        let finalPrompt = CodexCLIInvocation.wrappedPrompt(
-            text: trimmedText,
-            transformationPrompt: prompt
-        )
         let process = Process()
         process.executableURL = executable
         process.currentDirectoryURL = workspace
         process.arguments = CodexCLIInvocation.arguments(
-            model: config.model,
+            model: model,
             workspaceURL: workspace,
             schemaURL: schemaURL,
             outputURL: outputURL,
-            prompt: finalPrompt
+            prompt: prompt
         )
         process.standardOutput = FileHandle.nullDevice
         process.standardError = errorHandle
@@ -50,9 +114,8 @@ actor CodexCLIClient: LLMClient {
         environment["NO_COLOR"] = "1"
         process.environment = environment
 
-        let startedAt = ContinuousClock.now
         try process.run()
-        logger.info("Codex CLI started model=\(config.model)")
+        logger.info("Codex CLI started model=\(model)")
         let status = try await CodexCLIProcessRunner.waitForExit(process, timeout: .seconds(14))
         try errorHandle.synchronize()
 
@@ -61,16 +124,21 @@ actor CodexCLIClient: LLMClient {
             throw CodexCLIError.processFailed(status, CodexCLIError.concise(stderr))
         }
 
-        guard let data = try? Data(contentsOf: outputURL),
-              let envelope = try? JSONDecoder().decode(CodexCLIOutput.self, from: data)
-        else {
+        guard let data = try? Data(contentsOf: outputURL) else {
             throw CodexCLIError.invalidResponse
         }
+        let result = try Self.decodeResult(from: data)
+        DebugFileLogger.log("codex cli: completed +\(ContinuousClock.now - startedAt) chars=\(result.count) model=\(model)")
+        return result.strippingThinkTags()
+    }
 
+    private static func decodeResult(from data: Data) throws -> String {
+        guard let envelope = try? JSONDecoder().decode(CodexCLIOutput.self, from: data) else {
+            throw CodexCLIError.invalidResponse
+        }
         let result = envelope.result.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !result.isEmpty else { throw LLMError.emptyResponse(nil) }
-        DebugFileLogger.log("codex cli: completed +\(ContinuousClock.now - startedAt) chars=\(result.count) model=\(config.model)")
-        return result.strippingThinkTags()
+        return result
     }
 }
 
@@ -185,6 +253,7 @@ enum CodexCLIError: Error, LocalizedError {
     case processWaitFailed
     case processFailed(Int32, String)
     case invalidResponse
+    case appServerFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -198,6 +267,8 @@ enum CodexCLIError: Error, LocalizedError {
             return message.isEmpty ? L("Codex CLI 调用失败", "Codex CLI failed") : message
         case .invalidResponse:
             return L("Codex CLI 返回了无效结果", "Codex CLI returned an invalid result")
+        case .appServerFailed(let message):
+            return message.isEmpty ? "Codex App Server failed" : message
         }
     }
 

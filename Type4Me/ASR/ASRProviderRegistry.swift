@@ -7,21 +7,41 @@ enum ASRAudioInputKind: Sendable, Equatable {
 
 struct ASRProviderCapabilities: Sendable, Equatable {
     let isAvailable: Bool
-    /// False for batch/REST providers that only produce results in endAudio().
+    /// Internal session behavior: false for batch/REST providers that only produce final results in endAudio().
     let isStreaming: Bool
+    /// User-facing capability: true if recognition starts while speaking (streaming preview);
+    /// false if the complete audio is submitted only after releasing the hotkey ("非实时").
+    let supportsRealtimeRecognition: Bool
     let audioInput: ASRAudioInputKind
 
-    static func streaming(audioInput: ASRAudioInputKind = .pcmData) -> ASRProviderCapabilities {
-        ASRProviderCapabilities(isAvailable: true, isStreaming: true, audioInput: audioInput)
+    static func streaming(
+        audioInput: ASRAudioInputKind = .pcmData,
+        supportsRealtimeRecognition: Bool = true
+    ) -> ASRProviderCapabilities {
+        ASRProviderCapabilities(
+            isAvailable: true,
+            isStreaming: true,
+            supportsRealtimeRecognition: supportsRealtimeRecognition,
+            audioInput: audioInput
+        )
     }
 
-    static func batch(audioInput: ASRAudioInputKind = .pcmData) -> ASRProviderCapabilities {
-        ASRProviderCapabilities(isAvailable: true, isStreaming: false, audioInput: audioInput)
+    static func batch(
+        audioInput: ASRAudioInputKind = .pcmData,
+        supportsRealtimeRecognition: Bool = false
+    ) -> ASRProviderCapabilities {
+        ASRProviderCapabilities(
+            isAvailable: true,
+            isStreaming: false,
+            supportsRealtimeRecognition: supportsRealtimeRecognition,
+            audioInput: audioInput
+        )
     }
 
     static let unavailable = ASRProviderCapabilities(
         isAvailable: false,
         isStreaming: true,
+        supportsRealtimeRecognition: false,
         audioInput: .pcmData
     )
 }
@@ -32,17 +52,20 @@ enum ASRProviderRegistry {
         let configType: any ASRProviderConfig.Type
         let createClient: (@Sendable () -> any SpeechRecognizer)?
         let capabilities: ASRProviderCapabilities
+        let validateCredentials: (@Sendable (any ASRProviderConfig, ASRRequestOptions) async throws -> Void)?
 
         var isAvailable: Bool { createClient != nil }
 
         init(
             configType: any ASRProviderConfig.Type,
             createClient: (@Sendable () -> any SpeechRecognizer)?,
-            capabilities: ASRProviderCapabilities = .unavailable
+            capabilities: ASRProviderCapabilities = .unavailable,
+            validateCredentials: (@Sendable (any ASRProviderConfig, ASRRequestOptions) async throws -> Void)? = nil
         ) {
             self.configType = configType
             self.createClient = createClient
             self.capabilities = capabilities
+            self.validateCredentials = validateCredentials
         }
     }
 
@@ -63,9 +86,25 @@ enum ASRProviderRegistry {
                 createClient: { StepFunBatchASRClient() },
                 capabilities: .batch()
             ),
+            .mimo: ProviderEntry(
+                configType: MiMoASRConfig.self,
+                createClient: { MiMoASRClient() },
+                capabilities: .batch(),
+                validateCredentials: { config, options in
+                    guard let mimoConfig = config as? MiMoASRConfig else {
+                        throw MiMoASRError.invalidConfig
+                    }
+                    try await MiMoASRProtocol.validateCredentials(config: mimoConfig, options: options)
+                }
+            ),
             .deepgram: ProviderEntry(
                 configType: DeepgramASRConfig.self,
                 createClient: { DeepgramASRClient() },
+                capabilities: .streaming()
+            ),
+            .cartesia: ProviderEntry(
+                configType: CartesiaASRConfig.self,
+                createClient: { CartesiaASRClient() },
                 capabilities: .streaming()
             ),
             .assemblyai: ProviderEntry(
@@ -115,7 +154,7 @@ enum ASRProviderRegistry {
         dict[.sherpa] = ProviderEntry(
             configType: SherpaASRConfig.self,
             createClient: { SenseVoiceASRClient() },
-            capabilities: .batch()
+            capabilities: .batch(supportsRealtimeRecognition: true)
         )
         #else
         dict[.sherpa] = ProviderEntry(
@@ -162,6 +201,22 @@ enum ASRProviderRegistry {
 
     static func resolvedMode(for mode: ProcessingMode, provider: ASRProvider) -> ProcessingMode {
         supports(mode, for: provider) ? mode : .direct
+    }
+
+    static func validateCredentials(
+        for provider: ASRProvider,
+        config: any ASRProviderConfig,
+        options: ASRRequestOptions
+    ) async throws {
+        if let validator = all[provider]?.validateCredentials {
+            try await validator(config, options)
+            return
+        }
+        guard let client = createClient(for: provider) else {
+            throw MiMoASRError.invalidConfig
+        }
+        try await client.connect(config: config, options: options)
+        await client.disconnect()
     }
 
     static func unsupportedReason(for mode: ProcessingMode, provider: ASRProvider) -> String? {

@@ -98,37 +98,12 @@ enum SonioxAsyncClient {
 
     // MARK: - API calls
 
-    /// Wrap raw PCM s16le mono 16kHz data in a WAV container.
-    private static func wrapPCMAsWAV(_ pcmData: Data, sampleRate: Int = 16000, channels: Int = 1, bitsPerSample: Int = 16) -> Data {
-        let byteRate = sampleRate * channels * bitsPerSample / 8
-        let blockAlign = channels * bitsPerSample / 8
-        let dataSize = UInt32(pcmData.count)
-        let fileSize = 36 + dataSize
-
-        var wav = Data()
-        wav.append(contentsOf: "RIFF".utf8)
-        wav.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
-        wav.append(contentsOf: "WAVE".utf8)
-        wav.append(contentsOf: "fmt ".utf8)
-        wav.append(withUnsafeBytes(of: UInt32(16).littleEndian) { Data($0) })   // chunk size
-        wav.append(withUnsafeBytes(of: UInt16(1).littleEndian) { Data($0) })    // PCM format
-        wav.append(withUnsafeBytes(of: UInt16(channels).littleEndian) { Data($0) })
-        wav.append(withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { Data($0) })
-        wav.append(withUnsafeBytes(of: UInt32(byteRate).littleEndian) { Data($0) })
-        wav.append(withUnsafeBytes(of: UInt16(blockAlign).littleEndian) { Data($0) })
-        wav.append(withUnsafeBytes(of: UInt16(bitsPerSample).littleEndian) { Data($0) })
-        wav.append(contentsOf: "data".utf8)
-        wav.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-        wav.append(pcmData)
-        return wav
-    }
-
     private static func uploadAudio(
         _ audioData: Data,
         apiKey: String,
         session: URLSession
     ) async throws -> String {
-        let wavData = wrapPCMAsWAV(audioData)
+        let wavData = WAVEncoder.encode(pcmData: audioData)
 
         let url = URL(string: "\(baseURL)/v1/files")!
         var request = URLRequest(url: url, timeoutInterval: 30)

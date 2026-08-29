@@ -52,14 +52,7 @@ actor DoubaoChatClient: LLMClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
 
-        // tf_disableThinking: true (default) = disable thinking to save tokens;
-        // false = let the model use its default thinking behavior.
-        let disableThinking: Bool = {
-            guard let obj = UserDefaults.standard.object(forKey: "tf_disableThinking") else {
-                return true  // default: thinking disabled
-            }
-            return obj as? Bool ?? true
-        }()
+        let disableThinking = LLMThinkingPreference.isDisabled(for: provider)
         let disableField = disableThinking ? provider.thinkingDisableField(for: config.model) : nil
         let body = ChatRequest(
             model: config.model,
@@ -67,6 +60,7 @@ actor DoubaoChatClient: LLMClient {
             stream: true,
             thinking: disableField == .thinking ? ThinkingConfig(type: "disabled") : nil,
             enable_thinking: disableField == .enableThinking ? false : nil,
+            reasoning: disableField == .reasoning ? ReasoningConfig(effort: "none") : nil,
             reasoning_effort: disableField == .reasoningEffort ? "none" : nil,
             think: disableField == .think ? false : nil,
             reasoning_split: provider.needsReasoningSplit ? true : nil
@@ -101,12 +95,7 @@ actor DoubaoChatClient: LLMClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
 
-        let disableThinking: Bool = {
-            guard let obj = UserDefaults.standard.object(forKey: "tf_disableThinking") else {
-                return true
-            }
-            return obj as? Bool ?? true
-        }()
+        let disableThinking = LLMThinkingPreference.isDisabled(for: provider)
         let disableField = disableThinking ? provider.thinkingDisableField : nil
         let body = ChatRequest(
             model: config.model,
@@ -114,6 +103,7 @@ actor DoubaoChatClient: LLMClient {
             stream: true,
             thinking: disableField == .thinking ? ThinkingConfig(type: "disabled") : nil,
             enable_thinking: disableField == .enableThinking ? false : nil,
+            reasoning: disableField == .reasoning ? ReasoningConfig(effort: "none") : nil,
             reasoning_effort: disableField == .reasoningEffort ? "none" : nil,
             think: disableField == .think ? false : nil,
             reasoning_split: provider.needsReasoningSplit ? true : nil
@@ -213,12 +203,17 @@ struct ThinkingConfig: Encodable, Sendable {
     let type: String
 }
 
+struct ReasoningConfig: Encodable, Sendable {
+    let effort: String
+}
+
 struct ChatRequest: Encodable, Sendable {
     let model: String
     let messages: [ChatMessage]
     let stream: Bool
     let thinking: ThinkingConfig?
     let enable_thinking: Bool?
+    let reasoning: ReasoningConfig?
     let reasoning_effort: String?
     let think: Bool?
     let reasoning_split: Bool?

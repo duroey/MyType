@@ -1,5 +1,6 @@
 import Foundation
 @preconcurrency import AVFoundation
+import Type4MeReviseCore
 
 struct ASRRequestOptions: Sendable, Equatable {
     var enablePunc: Bool = true
@@ -9,7 +10,12 @@ struct ASRRequestOptions: Sendable, Equatable {
     var bypassProxy: Bool = false
     /// When set, ASR clients connect to this URL instead of their default endpoint.
     var cloudProxyURL: String?
+    var customURLSessionConfiguration: URLSessionConfiguration?
+
     var urlSessionConfiguration: URLSessionConfiguration {
+        if let custom = customURLSessionConfiguration {
+            return custom
+        }
         let config = URLSessionConfiguration.default
         if bypassProxy {
             config.connectionProxyDictionary = [:]
@@ -17,20 +23,14 @@ struct ASRRequestOptions: Sendable, Equatable {
         return config
     }
 
-    /// Shared URLSession for ASR WebSocket connections.
-    /// Reusing one session across recordings keeps the TCP connection pool warm,
-    /// saving ~150-300ms on each subsequent connect (skips TCP + TLS handshake).
-    static let sharedSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
-        config.httpMaximumConnectionsPerHost = 4
-        return URLSession(configuration: config)
-    }()
-
-    /// The URLSession to use for ASR connections. Returns the shared session
-    /// unless bypassProxy is set (which needs a custom configuration).
-    var resolvedSession: URLSession {
-        bypassProxy ? URLSession(configuration: urlSessionConfiguration) : Self.sharedSession
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.enablePunc == rhs.enablePunc
+            && lhs.hotwords == rhs.hotwords
+            && lhs.boostingTableID == rhs.boostingTableID
+            && lhs.contextHistoryLength == rhs.contextHistoryLength
+            && lhs.bypassProxy == rhs.bypassProxy
+            && lhs.cloudProxyURL == rhs.cloudProxyURL
+            && lhs.customURLSessionConfiguration === rhs.customURLSessionConfiguration
     }
 }
 
@@ -82,6 +82,8 @@ enum InjectionOutcome: Sendable, Equatable {
     case inserted
     case copiedToClipboard
     case actionFailed(String)
+    case notInserted
+    case discarded
 
     var completionMessage: String {
         switch self {
@@ -91,6 +93,10 @@ enum InjectionOutcome: Sendable, Equatable {
             return L("已粘贴到剪贴板", "Copied to clipboard")
         case .actionFailed(let message):
             return message
+        case .notInserted:
+            return L("未找到可输入的位置", "No editable field found")
+        case .discarded:
+            return L("已取消", "Cancelled")
         }
     }
 }
@@ -112,9 +118,20 @@ enum RecognitionEvent: Sendable {
     /// status-specific icon and color, holding for ~3 seconds.
     case macActionResult(message: String, status: MacActionResultStatus)
     /// Selection ask mode: show a separate answer panel and stream Markdown into it.
-    case selectionAskStarted(question: String, selectedText: String)
-    case selectionAskAnswerDelta(String)
-    case selectionAskAnswerCompleted
+    case selectionAskStarted(
+        requestID: UUID,
+        question: String,
+        selectedText: String,
+        contextWasTruncated: Bool
+    )
+    case selectionAskAnswerDelta(requestID: UUID, delta: String)
+    case selectionAskAnswerCompleted(requestID: UUID)
+    case selectionAskAnswerFailed(requestID: UUID, message: String)
+    case reviseProcessing
+    case reviseCompleted(text: String, message: String, undoTicketID: UUID?)
+    case reviseFailed(ReviseFailure)
+    case reviseCancelled
+    case reviseUndone(text: String)
 }
 
 struct LLMConfig: Sendable {

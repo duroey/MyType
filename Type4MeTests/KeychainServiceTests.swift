@@ -9,16 +9,16 @@ final class KeychainServiceTests: XCTestCase {
     private var testStorageNamespace: String!
     private var originalMigrationMarker: Any?
     private var credentialsURL: URL {
-        testStorageDirectory.appendingPathComponent("credentials.json")
+        KeychainService.credentialsFileURL
     }
 
-    override func setUp() {
-        super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         let testID = UUID().uuidString.lowercased()
         testStorageDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("mytype-keychain-tests-\(testID)", isDirectory: true)
         testStorageNamespace = "com.mytype.tests.\(testID)"
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: testStorageDirectory,
             withIntermediateDirectories: true
         )
@@ -26,11 +26,23 @@ final class KeychainServiceTests: XCTestCase {
             directory: testStorageDirectory,
             namespace: testStorageNamespace
         )
+        guard KeychainService.isUsingTestStorage else {
+            throw XCTSkip("Keychain tests require isolated test storage")
+        }
         originalProvider = KeychainService.selectedASRProvider
         originalMigrationMarker = UserDefaults.standard.object(forKey: "tf_migratedFromTypeFlow")
     }
 
+    func testUsesIsolatedCredentialStorage() {
+        XCTAssertTrue(KeychainService.isUsingTestStorage)
+        XCTAssertEqual(credentialsURL.deletingLastPathComponent(), testStorageDirectory)
+    }
+
     override func tearDown() {
+        guard KeychainService.isUsingTestStorage else {
+            super.tearDown()
+            return
+        }
         KeychainService.delete(key: "test_key")
         try? KeychainService.saveASRCredentials(for: .volcano, values: [:])
         try? KeychainService.saveLLMCredentials(for: .doubao, values: [:])

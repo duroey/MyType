@@ -5,6 +5,7 @@ struct OpenAIASRConfig: ASRProviderConfig, Sendable {
     static let provider = ASRProvider.openai
     static let displayName = "OpenAI"
     static let defaultModel = "gpt-4o-transcribe"
+    static let defaultBaseURL = "https://api.openai.com/v1"
 
     static let credentialFields: [CredentialField] = [
         CredentialField(key: "apiKey", label: L("API Key", "API Key"), placeholder: "sk-...", isSecure: true, isOptional: false, defaultValue: ""),
@@ -18,9 +19,12 @@ struct OpenAIASRConfig: ASRProviderConfig, Sendable {
                 FieldOption(value: "whisper-1", label: "Whisper ($0.36/hr)"),
             ]
         ),
+        CredentialField(
+            key: "baseURL", label: L("Base URL", "Base URL"),
+            placeholder: defaultBaseURL,
+            isSecure: false, isOptional: true, defaultValue: defaultBaseURL
+        ),
     ]
-
-    private static let defaultBaseURL = "https://api.openai.com/v1"
 
     let apiKey: String
     let model: String
@@ -32,9 +36,14 @@ struct OpenAIASRConfig: ASRProviderConfig, Sendable {
         self.model = credentials["model"]?.isEmpty == false
             ? credentials["model"]!
             : Self.defaultModel
-        self.baseURL = credentials["baseURL"]?.isEmpty == false
-            ? credentials["baseURL"]!
+        let configuredBaseURL = credentials["baseURL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedBaseURL = configuredBaseURL?.isEmpty == false
+            ? configuredBaseURL!
             : Self.defaultBaseURL
+        self.baseURL = resolvedBaseURL.hasSuffix("/")
+            ? String(resolvedBaseURL.dropLast())
+            : resolvedBaseURL
     }
 
     func toCredentials() -> [String: String] {

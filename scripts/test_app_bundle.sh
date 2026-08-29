@@ -20,6 +20,8 @@ read_plist() {
 [ -f "$INFO_PLIST" ] || fail "Info.plist missing at $INFO_PLIST"
 [ -f "$APP_PATH/Contents/MacOS/Type4Me" ] || fail "app executable missing"
 [ -f "$APP_PATH/Contents/Resources/AppIcon.icns" ] || fail "app icon missing"
+[ -f "$APP_PATH/Contents/Resources/Assets/type4me-wordmark-light.svg" ] || fail "light wordmark missing"
+[ -f "$APP_PATH/Contents/Resources/Assets/type4me-wordmark-dark.svg" ] || fail "dark wordmark missing"
 
 [ "$(read_plist CFBundleExecutable)" = "Type4Me" ] || fail "CFBundleExecutable should be Type4Me"
 [ "$(read_plist CFBundleIdentifier)" = "com.mytype.app" ] || fail "CFBundleIdentifier should be com.mytype.app"

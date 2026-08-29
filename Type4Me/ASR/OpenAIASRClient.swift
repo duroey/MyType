@@ -82,7 +82,7 @@ actor OpenAIASRClient: SpeechRecognizer {
             return
         }
 
-        let wavData = Self.wavFromPCM(audioBuffer)
+        let wavData = WAVEncoder.encode(pcmData: audioBuffer)
         logger.info("Sending \(wavData.count) bytes WAV to OpenAI transcription")
 
         let text = try await transcribe(wavData: wavData, config: config)
@@ -155,44 +155,6 @@ actor OpenAIASRClient: SpeechRecognizer {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         logger.info("OpenAI ASR result: \(trimmed.count) chars")
         return trimmed
-    }
-
-    // MARK: - WAV Encoding
-
-    private static func wavFromPCM(_ pcmData: Data) -> Data {
-        let dataSize = UInt32(pcmData.count)
-        let fileSize = 36 + dataSize
-
-        var wav = Data(capacity: 44 + pcmData.count)
-
-        wav.append(contentsOf: [0x52, 0x49, 0x46, 0x46])  // "RIFF"
-        appendUInt32(&wav, fileSize)
-        wav.append(contentsOf: [0x57, 0x41, 0x56, 0x45])  // "WAVE"
-
-        wav.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])  // "fmt "
-        appendUInt32(&wav, 16)
-        appendUInt16(&wav, 1)        // PCM format
-        appendUInt16(&wav, 1)        // mono
-        appendUInt32(&wav, 16000)    // sample rate
-        appendUInt32(&wav, 32000)    // byte rate
-        appendUInt16(&wav, 2)        // block align
-        appendUInt16(&wav, 16)       // bits per sample
-
-        wav.append(contentsOf: [0x64, 0x61, 0x74, 0x61])  // "data"
-        appendUInt32(&wav, dataSize)
-        wav.append(pcmData)
-
-        return wav
-    }
-
-    private static func appendUInt32(_ data: inout Data, _ value: UInt32) {
-        var v = value.littleEndian
-        data.append(Data(bytes: &v, count: 4))
-    }
-
-    private static func appendUInt16(_ data: inout Data, _ value: UInt16) {
-        var v = value.littleEndian
-        data.append(Data(bytes: &v, count: 2))
     }
 }
 

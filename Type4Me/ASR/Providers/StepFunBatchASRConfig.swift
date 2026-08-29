@@ -26,7 +26,7 @@ enum StepFunBatchAccessMode: String, Sendable, CaseIterable {
 struct StepFunBatchASRConfig: ASRProviderConfig, Sendable {
 
     static let provider = ASRProvider.stepfunBatch
-    static let displayName = L("阶跃星辰（非实时）", "StepFun (Batch)")
+    static let displayName = L("阶跃星辰", "StepFun")
     static let defaultModel = "stepaudio-2.5-asr"
     static let stepPlanEndpoint = "https://api.stepfun.com/step_plan/v1/audio/asr/sse"
     static let standardEndpoint = "https://api.stepfun.com/v1/audio/asr/sse"

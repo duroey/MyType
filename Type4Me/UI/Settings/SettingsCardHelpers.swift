@@ -1,5 +1,56 @@
 import SwiftUI
 
+// MARK: - Shared Settings Tooltip
+
+/// Immediate black tooltip used by icon-only controls throughout Settings.
+/// Keeping this separate from SwiftUI's delayed `.help` modifier makes the
+/// interaction consistent across the Vocabulary and History pages.
+struct SettingsTooltipBubble: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.black.opacity(0.92))
+            )
+            .fixedSize(horizontal: true, vertical: false)
+            .allowsHitTesting(false)
+    }
+}
+
+private struct SettingsTooltipModifier: ViewModifier {
+    let text: String
+    let isEnabled: Bool
+
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .top) {
+                if isHovered && isEnabled {
+                    SettingsTooltipBubble(text: text)
+                        .offset(y: 40)
+                        .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                }
+            }
+            .zIndex(isHovered && isEnabled ? 30 : 0)
+            .onHover { isHovered = $0 }
+            .animation(.easeOut(duration: 0.08), value: isHovered)
+    }
+}
+
+extension View {
+    func settingsTooltip(_ text: String, isEnabled: Bool = true) -> some View {
+        modifier(SettingsTooltipModifier(text: text, isEnabled: isEnabled))
+    }
+}
+
 // MARK: - Shared Types
 
 enum SettingsTestStatus: Equatable {
@@ -26,8 +77,147 @@ enum SettingsTestStatus: Equatable {
 
 protocol SettingsCardHelpers {}
 
+enum SettingsControlWidth {
+    static let toggle: CGFloat = 52
+    static let standard: CGFloat = 240
+    static let provider: CGFloat = 320
+    static let input: CGFloat = 360
+}
+
+private struct SettingsOptionRowLayout: Layout {
+    let controlWidth: CGFloat
+    private let horizontalSpacing: CGFloat = 24
+    private let verticalSpacing: CGFloat = 10
+    private let minimumLabelWidth: CGFloat = 220
+    private let minimumRowHeight: CGFloat = 56
+
+    private func usesHorizontalLayout(availableWidth: CGFloat) -> Bool {
+        availableWidth >= minimumLabelWidth + horizontalSpacing + controlWidth
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        guard subviews.count == 2 else { return .zero }
+        let availableWidth = proposal.width
+            ?? (minimumLabelWidth + horizontalSpacing + controlWidth)
+
+        if usesHorizontalLayout(availableWidth: availableWidth) {
+            let labelWidth = availableWidth - horizontalSpacing - controlWidth
+            let labelSize = subviews[0].sizeThatFits(
+                ProposedViewSize(width: labelWidth, height: proposal.height)
+            )
+            let controlSize = subviews[1].sizeThatFits(
+                ProposedViewSize(width: controlWidth, height: proposal.height)
+            )
+            return CGSize(
+                width: availableWidth,
+                height: max(minimumRowHeight, labelSize.height, controlSize.height)
+            )
+        }
+
+        let labelSize = subviews[0].sizeThatFits(
+            ProposedViewSize(width: availableWidth, height: nil)
+        )
+        let controlSize = subviews[1].sizeThatFits(
+            ProposedViewSize(width: availableWidth, height: nil)
+        )
+        return CGSize(
+            width: availableWidth,
+            height: labelSize.height + verticalSpacing + controlSize.height + 20
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard subviews.count == 2 else { return }
+
+        if usesHorizontalLayout(availableWidth: bounds.width) {
+            let labelWidth = bounds.width - horizontalSpacing - controlWidth
+            subviews[0].place(
+                at: CGPoint(x: bounds.minX, y: bounds.midY),
+                anchor: .leading,
+                proposal: ProposedViewSize(width: labelWidth, height: bounds.height)
+            )
+            subviews[1].place(
+                at: CGPoint(x: bounds.maxX, y: bounds.midY),
+                anchor: .trailing,
+                proposal: ProposedViewSize(width: controlWidth, height: bounds.height)
+            )
+        } else {
+            let contentWidth = bounds.width
+            let labelSize = subviews[0].sizeThatFits(
+                ProposedViewSize(width: contentWidth, height: nil)
+            )
+            subviews[0].place(
+                at: CGPoint(x: bounds.minX, y: bounds.minY + 10),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: contentWidth, height: labelSize.height)
+            )
+            subviews[1].place(
+                at: CGPoint(x: bounds.minX, y: bounds.minY + 10 + labelSize.height + verticalSpacing),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: contentWidth, height: nil)
+            )
+        }
+    }
+}
+
 @MainActor
 extension SettingsCardHelpers {
+
+    func settingsOptionRow<Control: View>(
+        _ label: String,
+        subtitle: String? = nil,
+        controlWidth: CGFloat = SettingsControlWidth.standard,
+        @ViewBuilder control: () -> Control
+    ) -> some View {
+        SettingsOptionRowLayout(controlWidth: controlWidth) {
+            settingsOptionLabel(label, subtitle: subtitle)
+            control()
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+    }
+
+    func settingsToggleRow(
+        _ label: String,
+        subtitle: String? = nil,
+        isOn: Binding<Bool>,
+        isEnabled: Bool = true
+    ) -> some View {
+        settingsOptionRow(
+            label,
+            subtitle: subtitle,
+            controlWidth: SettingsControlWidth.toggle
+        ) {
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(.black)
+                .disabled(!isEnabled)
+        }
+    }
+
+    private func settingsOptionLabel(_ label: String, subtitle: String?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(TF.settingsText)
+            if let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
 
     func settingsGroupCard<Content: View>(
         _ title: String,
@@ -35,118 +225,100 @@ extension SettingsCardHelpers {
         trailing: AnyView? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
                 if let icon {
                     Image(systemName: icon)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(TF.settingsAccentAmber)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(TF.settingsText)
                 }
-                Text(title.uppercased())
-                    .font(.system(size: 11, weight: .semibold))
-                    .tracking(1.2)
-                    .foregroundStyle(TF.settingsTextTertiary)
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(TF.settingsText)
                 Spacer()
                 if let trailing {
                     trailing
                 }
             }
-            .padding(.bottom, 14)
+            .padding(.horizontal, 2)
 
-            content()
+            VStack(alignment: .leading, spacing: 0) {
+                content()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.clear)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(TF.settingsBorder, lineWidth: 1)
+                    )
+            )
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(TF.settingsBg)
-        )
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     func settingsField(_ label: String, text: Binding<String>, prompt: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.8)
-                .foregroundStyle(TF.settingsTextTertiary)
+        settingsOptionRow(label, controlWidth: SettingsControlWidth.input) {
             FixedWidthTextField(text: text, placeholder: prompt)
                 .padding(.horizontal, 12)
                 .frame(height: 36)
                 .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsCardAlt))
         }
-        .padding(.vertical, 6)
     }
 
     func settingsPickerField(_ label: String, selection: Binding<String>, options: [FieldOption]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.8)
-                .foregroundStyle(TF.settingsTextTertiary)
+        settingsOptionRow(label, controlWidth: SettingsControlWidth.input) {
             settingsDropdown(
                 selection: selection,
                 options: options.map { ($0.value, $0.label) }
             )
         }
-        .padding(.vertical, 6)
     }
 
     func settingsSecureField(_ label: String, text: Binding<String>, prompt: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.8)
-                .foregroundStyle(TF.settingsTextTertiary)
+        settingsOptionRow(label, controlWidth: SettingsControlWidth.input) {
             FixedWidthSecureField(text: text, placeholder: prompt)
                 .padding(.horizontal, 12)
                 .frame(height: 36)
                 .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsCardAlt))
         }
-        .padding(.vertical, 6)
     }
 
     func credentialSummaryCard(rows: [(String, String)]) -> some View {
-        let pairedRows = stride(from: 0, to: rows.count, by: 2).map { i in
-            Array(rows[i..<min(i+2, rows.count)])
-        }
         return VStack(spacing: 0) {
-            ForEach(Array(pairedRows.enumerated()), id: \.offset) { index, pair in
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, item in
                 if index > 0 { SettingsDivider() }
-                HStack(alignment: .top, spacing: 16) {
-                    ForEach(Array(pair.enumerated()), id: \.offset) { _, item in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(item.0.uppercased())
-                                .font(.system(size: 10, weight: .semibold))
-                                .tracking(0.8)
-                                .foregroundStyle(TF.settingsTextTertiary)
-                            HStack {
-                                Text(item.1)
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(TF.settingsTextSecondary)
-                                Spacer()
-                            }
-                            .padding(.horizontal, 12)
-                            .frame(height: 36)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(TF.settingsCardAlt)
-                            )
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                settingsOptionRow(item.0, controlWidth: SettingsControlWidth.input) {
+                    HStack {
+                        Text(item.1)
+                            .font(.system(size: 13))
+                            .foregroundStyle(TF.settingsTextSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
                     }
-                    if pair.count == 1 {
-                        Spacer().frame(maxWidth: .infinity)
-                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: 36)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(TF.settingsCardAlt)
+                    )
                 }
-                .padding(.vertical, 6)
             }
         }
     }
 
     // MARK: - Custom Controls
 
-    /// Custom dropdown that matches the design mockup (rounded rect + chevron).
-    func settingsDropdown(selection: Binding<String>, options: [(value: String, label: String)], icon: String? = nil) -> some View {
+    /// Custom dropdown whose visible width follows the current selection.
+    func settingsDropdown(
+        selection: Binding<String>,
+        options: [(value: String, label: String)],
+        icon: String? = nil
+    ) -> some View {
         let currentLabel = options.first(where: { $0.value == selection.wrappedValue })?.label ?? selection.wrappedValue
         return Menu {
             ForEach(options, id: \.value) { option in
@@ -158,28 +330,37 @@ extension SettingsCardHelpers {
                 }
             }
         } label: {
-            HStack(spacing: 8) {
-                if let icon {
-                    Image(systemName: icon)
-                        .font(.system(size: 12))
-                        .foregroundStyle(TF.settingsTextTertiary)
-                }
-                Text(currentLabel)
-                    .font(.system(size: 13))
-                    .foregroundStyle(TF.settingsText)
-                Spacer()
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(TF.settingsTextTertiary)
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 36)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(TF.settingsCardAlt)
-            )
+            settingsDropdownLabel(currentLabel, icon: icon)
         }
         .buttonStyle(.plain)
+    }
+
+    func settingsDropdownLabel(
+        _ label: String,
+        icon: String? = nil
+    ) -> some View {
+        HStack(spacing: 8) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+                    .foregroundStyle(TF.settingsTextTertiary)
+            }
+            Text(label)
+                .font(.system(size: 13))
+                .foregroundStyle(TF.settingsText)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(TF.settingsTextTertiary)
+        }
+        .padding(.horizontal, 12)
+        .frame(minWidth: 88, minHeight: 36)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(TF.settingsCardAlt)
+        )
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     /// Custom segmented picker with dark selected pill.
@@ -220,7 +401,7 @@ extension SettingsCardHelpers {
             .foregroundStyle(.white)
             .padding(.horizontal, 16)
             .padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 8).fill(TF.settingsAccentAmber))
+            .background(RoundedRectangle(cornerRadius: 9).fill(TF.settingsAccentBlue))
             .contentShape(Rectangle())
     }
 

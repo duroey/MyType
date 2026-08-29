@@ -38,7 +38,7 @@ struct SmartCorrectionSheet: View {
     @State private var hotwordSuggestions: [HotwordSuggestion] = []
     @State private var hotwordReason: String = ""
 
-    private let historyStore = HistoryStore()
+    private let historyStore = HistoryStore.shared
     private let generator = ASRVariantGenerator()
 
     // MARK: - Computed
@@ -291,7 +291,8 @@ struct SmartCorrectionSheet: View {
                     Text(L("选中:", "Selected:"))
                         .foregroundStyle(TF.settingsTextTertiary)
                     Text(selectedText)
-                        .foregroundStyle(TF.settingsAccentAmber)
+                        .foregroundStyle(TF.settingsText)
+                        .fontWeight(.semibold)
                 }
                 .font(.system(size: 11))
                 .padding(.top, TF.spacingSM)
@@ -325,7 +326,7 @@ struct SmartCorrectionSheet: View {
                 .foregroundStyle(isSelected ? .white : TF.settingsText)
                 .background(
                     RoundedRectangle(cornerRadius: TF.cornerSM)
-                        .fill(isSelected ? TF.settingsAccentAmber : TF.settingsBg)
+                        .fill(isSelected ? TF.settingsText : TF.settingsBg)
                 )
         }
         .buttonStyle(.plain)
@@ -531,7 +532,7 @@ struct SmartCorrectionSheet: View {
                     .padding(.vertical, 7)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(canGenerate ? TF.settingsAccentAmber : TF.settingsTextTertiary.opacity(0.3))
+                            .fill(canGenerate ? TF.settingsText : TF.settingsTextTertiary.opacity(0.3))
                     )
                     .contentShape(Rectangle())
                 }

@@ -29,7 +29,7 @@ esac
 APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/${APP_NAME}.app}"
 APP_EXECUTABLE="${APP_EXECUTABLE:-Type4Me}"
 APP_ICON_NAME="${APP_ICON_NAME:-AppIcon}"
-APP_VERSION="${APP_VERSION:-2.0.0}"
+APP_VERSION="${APP_VERSION:-2.3.0}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 VARIANT="${VARIANT:-cloud}"    # cloud or local
@@ -134,6 +134,19 @@ echo "Packaging app bundle at $APP_PATH..."
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
 cp "$PROJECT_DIR/Type4Me/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
+mkdir -p "$APP_PATH/Contents/Resources/Assets"
+cp "$PROJECT_DIR/Type4Me/Resources/Assets/"*.svg "$APP_PATH/Contents/Resources/Assets/"
+BINARY_DIR="$(dirname "$BINARY")"
+find "$BINARY_DIR" -maxdepth 1 -name "*.bundle" -exec cp -R {} "$APP_PATH/Contents/Resources/" \; 2>/dev/null || true
+
+if [ -f "$PROJECT_DIR/CppJiebaBridge/marker" ]; then
+    mkdir -p "$APP_PATH/Contents/Resources/Jieba"
+    cp "$PROJECT_DIR/Type4Me/Resources/Jieba/dict.txt.small" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/Type4Me/Resources/Jieba/hmm_model.utf8" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/Type4Me/Resources/Jieba/user.dict.utf8" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/CppJiebaBridge/CPPJIEBA_LICENSE" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/CppJiebaBridge/JIEBA_LICENSE" "$APP_PATH/Contents/Resources/Jieba/"
+fi
 
 cat >"$INFO_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

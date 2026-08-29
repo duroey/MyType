@@ -1,7 +1,8 @@
 import Foundation
 
 enum AppIdentity {
-    static let displayName = "mytype"
+    static let displayName = "MyType"
+    static let urlScheme = "mytype"
     static let supportDirectoryName = "mytype"
     static let legacySupportDirectoryNames = ["Type4Me", "MyType"]
 

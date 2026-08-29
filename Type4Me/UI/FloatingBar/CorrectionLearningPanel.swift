@@ -1,0 +1,295 @@
+import AppKit
+import SwiftUI
+
+@MainActor
+private final class CorrectionLearningPanelState: ObservableObject {
+    enum Status {
+        case candidate
+        case learned
+        case saveFailed
+    }
+
+    @Published var candidate: CorrectionCandidate?
+    @Published var status: Status = .candidate
+    @Published var remainingSeconds = 12
+    @Published var isPresented = false
+    var onLearn: (() -> Void)?
+    var onIgnore: (() -> Void)?
+}
+
+private final class CorrectionLearningPanel: NSPanel {
+    init(contentRect: NSRect) {
+        super.init(
+            contentRect: contentRect,
+            styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        isFloatingPanel = true
+        level = .floating
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        ignoresMouseEvents = false
+        animationBehavior = .utilityWindow
+        appearance = NSAppearance(named: .darkAqua)
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    func positionAboveFloatingBar() {
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else { return }
+        let visible = screen.visibleFrame
+        let x = visible.midX - frame.width / 2
+        let y = visible.origin.y + TF.barBottomOffset + TF.barHeight + 18
+        setFrameOrigin(NSPoint(x: x, y: y))
+    }
+}
+
+@MainActor
+final class CorrectionLearningPanelController {
+    private let panel: CorrectionLearningPanel
+    private let state = CorrectionLearningPanelState()
+    private var lifecycleTask: Task<Void, Never>?
+    private var generation = 0
+
+    init() {
+        let frame = NSRect(x: 0, y: 0, width: 500, height: 200)
+        panel = CorrectionLearningPanel(contentRect: frame)
+        let hosting = NSHostingView(rootView: CorrectionLearningCardView(state: state))
+        hosting.frame = frame
+        hosting.autoresizingMask = [.width, .height]
+        panel.contentView = hosting
+        panel.setFrame(frame, display: false)
+    }
+
+    func show(
+        candidate: CorrectionCandidate,
+        onLearn: @escaping () -> Void,
+        onIgnore: @escaping () -> Void
+    ) {
+        generation &+= 1
+        lifecycleTask?.cancel()
+        state.candidate = candidate
+        state.status = .candidate
+        state.remainingSeconds = 12
+        state.isPresented = true
+        state.onLearn = onLearn
+        state.onIgnore = onIgnore
+        panel.positionAboveFloatingBar()
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
+
+        scheduleAutoIgnore()
+    }
+
+    func showLearned() {
+        state.status = .learned
+        state.onLearn = nil
+        state.onIgnore = nil
+        lifecycleTask?.cancel()
+        lifecycleTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.2))
+            guard !Task.isCancelled else { return }
+            self?.hide()
+        }
+    }
+
+    func showSaveFailure() {
+        state.status = .saveFailed
+        state.remainingSeconds = 12
+        scheduleAutoIgnore()
+    }
+
+    func hide() {
+        generation &+= 1
+        lifecycleTask?.cancel()
+        lifecycleTask = nil
+        state.onLearn = nil
+        state.onIgnore = nil
+        state.isPresented = false
+        guard panel.isVisible else { return }
+        let expectedGeneration = generation
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.generation == expectedGeneration else { return }
+                self.panel.orderOut(nil)
+            }
+        })
+    }
+
+    private func scheduleAutoIgnore() {
+        lifecycleTask?.cancel()
+        let expectedGeneration = generation
+        lifecycleTask = Task { [weak self] in
+            for remaining in stride(from: 11, through: 0, by: -1) {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled,
+                      let self,
+                      self.generation == expectedGeneration
+                else { return }
+                self.state.remainingSeconds = remaining
+            }
+            guard let self, self.generation == expectedGeneration else { return }
+            let ignore = self.state.onIgnore
+            self.hide()
+            ignore?()
+        }
+    }
+}
+
+private struct CorrectionLearningCardView: View {
+    @ObservedObject var state: CorrectionLearningPanelState
+
+    var body: some View {
+        ZStack {
+            if let candidate = state.candidate, state.status != .learned {
+                HStack(spacing: 28) {
+                    Text(candidate.wrongText)
+                        .strikethrough()
+                        .foregroundStyle(secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 165, alignment: .trailing)
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(primaryText)
+                    Text(candidate.correctedText)
+                        .foregroundStyle(primaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 165, alignment: .leading)
+                }
+                .font(.system(size: 20, weight: .semibold))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            } else if state.status == .learned {
+                Text(L("已加入个人词库", "Added to your vocabulary"))
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(primaryText)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 8) {
+                    animatedStatusIcon
+                    Text(statusTitle)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryText)
+                    Spacer()
+                }
+
+                Spacer()
+
+                if state.status != .learned {
+                    HStack(spacing: 10) {
+                        Text(L("添加到热词和片段替换", "Add to hotwords and replacements"))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(secondaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+
+                        Button(L("忽略 (\(state.remainingSeconds)s)", "Ignore (\(state.remainingSeconds)s)")) {
+                            state.onIgnore?()
+                        }
+                        .buttonStyle(CorrectionCardButtonStyle(isPrimary: false, fixedWidth: 96))
+
+                        Button(state.status == .saveFailed ? L("重试", "Retry") : L("添加", "Add")) {
+                            state.onLearn?()
+                        }
+                        .buttonStyle(CorrectionCardButtonStyle(isPrimary: true))
+                    }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(Color(red: 0.095, green: 0.095, blue: 0.095).opacity(0.98))
+        )
+        .padding(6)
+    }
+
+    private let primaryText = Color(red: 1, green: 1, blue: 1)
+    private let secondaryText = Color(red: 138 / 255, green: 138 / 255, blue: 138 / 255)
+
+    @ViewBuilder
+    private var animatedStatusIcon: some View {
+        if #available(macOS 15.0, *), state.status == .candidate {
+            Image(systemName: "sparkles")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(primaryText)
+                .symbolEffect(.breathe, options: .repeating, isActive: state.isPresented)
+        } else {
+            Image(systemName: state.status == .candidate ? "sparkles" : statusIcon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(primaryText)
+                .symbolEffect(
+                    .pulse,
+                    options: .repeating,
+                    isActive: state.isPresented && state.status == .candidate
+                )
+        }
+    }
+
+    private var statusTitle: String {
+        switch state.status {
+        case .candidate:
+            return L(
+                "\(AppIdentity.displayName) 发现了一次纠正",
+                "\(AppIdentity.displayName) detected a correction"
+            )
+        case .learned: return L("已学习", "Learned")
+        case .saveFailed: return L("保存失败，请重试", "Couldn’t save. Try again")
+        }
+    }
+
+    private var statusIcon: String {
+        switch state.status {
+        case .candidate: return "sparkles"
+        case .learned: return "checkmark.circle.fill"
+        case .saveFailed: return "exclamationmark.triangle.fill"
+        }
+    }
+
+}
+
+private struct CorrectionCardButtonStyle: ButtonStyle {
+    let isPrimary: Bool
+    var fixedWidth: CGFloat? = nil
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(isPrimary ? Color.black : Color.white)
+            .padding(.horizontal, fixedWidth == nil ? 14 : 0)
+            .frame(width: fixedWidth, height: 34)
+            .background(
+                Capsule().fill(
+                    isPrimary
+                        ? Color(red: 251 / 255, green: 251 / 255, blue: 251 / 255)
+                            .opacity(configuration.isPressed ? 0.78 : 1)
+                        : Color(red: 51 / 255, green: 51 / 255, blue: 51 / 255)
+                            .opacity(configuration.isPressed ? 0.76 : 1)
+                )
+            )
+    }
+}

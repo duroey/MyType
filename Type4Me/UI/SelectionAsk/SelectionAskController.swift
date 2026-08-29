@@ -5,11 +5,28 @@ import SwiftUI
 @Observable
 final class SelectionAskState {
     struct Turn: Identifiable, Equatable {
-        let id = UUID()
+        let id: UUID
         var question: String
         var answer: String
         var isLoading: Bool
         var errorMessage: String?
+        var isInterrupted: Bool
+
+        init(
+            id: UUID = UUID(),
+            question: String,
+            answer: String,
+            isLoading: Bool,
+            errorMessage: String? = nil,
+            isInterrupted: Bool = false
+        ) {
+            self.id = id
+            self.question = question
+            self.answer = answer
+            self.isLoading = isLoading
+            self.errorMessage = errorMessage
+            self.isInterrupted = isInterrupted
+        }
     }
 
     enum Phase: Equatable {
@@ -24,6 +41,16 @@ final class SelectionAskState {
     var phase: Phase = .idle
     var turns: [Turn] = []
     var isRecordingFollowUp = false
+    var followUpShortcutHint = ""
+    var isHistoryEnabled = true
+
+    /// Whether the answer UI should run its indeterminate loading animation.
+    /// Treating `.idle` as loading keeps a hidden, eagerly-created panel
+    /// repainting continuously even when Type4Me is otherwise inactive.
+    var isAnswerLoading: Bool {
+        if case .loading = phase { return true }
+        return false
+    }
 
     var activeAnswer: String {
         switch phase {
@@ -121,19 +148,25 @@ enum SelectionAskPromptBuilder {
 
 @MainActor
 final class SelectionAskPanel: NSPanel {
+    var onEscape: (() -> Void)?
+
     init(contentRect: NSRect) {
         super.init(
             contentRect: contentRect,
-            styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
+            styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView, .resizable],
             backing: .buffered,
             defer: false
         )
 
+        minSize = NSSize(width: 560, height: 440)
+        maxSize = NSSize(width: 820, height: 760)
+        contentMinSize = minSize
+        contentMaxSize = maxSize
         isFloatingPanel = true
         level = .floating
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = false
+        hasShadow = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate = false
         animationBehavior = .utilityWindow
@@ -142,73 +175,178 @@ final class SelectionAskPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        onEscape?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard event.keyCode != 53 else {
+            onEscape?()
+            return
+        }
+        super.keyDown(with: event)
+    }
 }
 
 @MainActor
 final class SelectionAskController {
-    private let state = SelectionAskState()
+    let coordinator: AskAnythingCoordinator
+    private var state: SelectionAskState { coordinator.state }
     private let panel: SelectionAskPanel
     private var requestGeneration = 0
-    private let onFollowUp: (String) -> Bool
-    private var awaitingFollowUpTurn = false
+    private let onStartFollowUp: (SelectionAskRequestContext) -> Bool
+    private let onFinishFollowUp: () -> Void
+    private let onCancelFollowUp: () -> Void
+    private let onOpenInType4Me: (UUID) -> Void
+    private let onBecameReleasable: () -> Void
+    private var currentRequestID: UUID?
 
-    init(onFollowUp: @escaping (String) -> Bool = { _ in false }) {
-        self.onFollowUp = onFollowUp
-        let size = NSSize(width: 860, height: 760)
+    init(
+        coordinator: AskAnythingCoordinator? = nil,
+        onStartFollowUp: @escaping (SelectionAskRequestContext) -> Bool = { _ in false },
+        onStartNewQuestion: @escaping (SelectionAskRequestContext) -> Bool = { _ in false },
+        onFinishFollowUp: @escaping () -> Void = {},
+        onCancelFollowUp: @escaping () -> Void = {},
+        onOpenInType4Me: @escaping (UUID) -> Void = { _ in },
+        onBecameReleasable: @escaping () -> Void = {}
+    ) {
+        let ownsCoordinator = coordinator == nil
+        self.coordinator = coordinator ?? AskAnythingCoordinator(
+            store: AskAnythingStore(path: ":memory:"),
+            historyEnabled: false
+        )
+        self.onStartFollowUp = onStartFollowUp
+        self.onFinishFollowUp = onFinishFollowUp
+        self.onCancelFollowUp = onCancelFollowUp
+        self.onOpenInType4Me = onOpenInType4Me
+        self.onBecameReleasable = onBecameReleasable
+        if ownsCoordinator {
+            self.coordinator.configureRuntime(
+                onStartFollowUp: onStartFollowUp,
+                onStartNewQuestion: onStartNewQuestion,
+                onFinishFollowUp: onFinishFollowUp,
+                onCancelFollowUp: onCancelFollowUp
+            )
+        }
+        let size = NSSize(width: 680, height: 560)
         panel = SelectionAskPanel(contentRect: NSRect(origin: .zero, size: size))
 
-        let view = SelectionAskView(state: state) { [weak self] in
-            self?.hide()
+        let view = SelectionAskView(state: self.coordinator.state) { [weak self] in
+            self?.close()
         } onFollowUp: { [weak self] in
-            self?.toggleFollowUpRecording()
+            _ = self?.performPrimaryFollowUpAction()
+        } onCancelFollowUp: { [weak self] in
+            _ = self?.handleActiveRecordingAction(.cancel)
+        } onOpenInType4Me: { [weak self] in
+            self?.openInType4Me()
         }
         let hosting = NSHostingView(rootView: view)
         hosting.frame = NSRect(origin: .zero, size: size)
         hosting.autoresizingMask = [.width, .height]
         panel.contentView = hosting
         panel.setFrame(NSRect(origin: .zero, size: size), display: false)
+        panel.onEscape = { [weak self] in
+            self?.handleEscape()
+        }
+    }
+
+    var isVisible: Bool { panel.isVisible }
+    var isReleasable: Bool {
+        !panel.isVisible && !state.isRecordingFollowUp && currentRequestID == nil
+    }
+
+    var isRecordingFollowUp: Bool { state.isRecordingFollowUp }
+    var turns: [SelectionAskState.Turn] { state.turns }
+
+    func updateFollowUpShortcutHint(_ hint: String) {
+        coordinator.updateFollowUpShortcutHint(hint)
     }
 
     func begin(question: String, selectedText: String) {
+        begin(
+            requestID: coordinator.pendingFollowUpRequestID ?? UUID(),
+            question: question,
+            selectedText: selectedText
+        )
+    }
+
+    func begin(
+        requestID: UUID,
+        question: String,
+        selectedText: String,
+        contextWasTruncated: Bool = false
+    ) {
         requestGeneration &+= 1
-        state.question = question
-        state.selectedText = selectedText
-        state.phase = .loading
-        state.isRecordingFollowUp = false
-        if awaitingFollowUpTurn, !state.turns.isEmpty {
-            state.turns.append(SelectionAskState.Turn(question: question, answer: "", isLoading: true))
+        currentRequestID = requestID
+        coordinator.begin(
+            requestID: requestID,
+            question: question,
+            selectedText: selectedText,
+            contextWasTruncated: contextWasTruncated
+        )
+        if coordinator.presentation == .panel {
+            show()
         } else {
-            state.turns = [SelectionAskState.Turn(question: question, answer: "", isLoading: true)]
+            hide()
         }
-        awaitingFollowUpTurn = false
-        show()
     }
 
     func appendAnswerDelta(_ delta: String) {
-        if !state.turns.isEmpty {
-            state.turns[state.turns.count - 1].answer += delta
-            state.turns[state.turns.count - 1].isLoading = false
+        guard let currentRequestID else {
+            coordinator.appendTransientAnswerDelta(delta)
+            return
         }
-        switch state.phase {
-        case .answered(let current):
-            state.phase = .answered(current + delta)
-        case .loading, .idle:
-            state.phase = .answered(delta)
-        case .error:
-            break
-        }
+        coordinator.appendAnswerDelta(requestID: currentRequestID, delta: delta)
     }
 
     func completeAnswer() {
-        if !state.turns.isEmpty {
-            state.turns[state.turns.count - 1].isLoading = false
-        }
-        if case .loading = state.phase {
-            state.phase = .answered("")
-        }
+        guard let currentRequestID else { return }
+        coordinator.completeAnswer(requestID: currentRequestID)
+        self.currentRequestID = nil
+        notifyIfReleasable()
     }
 
-    func showError(_ message: String) {
+    /// Completes the answer only when the terminal event owns this request.
+    ///
+    /// Args:
+    ///   requestID: Identifier carried by the recognition terminal event.
+    ///
+    /// Returns:
+    ///   `true` when the current request was completed.
+    @discardableResult
+    func completeAnswer(requestID: UUID) -> Bool {
+        guard currentRequestID == requestID else { return false }
+        coordinator.completeAnswer(requestID: requestID)
+        currentRequestID = nil
+        notifyIfReleasable()
+        return true
+    }
+
+    func appendAnswerDelta(requestID: UUID, delta: String) {
+        guard currentRequestID == requestID else { return }
+        coordinator.appendAnswerDelta(requestID: requestID, delta: delta)
+    }
+
+    /// Fails the answer only when the terminal event owns this request.
+    ///
+    /// Args:
+    ///   requestID: Identifier carried by the recognition terminal event.
+    ///   message: User-facing failure message.
+    ///
+    /// Returns:
+    ///   `true` when the current request was failed.
+    @discardableResult
+    func showError(requestID: UUID, message: String) -> Bool {
+        guard currentRequestID == requestID else { return false }
+        coordinator.failAnswer(requestID: requestID, message: message)
+        currentRequestID = nil
+        notifyIfReleasable()
+        return true
+    }
+
+    func showTransientError(_ message: String) {
+        coordinator.appendTransientAnswerDelta(message)
         if !state.turns.isEmpty {
             state.turns[state.turns.count - 1].errorMessage = message
             state.turns[state.turns.count - 1].isLoading = false
@@ -216,13 +354,35 @@ final class SelectionAskController {
         state.phase = .error(message)
     }
 
-    func cancelFollowUpRecording() {
-        state.isRecordingFollowUp = false
-        awaitingFollowUpTurn = false
+    func showError(_ message: String) {
+        if let currentRequestID {
+            coordinator.failAnswer(requestID: currentRequestID, message: message)
+            self.currentRequestID = nil
+            notifyIfReleasable()
+        } else {
+            showTransientError(message)
+        }
+    }
+
+    func recordingDidEnd(_ action: RecordingControlAction) {
+        coordinator.recordingDidEnd(action)
+        notifyIfReleasable()
     }
 
     func hide() {
         panel.orderOut(nil)
+        notifyIfReleasable()
+    }
+
+    func close() {
+        _ = handleActiveRecordingAction(.cancel)
+        hide()
+    }
+
+    func releasePanelResources() {
+        panel.orderOut(nil)
+        panel.contentView = nil
+        panel.onEscape = nil
     }
 
     private func show() {
@@ -236,24 +396,51 @@ final class SelectionAskController {
         }
     }
 
-    private func toggleFollowUpRecording() {
-        let didStartOrStop = onFollowUp(conversationContext())
-        guard didStartOrStop else { return }
-        if !state.isRecordingFollowUp {
-            awaitingFollowUpTurn = true
-        }
-        state.isRecordingFollowUp.toggle()
+    @discardableResult
+    func startFollowUpRecording() -> Bool {
+        coordinator.startFollowUpRecording()
     }
 
-    private func conversationContext() -> String {
-        state.turns.enumerated().map { index, turn in
-            let answer = turn.answer.trimmingCharacters(in: .whitespacesAndNewlines)
-            return """
-            第 \(index + 1) 轮
-            用户：\(turn.question)
-            助手：\(answer.isEmpty ? "（尚无回答）" : answer)
-            """
-        }.joined(separator: "\n\n")
+    @discardableResult
+    func finishActiveFollowUp() -> Bool {
+        coordinator.finishActiveFollowUp()
+    }
+
+    @discardableResult
+    func cancelActiveFollowUp() -> Bool {
+        coordinator.cancelActiveFollowUp()
+    }
+
+    @discardableResult
+    func handleActiveRecordingAction(_ action: RecordingControlAction) -> Bool {
+        switch action {
+        case .finish:
+            return finishActiveFollowUp()
+        case .cancel:
+            return cancelActiveFollowUp()
+        }
+    }
+
+    @discardableResult
+    func performPrimaryFollowUpAction() -> Bool {
+        if state.isRecordingFollowUp {
+            return handleActiveRecordingAction(.finish)
+        }
+        return startFollowUpRecording()
+    }
+
+    func handleEscape() {
+        guard panel.isVisible else { return }
+        if state.isRecordingFollowUp {
+            _ = handleActiveRecordingAction(.cancel)
+        } else {
+            hide()
+        }
+    }
+
+    private func openInType4Me() {
+        guard let sessionID = coordinator.activeConversation?.session.id else { return }
+        onOpenInType4Me(sessionID)
     }
 
     private func positionNearMouse() {
@@ -265,5 +452,10 @@ final class SelectionAskController {
         let x = visible.midX - frame.width / 2
         let y = visible.midY - frame.height / 2
         panel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func notifyIfReleasable() {
+        guard isReleasable else { return }
+        onBecameReleasable()
     }
 }

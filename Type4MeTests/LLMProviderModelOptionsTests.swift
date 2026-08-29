@@ -62,6 +62,21 @@ final class LLMProviderModelOptionsTests: XCTestCase {
         XCTAssertEqual(LLMProvider.kimi.thinkingDisableField(for: "kimi-k2.6"), .thinking)
         XCTAssertEqual(LLMProvider.deepseek.thinkingDisableField(for: "deepseek-v4-flash"), .thinking)
         XCTAssertEqual(LLMProvider.zhipu.thinkingDisableField(for: "glm-5.2"), .thinking)
+        XCTAssertEqual(LLMProvider.openrouter.thinkingDisableField(for: "deepseek/deepseek-v4-flash-0731"), .reasoning)
+    }
+
+    func testOpenRouterThinkingPreferenceDefaultsToModelBehavior() throws {
+        let suiteName = "LLMThinkingPreferenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(true, forKey: "tf_disableThinking")
+
+        XCTAssertTrue(LLMThinkingPreference.isDisabled(for: .deepseek, defaults: defaults))
+        XCTAssertFalse(LLMThinkingPreference.isDisabled(for: .openrouter, defaults: defaults))
+
+        LLMThinkingPreference.setDisabled(true, for: .openrouter, defaults: defaults)
+        XCTAssertTrue(LLMThinkingPreference.isDisabled(for: .openrouter, defaults: defaults))
     }
 }
 

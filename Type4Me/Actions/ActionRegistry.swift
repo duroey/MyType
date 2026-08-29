@@ -20,6 +20,9 @@ enum ActionRegistry {
         CreateReminderAction(),
         ScrollDownAction(),
         ScrollUpAction(),
+        OpenVocabularyAction(),
+        PrepareSnippetFromSelectionAction(),
+        AddSelectedHotwordAction(),
     ]
 
     /// Renders the JSON tool list block injected into the LLM system prompt.
@@ -42,9 +45,16 @@ enum ActionRegistry {
 
     /// Look up an action by name and execute it. Returns nil if no action with
     /// the given name is registered.
-    static func dispatch(name: String, args: [String: Any]) async -> MacActionResult? {
+    static func dispatch(
+        name: String,
+        args: [String: Any],
+        context: MacActionContext = .empty
+    ) async -> MacActionResult? {
         guard let action = allActions.first(where: { $0.name == name }) else {
             return nil
+        }
+        if let contextualAction = action as? any ContextualMacAction {
+            return await contextualAction.execute(args: args, context: context)
         }
         return await action.execute(args: args)
     }

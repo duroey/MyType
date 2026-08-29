@@ -23,7 +23,7 @@ actor SonioxASRClient: SpeechRecognizer {
     )
 
     private var webSocketTask: URLSessionWebSocketTask?
-    private var receiveTask: Task<Void, Never>?
+    private var receiveGeneration = 0
     private var session: URLSession?
 
     private var eventContinuation: AsyncStream<RecognitionEvent>.Continuation?
@@ -57,9 +57,21 @@ actor SonioxASRClient: SpeechRecognizer {
         _events = stream
 
         let url = try SonioxProtocol.buildWebSocketURL(override: options.cloudProxyURL)
-        let session = options.resolvedSession
+        let message = try SonioxProtocol.buildStartMessage(
+            config: sonioxConfig,
+            options: options
+        )
+        let session = URLSession(configuration: options.urlSessionConfiguration)
         let task = session.webSocketTask(with: url)
         task.resume()
+        NSLog("[Soniox] Sending start message")
+        do {
+            try await task.send(.string(message))
+        } catch {
+            task.cancel(with: .goingAway, reason: nil)
+            session.invalidateAndCancel()
+            throw error
+        }
 
         self.session = session
         webSocketTask = task
@@ -70,15 +82,7 @@ actor SonioxASRClient: SpeechRecognizer {
         didRequestEnd = false
         sessionStartTime = ContinuousClock.now
         lastTranscriptTime = nil
-
         startReceiveLoop()
-
-        let message = try SonioxProtocol.buildStartMessage(
-            config: sonioxConfig,
-            options: options
-        )
-        NSLog("[Soniox] Sending start message")
-        try await task.send(.string(message))
         NSLog("[Soniox] Start message sent OK")
     }
 
@@ -96,12 +100,12 @@ actor SonioxASRClient: SpeechRecognizer {
         NSLog("[Soniox] Sent end-of-stream (sent %d packets, %d bytes)", audioPacketCount, totalAudioBytes)
     }
 
-    func disconnect() {
-        receiveTask?.cancel()
-        receiveTask = nil
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+    func disconnect() async {
+        receiveGeneration &+= 1
+        let socket = webSocketTask
         webSocketTask = nil
-        // Don't invalidate shared session — just release our reference
+        socket?.cancel()
+        session?.invalidateAndCancel()
         session = nil
         eventContinuation?.finish()
         eventContinuation = nil
@@ -112,43 +116,56 @@ actor SonioxASRClient: SpeechRecognizer {
     // MARK: - Receive Loop
 
     private func startReceiveLoop() {
-        receiveTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                do {
-                    guard let task = await self.webSocketTask else { break }
-                    let message = try await task.receive()
-                    let action = await self.handleMessage(message)
-                    switch action {
-                    case .none:
-                        break
-                    case .finished:
-                        await self.emitEvent(.completed)
-                        return
-                    case .fatal(let error):
-                        await self.emitEvent(.error(error))
-                        await self.emitEvent(.completed)
-                        return
-                    }
-                } catch {
-                    if Task.isCancelled { break }
+        receiveGeneration &+= 1
+        guard let task = webSocketTask else { return }
+        scheduleReceive(on: task, generation: receiveGeneration)
+    }
 
-                    if await self.didRequestEnd {
-                        NSLog("[Soniox] Treating socket close as normal end (sent %d packets)", await self.audioPacketCount)
-                    } else if await self.audioPacketCount == 0 {
-                        NSLog("[Soniox] Receive error before audio: %@", String(describing: error))
-                        await self.emitEvent(.error(error))
-                    } else {
-                        NSLog("[Soniox] Unexpected close during audio (sent %d packets): %@", await self.audioPacketCount, String(describing: error))
-                        await self.emitEvent(.error(error))
-                    }
-                    await self.emitEvent(.completed)
-                    break
-                }
-            }
-            NSLog("[Soniox] Receive loop ended")
-            await self.eventContinuation?.finish()
+    private func scheduleReceive(on task: URLSessionWebSocketTask, generation: Int) {
+        task.receive { [weak self, weak task] result in
+            guard let self, let task else { return }
+            Task { await self.handleReceiveResult(result, task: task, generation: generation) }
         }
+    }
+
+    private func handleReceiveResult(
+        _ result: Result<URLSessionWebSocketTask.Message, Error>,
+        task: URLSessionWebSocketTask,
+        generation: Int
+    ) {
+        guard generation == receiveGeneration, task === webSocketTask else { return }
+
+        switch result {
+        case .success(let message):
+            switch handleMessage(message) {
+            case .none:
+                scheduleReceive(on: task, generation: generation)
+            case .finished:
+                emitEvent(.completed)
+                finishReceiveLoop()
+            case .fatal(let error):
+                emitEvent(.error(error))
+                emitEvent(.completed)
+                finishReceiveLoop()
+            }
+        case .failure(let error):
+            if didRequestEnd {
+                NSLog("[Soniox] Treating socket close as normal end (sent %d packets)", audioPacketCount)
+            } else if audioPacketCount == 0 {
+                NSLog("[Soniox] Receive error before audio: %@", String(describing: error))
+                emitEvent(.error(error))
+            } else {
+                NSLog("[Soniox] Unexpected close during audio (sent %d packets): %@", audioPacketCount, String(describing: error))
+                emitEvent(.error(error))
+            }
+            emitEvent(.completed)
+            finishReceiveLoop()
+        }
+    }
+
+    private func finishReceiveLoop() {
+        NSLog("[Soniox] Receive loop ended")
+        eventContinuation?.finish()
     }
 
     private enum MessageAction {

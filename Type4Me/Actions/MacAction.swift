@@ -27,6 +27,14 @@ enum MacActionResultStatus: Sendable, Equatable {
     case unsure
 }
 
+/// Local-only context captured before recording starts. Contextual actions can
+/// use it without exposing selected text to the LLM tool arguments.
+struct MacActionContext: Sendable, Equatable {
+    let selectedText: String
+
+    static let empty = MacActionContext(selectedText: "")
+}
+
 /// A macOS action exposed to the LLM as a tool. The LLM picks one based on the
 /// user's voice intent and supplies arguments; the registry dispatches it.
 protocol MacAction: Sendable {
@@ -41,4 +49,16 @@ protocol MacAction: Sendable {
 
     /// Execute the action with arguments supplied by the LLM.
     func execute(args: [String: Any]) async -> MacActionResult
+}
+
+/// Opt-in protocol for actions that need locally captured context. Existing
+/// actions continue using the context-free MacAction interface unchanged.
+protocol ContextualMacAction: MacAction {
+    func execute(args: [String: Any], context: MacActionContext) async -> MacActionResult
+}
+
+extension ContextualMacAction {
+    func execute(args: [String: Any]) async -> MacActionResult {
+        await execute(args: args, context: .empty)
+    }
 }

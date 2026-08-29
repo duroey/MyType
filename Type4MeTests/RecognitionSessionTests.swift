@@ -1,24 +1,43 @@
 import XCTest
+import os
 @testable import Type4Me
-
-private actor PromptContextCaptureSpy {
-    private(set) var callCount = 0
-    private let capturedContext: PromptContext
-
-    init(capturedContext: PromptContext) {
-        self.capturedContext = capturedContext
-    }
-
-    func capture() -> PromptContext {
-        callCount += 1
-        return capturedContext
-    }
-}
+@testable import Type4MeIntelliSenseCore
 
 final class RecognitionSessionTests: XCTestCase {
+    /// Verifies that only the current non-idle generation may emit UI events.
+    func testRecognitionEventOwnershipRequiresCurrentActiveGeneration() {
+        XCTAssertTrue(
+            RecognitionSession.shouldEmitRecognitionEvent(
+                ownerGeneration: 4,
+                activeGeneration: 4,
+                state: .recording
+            )
+        )
+        XCTAssertFalse(
+            RecognitionSession.shouldEmitRecognitionEvent(
+                ownerGeneration: 3,
+                activeGeneration: 4,
+                state: .recording
+            )
+        )
+        XCTAssertFalse(
+            RecognitionSession.shouldEmitRecognitionEvent(
+                ownerGeneration: 4,
+                activeGeneration: 4,
+                state: .idle
+            )
+        )
+        XCTAssertFalse(
+            RecognitionSession.shouldEmitRecognitionEvent(
+                ownerGeneration: 4,
+                activeGeneration: 4,
+                state: .resetting
+            )
+        )
+    }
+
     override func tearDown() {
         KeychainService.selectedASRProvider = .volcano
-        UserDefaults.standard.removeObject(forKey: "tf_preserveCJKLatinSpacing")
     }
 
     func testInitialStateIsIdle() async {
@@ -47,6 +66,10 @@ final class RecognitionSessionTests: XCTestCase {
         await session.setState(.recovering)
         canStart = await session.canStartRecording
         XCTAssertFalse(canStart)
+
+        await session.setState(.resetting)
+        canStart = await session.canStartRecording
+        XCTAssertFalse(canStart)
         await session.setState(.idle)
     }
 
@@ -69,10 +92,11 @@ final class RecognitionSessionTests: XCTestCase {
         KeychainService.selectedASRProvider = .volcano
         let session = RecognitionSession()
 
-        await session.switchMode(to: .direct)
+        let ownerGeneration = await session.switchMode(to: .direct)
 
         let mode = await session.currentModeForTesting()
         XCTAssertEqual(mode.id, ProcessingMode.directId)
+        XCTAssertEqual(ownerGeneration, 0)
     }
 
     func testSwitchModeDirectWorksForSoniox() async {
@@ -85,33 +109,188 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(mode.id, ProcessingMode.directId)
     }
 
-    func testResolvePromptContextSkipsCaptureForRecordingMode() async {
-        let spy = PromptContextCaptureSpy(
-            capturedContext: PromptContext(selectedText: "stale selection", clipboardText: "stale clipboard")
-        )
+    func testStopRecordingRejectsStaleExpectedGeneration() async {
+        let session = RecognitionSession()
+        await session.setState(.recording)
 
-        let context = await RecognitionSession.resolvePromptContext(for: .recording) {
-            await spy.capture()
-        }
-        let callCount = await spy.callCount
+        await session.stopRecording(expectedGeneration: 1)
 
-        XCTAssertEqual(callCount, 0)
-        XCTAssertTrue(context.selectedText.isEmpty)
-        XCTAssertTrue(context.clipboardText.isEmpty)
+        let state = await session.state
+        XCTAssertEqual(state, .recording)
+        await session.setState(.idle)
     }
 
-    func testResolvePromptContextCapturesForSelectionAskMode() async {
-        let expected = PromptContext(selectedText: "selected text", clipboardText: "clipboard text")
-        let spy = PromptContextCaptureSpy(capturedContext: expected)
+    func testActiveRecordingGenerationIsAvailableOnlyWhileRecording() async {
+        let session = RecognitionSession()
+        var generation = await session.activeRecordingGenerationForStop()
+        XCTAssertNil(generation)
 
-        let context = await RecognitionSession.resolvePromptContext(for: .selectionAsk) {
-            await spy.capture()
+        await session.setState(.recording)
+        generation = await session.activeRecordingGenerationForStop()
+        XCTAssertEqual(generation, 0)
+
+        await session.setState(.finishing)
+        generation = await session.activeRecordingGenerationForStop()
+        XCTAssertNil(generation)
+        await session.setState(.idle)
+    }
+
+    func testStartupAudioFallbackRequiresSpeechBeforePipelineReady() {
+        XCTAssertTrue(RecognitionSession.shouldUseStartupAudioFallback(
+            speechDetected: true,
+            streamingPipelineReady: false
+        ))
+        XCTAssertFalse(RecognitionSession.shouldUseStartupAudioFallback(
+            speechDetected: false,
+            streamingPipelineReady: false
+        ))
+        XCTAssertFalse(RecognitionSession.shouldUseStartupAudioFallback(
+            speechDetected: true,
+            streamingPipelineReady: true
+        ))
+    }
+
+    func testInterruptedConnectDoesNotResetEarlyStopOwner() {
+        XCTAssertFalse(RecognitionSession.shouldResetAfterInterruptedConnect(
+            ownerGeneration: 4,
+            activeGeneration: 4,
+            state: .finishing
+        ))
+        XCTAssertTrue(RecognitionSession.shouldResetAfterInterruptedConnect(
+            ownerGeneration: 4,
+            activeGeneration: 4,
+            state: .recording
+        ))
+        XCTAssertFalse(RecognitionSession.shouldResetAfterInterruptedConnect(
+            ownerGeneration: 3,
+            activeGeneration: 4,
+            state: .recording
+        ))
+    }
+
+    func testStartRecordingSignalsClaimBeforeFirstSuspension() async {
+        KeychainService.selectedASRProvider = .custom
+        let session = RecognitionSession()
+        let claimedGeneration = OSAllocatedUnfairLock<Int?>(initialState: nil)
+
+        await session.startRecording(
+            externalAudioInput: true,
+            onClaimed: { generation in
+                claimedGeneration.withLock { $0 = generation }
+            }
+        )
+
+        XCTAssertEqual(claimedGeneration.withLock { $0 }, 1)
+    }
+
+    func testPromptContextCaptureIsDisabledForRecordingModes() {
+        let customPromptMode = ProcessingMode(
+            id: UUID(),
+            name: "Custom Context Prompt",
+            description: "",
+            prompt: "Use {selected} and {clipboard}",
+            isBuiltin: false
+        )
+        let modes: [ProcessingMode] = [
+            .direct,
+            .formalWriting,
+            .macAction,
+            customPromptMode,
+        ]
+
+        for mode in modes {
+            let requirements = RecognitionSession.promptContextCaptureRequirements(
+                for: mode.executionKind
+            )
+            XCTAssertTrue(requirements.isEmpty, "Unexpected context capture for \(mode.name)")
         }
-        let callCount = await spy.callCount
+    }
 
-        XCTAssertEqual(callCount, 1)
-        XCTAssertEqual(context.selectedText, expected.selectedText)
-        XCTAssertEqual(context.clipboardText, expected.clipboardText)
+    func testPromptContextCaptureIncludesSelectionAndClipboardForSelectionAsk() {
+        let requirements = RecognitionSession.promptContextCaptureRequirements(for: .selectionAsk)
+
+        XCTAssertTrue(requirements.contains(.selected))
+        XCTAssertTrue(requirements.contains(.clipboard))
+    }
+
+    func testTranslationTargetAndPromptAreFrozenForSession() async throws {
+        let session = RecognitionSession()
+        let english = ProcessingMode.translation(target: .english)
+        try await session.freezeTranslationModeForTesting(english)
+
+        let firstPrompt = await session.promptForCurrentModeForTesting()
+        var changedSetting = ProcessingMode.translation(target: .japanese)
+        changedSetting.translationTargetLanguageCode = TranslationLanguage.japanese.rawValue
+        await session.replaceTranslationModeSnapshotForTesting(changedSetting)
+        let secondPrompt = await session.promptForCurrentModeForTesting()
+
+        let frozenTarget = await session.frozenTranslationTargetForTesting()
+        XCTAssertEqual(frozenTarget, .english)
+        XCTAssertEqual(secondPrompt, firstPrompt)
+        XCTAssertTrue(secondPrompt.contains("English (en)"))
+        XCTAssertFalse(secondPrompt.contains("Japanese (ja)"))
+    }
+
+    func testIntelliSensePromptUsesCurrentTranscriptWithFrozenContext() async {
+        let session = RecognitionSession()
+        var settings = IntelliSenseSettings()
+        settings.applicationAwarenessEnabled = true
+        settings.expressionLearningEnabled = true
+        await session.freezeIntelliSenseForTesting(
+            snapshot: IntelliSenseContextSnapshot(
+                bundleIdentifier: "company.thebrowser.dia",
+                appName: "Dia",
+                appCategory: .browser,
+                controlCategory: .multiLine,
+                contextBeforeCursor: "",
+                contextAfterCursor: "",
+                availability: .appOnly,
+                wasTruncated: false
+            ),
+            settings: settings,
+            expressionProfile: EffectiveExpressionProfile(
+                directives: ["倾向连续自然段，减少列表。"]
+            )
+        )
+
+        let speculative = await session.promptForCurrentModeForTesting(
+            text: "目前报价模式分为三块。第一块是 license，第二块是 Studio。"
+        )
+        let final = await session.promptForCurrentModeForTesting(
+            text: "目前报价模式分为三块。第一块是 license，第二块是 Studio，第三块是 FDE。"
+        )
+
+        XCTAssertTrue(speculative.contains("明确包含 2 个有顺序"))
+        XCTAssertTrue(final.contains("明确包含 3 个有顺序"))
+        XCTAssertFalse(final.contains("减少列表"))
+        XCTAssertTrue(final.contains("company.thebrowser.dia") == false)
+    }
+
+    func testUnknownTranslationTargetCannotBeFrozen() async {
+        let session = RecognitionSession()
+        var mode = ProcessingMode.translation()
+        mode.translationTargetLanguageCode = "x-future"
+
+        do {
+            try await session.freezeTranslationModeForTesting(mode)
+            XCTFail("Expected unsupported target")
+        } catch let error as TranslationError {
+            XCTAssertEqual(error.errorDescription, L(
+                "暂不支持目标语言：x-future",
+                "Unsupported target language: x-future"
+            ))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testUnexpectedTranslationLanguageHasUserFacingFailureMessage() {
+        let error = TranslationError.unexpectedLanguage(.japanese)
+
+        XCTAssertEqual(error.errorDescription, L(
+            "翻译结果不是目标语言（日语），已停止粘贴。",
+            "The translation was not in the target language (Japanese) and was not pasted."
+        ))
     }
 
     func testShouldAttemptBatchFallbackWhenStreamingErrorWasObserved() {
@@ -196,48 +375,144 @@ final class RecognitionSessionTests: XCTestCase {
         XCTAssertEqual(threshold, 2_347, accuracy: 0.001)
     }
 
-    // MARK: - CJK / Latin spacing (issue #186)
-
-    /// The space between a CJK character and an adjacent Latin word or digit
-    /// (Pangu spacing) must survive normalization. Regression test for #186,
-    /// where "我已经把最新的 prompt 提交并更新" was collapsed to "...的prompt提交...".
-    func testRemovingCJKLatinSpaces_preservesPanguSpacing() {
-        UserDefaults.standard.set(true, forKey: "tf_preserveCJKLatinSpacing")
-
-        // The reported case: CJK ↔ Latin spaces are kept.
-        XCTAssertEqual(
-            "我已经把最新的 prompt 提交并更新".removingCJKLatinSpaces,
-            "我已经把最新的 prompt 提交并更新"
+    func testRevisePurposeNeverRunsInputModeLLM() {
+        let prepared = RevisePreparedTarget(
+            transactionID: UUID(),
+            targetID: UUID(),
+            targetGeneration: 0,
+            sourceRecordID: "record-1",
+            currentText: "明天上午 9 点开会",
+            currentFullValue: "明天上午 9 点开会",
+            currentRange: NSRange(location: 0, length: 10),
+            confidence: .exact,
+            controlKind: .multiLine,
+            sourceModeKind: .direct,
+            learningResumePlan: nil,
+            isDeletionTombstone: false
         )
-        // CJK ↔ Latin word, both boundaries.
-        XCTAssertEqual("Max 你好".removingCJKLatinSpaces, "Max 你好")
-        XCTAssertEqual("发布 v1.9.5 版本".removingCJKLatinSpaces, "发布 v1.9.5 版本")
-        // CJK ↔ digit.
-        XCTAssertEqual("第 3 个".removingCJKLatinSpaces, "第 3 个")
-        // Pure English is untouched.
-        XCTAssertEqual("hello world".removingCJKLatinSpaces, "hello world")
+
+        XCTAssertFalse(RecognitionSession.shouldRunInputModeLLM(
+            recordingPurpose: .revise(prepared),
+            mode: .intelliSense
+        ))
+        XCTAssertTrue(RecognitionSession.shouldRunInputModeLLM(
+            recordingPurpose: .input(.intelliSense),
+            mode: .intelliSense
+        ))
+        XCTAssertFalse(RecognitionSession.shouldRunInputModeLLM(
+            recordingPurpose: .input(.direct),
+            mode: .direct
+        ))
     }
 
-    /// Spaces between two CJK characters, or between a CJK character and
-    /// punctuation, are ASR/LLM noise and must still be removed.
-    func testRemovingCJKLatinSpaces_stripsCJKAndPunctuationNoise() {
-        UserDefaults.standard.set(true, forKey: "tf_preserveCJKLatinSpacing")
+    func testSessionFormattingUsesTheSelectedModeAcrossOutputKinds() throws {
+        let suite = "RecognitionSessionTests.Formatting.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(CJKSpacingMode.off.rawValue, forKey: CJKSpacingMode.storageKey)
+        defaults.set(TrailingPunctuationMode.period.rawValue, forKey: "tf_stripTrailingPunctuation")
 
-        // CJK ↔ CJK noise from ASR token boundaries.
-        XCTAssertEqual("你 好".removingCJKLatinSpaces, "你好")
-        XCTAssertEqual("你  好".removingCJKLatinSpaces, "你好")
-        // CJK ↔ punctuation (full-width and ASCII).
-        XCTAssertEqual("你好 ，世界".removingCJKLatinSpaces, "你好，世界")
-        XCTAssertEqual("你好 , 世界".removingCJKLatinSpaces, "你好,世界")
-    }
-
-    func testRemovingCJKLatinSpaces_canStripPanguSpacingWhenDisabled() {
-        UserDefaults.standard.set(false, forKey: "tf_preserveCJKLatinSpacing")
-
+        var quick = ProcessingMode.direct
+        quick.punctuationMode = .inherit
         XCTAssertEqual(
-            "我已经把最新的 prompt 提交并更新".removingCJKLatinSpaces,
-            "我已经把最新的prompt提交并更新"
+            RecognitionSession.formattedOutputText("快速模式。", mode: quick, userDefaults: defaults),
+            "快速模式"
         )
-        XCTAssertEqual("第 3 个".removingCJKLatinSpaces, "第3个")
+
+        var polished = ProcessingMode.formalWriting
+        polished.punctuationMode = .removeAll
+        XCTAssertEqual(
+            RecognitionSession.formattedOutputText("润色：完成！", mode: polished, userDefaults: defaults),
+            "润色完成"
+        )
+
+        var intelliSense = ProcessingMode.intelliSense
+        intelliSense.punctuationMode = .questionsAndExclamationsOnly
+        XCTAssertEqual(
+            RecognitionSession.formattedOutputText("智能，完成？Yes!", mode: intelliSense, userDefaults: defaults),
+            "智能完成？Yes!"
+        )
+
+        var translation = ProcessingMode.translation(target: .english)
+        translation.punctuationMode = .stripTrailing
+        XCTAssertEqual(
+            RecognitionSession.formattedOutputText("Translation complete?!", mode: translation, userDefaults: defaults),
+            "Translation complete"
+        )
     }
+
+    func testCrossModeFinishFormatsWithTheEndingMode() throws {
+        let suite = "RecognitionSessionTests.CrossModeFormatting.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(CJKSpacingMode.off.rawValue, forKey: CJKSpacingMode.storageKey)
+
+        var startingMode = ProcessingMode.direct
+        startingMode.punctuationMode = .preserve
+        var endingMode = ProcessingMode.formalWriting
+        endingMode.punctuationMode = .removeAll
+        let processingMode = CrossModeFinishPreference.processingMode(
+            startingMode: startingMode,
+            endingMode: endingMode,
+            isEnabled: true
+        )
+
+        XCTAssertEqual(processingMode.id, endingMode.id)
+        XCTAssertEqual(
+            RecognitionSession.formattedOutputText("跨模式，完成！", mode: processingMode, userDefaults: defaults),
+            "跨模式完成"
+        )
+    }
+
+    func testResolveEffectiveTranscript_batchProviderWithUnfinalizedPartial_returnsEmpty() {
+        let partialTranscript = RecognitionTranscript(
+            confirmedSegments: [],
+            partialText: "未完成的半截识别文本",
+            authoritativeText: "未完成的半截识别文本",
+            isFinal: false
+        )
+
+        let result = RecognitionSession.resolveEffectiveTranscript(
+            currentTranscript: partialTranscript,
+            providerIsStreaming: false
+        )
+
+        XCTAssertEqual(result, .empty)
+        XCTAssertTrue(result.displayText.isEmpty)
+    }
+
+    func testResolveEffectiveTranscript_batchProviderWithFinalizedTranscript_preservesText() {
+        let finalTranscript = RecognitionTranscript(
+            confirmedSegments: ["完整识别文本"],
+            partialText: "",
+            authoritativeText: "完整识别文本",
+            isFinal: true
+        )
+
+        let result = RecognitionSession.resolveEffectiveTranscript(
+            currentTranscript: finalTranscript,
+            providerIsStreaming: false
+        )
+
+        XCTAssertEqual(result, finalTranscript)
+        XCTAssertEqual(result.displayText, "完整识别文本")
+    }
+
+    func testResolveEffectiveTranscript_streamingProviderWithPartial_preservesTextForRecovery() {
+        let partialTranscript = RecognitionTranscript(
+            confirmedSegments: ["前半句"],
+            partialText: "后半句",
+            authoritativeText: "",
+            isFinal: false
+        )
+
+        let result = RecognitionSession.resolveEffectiveTranscript(
+            currentTranscript: partialTranscript,
+            providerIsStreaming: true
+        )
+
+        XCTAssertEqual(result, partialTranscript)
+        XCTAssertEqual(result.displayText, "前半句后半句")
+    }
+
 }

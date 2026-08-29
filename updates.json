@@ -1,16 +1,60 @@
 {
-  "latest": "2.0.0",
+  "latest": "2.3.0",
   "releases": [
     {
+      "version": "2.3.0",
+      "date": "2026-08-26",
+      "notes": "- 全新 Liquid Glass 录音指示条，支持动态预设与低功耗静态 Siri 样式\n- 操作提示与取消按钮可分别显示或隐藏，同时继续支持 Esc 取消\n- 首页新增紧凑数据概览、活动热力图和常用模式快捷入口\n- 改进长转写文本布局、流畅取消交互及录音状态稳定性\n- 优化外观预览、减少动态效果支持与热力图悬停体验",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.3.0/Type4Me-v2.3.0-cloud.dmg",
+      "cloud_dmg_size": 11486531,
+      "cloud_dmg_sha256": "10dbf22bb16f18891912dc636f0cd308246dda23a3529ae2327722bd436aa78d",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.3.0/Type4Me-v2.3.0-local-apple-silicon.dmg",
+      "local_dmg_size": 716955845,
+      "local_dmg_sha256": "a07d32c30d44652cc0d88fb8d2f5029d8fb6d60d957581738b13afe622fffa1f"
+    },
+    {
+      "version": "2.2.0",
+      "date": "2026-08-25",
+      "notes": "- 新增菜单栏运行控制中心，可查看录音状态与输入设备，并切换模式、麦克风、ASR 和翻译目标\n- 支持 type4me://start、stop、toggle URL Scheme，方便 Stream Deck、快捷指令、Raycast 等自动化工具控制录音\n- 新增小米 MiMo-V2.5-ASR 批量识别服务，并为所有非实时服务提供统一标记\n- 新增外观设置、录音条与文本输出实时预览，以及独立的紧凑型录音指示条\n- 改进跨 App 文本注入、剪贴板留存、后台 URL 调用、批量识别异常处理和系统模式本地化",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.2.0/Type4Me-v2.2.0-cloud.dmg",
+      "cloud_dmg_size": 11071334,
+      "cloud_dmg_sha256": "6fea1b1284adebd60dc6e453b14bb28f9b5009bf821f0ba5e16e79db2b7552a6",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.2.0/Type4Me-v2.2.0-local-apple-silicon.dmg",
+      "local_dmg_size": 716765001,
+      "local_dmg_sha256": "1fef184a033685c32295e7e0533737a5c7b3fba76b14f5bd83fabfa97ff2292d"
+    },
+    {
+      "version": "2.1.1",
+      "date": "2026-08-23",
+      "notes": "- 新增 Cartesia Ink-2 流式语音识别，并支持配置 Deepgram WebSocket 地址与自定义 OpenAI ASR Base URL\n- 会粘贴文本的处理模式可分别设置标点策略，包括保留全部、去掉句末、仅保留问号和感叹号或去掉全部标点\n- 复用 Codex App Server 会话以减少连续处理开销，并支持关闭 OpenRouter 推理输出\n- 历史记录显示实际识别与处理模型，同时修复 SQLite 句柄泄漏\n- 修复 USB 多缓冲音频设备刷新崩溃、上下文读取造成的录音启动等待，以及独立和左右侧修饰键识别问题",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.1.1/Type4Me-v2.1.1-cloud.dmg",
+      "cloud_dmg_size": 10598598,
+      "cloud_dmg_sha256": "6ad1a82257b59c68d5725ab58ea9a10bfe21f5161511a8fc714c1ee0110b599c",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.1.1/Type4Me-v2.1.1-local-apple-silicon.dmg",
+      "local_dmg_size": 716532080,
+      "local_dmg_sha256": "52a51a2ca64e0ba630424b1352de7e2b949b42ec6ee9960ef01955cb52b1fc31"
+    },
+    {
+      "version": "2.1.0",
+      "date": "2026-08-18",
+      "notes": "- 全面重构设置、历史、词汇与录音浮窗，同一模式支持多个 hold/toggle 快捷键\n- 新增可选 Intelli Sense：结合 App、控件和有限上下文润色，并按需学习稳定偏好\n- Ask Anything 新增可搜索、恢复和继续追问的会话历史\n- 统一翻译支持自动识别源语言、18 种目标语言；新增受控语音改口 Revise\n- 改进最终文本格式化，并修复火山转写、Fn 点按、登录项和内部剪贴板历史问题",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.1.0/Type4Me-v2.1.0-cloud.dmg",
+      "cloud_dmg_size": 10362351,
+      "cloud_dmg_sha256": "bb06263120a51190683c848334f446ca1ea7d090958924865f7b49f574c9df1c",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.1.0/Type4Me-v2.1.0-local-apple-silicon.dmg",
+      "local_dmg_size": 716584726,
+      "local_dmg_sha256": "53d629d5c98780daba092a6e72330da9eb3b33c77588b9dbfeaad2bf963d8724"
+    },
+    {
       "version": "2.0.0",
-      "date": "2026-08-07",
-      "notes": "- 新增 Selection Ask：可围绕选中文本连续追问，并以流式 Markdown 展示回答\n- 文本处理支持使用本机已登录的 Codex CLI，无需单独配置 API Key\n- 新增 Grok 流式语音识别与 StepFun 批量转写\n- Local 版新增 Qwen3-only 本地识别模式\n- 火山语音识别支持新版 API Key，同时兼容旧版 App ID + Access Token\n- 历史用量详情、应用内 GitHub 反馈与 ElevenLabs 英文标点处理得到改进",
-      "cloud_dmg_url": null,
-      "cloud_dmg_size": null,
-      "cloud_dmg_sha256": null,
-      "local_dmg_url": null,
-      "local_dmg_size": null,
-      "local_dmg_sha256": null
+      "date": "2026-07-17",
+      "notes": "- 新增 Codex CLI 本地账号运行时，无需配置 API Key，直接复用本机 Codex 登录态与额度\n- 默认使用 GPT-5.6 Luna，同时提供更快的 GPT-5.3 Codex Spark 实验选项\n- 设置页支持模型选择、连接测试和保存，并对本地 CLI 调用增加隔离、超时与结构化输出保护",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.0.0/Type4Me-v2.0.0-cloud.dmg",
+      "cloud_dmg_size": 6163313,
+      "cloud_dmg_sha256": "622d2a9354566bf7466e1d085a2b36c6c7f5f057b0fd1622824caee478084c3f",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.0.0/Type4Me-v2.0.0-local-apple-silicon.dmg",
+      "local_dmg_size": 705525787,
+      "local_dmg_sha256": "970cbd2f29af2ad289bbba5a5da67c1238b5666fc6a05d1563b4cb2051aafb1f"
     },
     {
       "version": "1.9.9",

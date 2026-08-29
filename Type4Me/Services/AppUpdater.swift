@@ -397,8 +397,8 @@ final class AppUpdater {
     nonisolated static func downloadFailureMessage(for error: NSError, fallback: String) -> String {
         if isTooManyOpenFiles(error) {
             return L(
-                "系统打开文件过多，请完全退出 Type4Me 后重新打开再试；如果仍失败，请手动下载 DMG 安装",
-                "Too many files are open. Quit and reopen Type4Me, then try again; if it still fails, install the DMG manually"
+                "系统打开文件过多，请完全退出 \(AppIdentity.displayName) 后重新打开再试；如果仍失败，请手动下载 DMG 安装",
+                "Too many files are open. Quit and reopen \(AppIdentity.displayName), then try again; if it still fails, install the DMG manually"
             )
         }
 

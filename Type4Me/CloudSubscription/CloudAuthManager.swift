@@ -21,7 +21,7 @@ final class CloudAuthManager: ObservableObject, Sendable {
     private let logger = Logger(subsystem: "com.mytype.app", category: "CloudAuth")
 
     // JWT stored in UserDefaults — security is enforced by device binding,
-    // not token expiry. See docs/plans/2026-04-04-account-page-design.md
+    // not token expiry. The former account-page design document was retired.
     private var jwt: String? {
         get { UserDefaults.standard.string(forKey: "tf_cloud_jwt") }
         set { UserDefaults.standard.set(newValue, forKey: "tf_cloud_jwt") }

@@ -6,21 +6,81 @@ import os
 /// Captured at recording start so `{selected}` reflects the user's selection
 /// before any text injection occurs.
 struct PromptContext: Sendable {
+    struct CaptureRequirements: OptionSet, Sendable {
+        let rawValue: UInt8
+
+        static let selected = CaptureRequirements(rawValue: 1 << 0)
+        static let clipboard = CaptureRequirements(rawValue: 1 << 1)
+
+        var logDescription: String {
+            var names: [String] = []
+            if contains(.selected) { names.append("selected") }
+            if contains(.clipboard) { names.append("clipboard") }
+            return names.isEmpty ? "none" : names.joined(separator: ",")
+        }
+    }
+
     let selectedText: String
     let clipboardText: String
 
-    /// Capture the current selected text (via Accessibility) and clipboard content.
-    /// Clipboard is read on MainActor (AppKit requirement).
-    /// AX calls run on a detached task with a short timeout.
-    static func capture() async -> PromptContext {
-        let clipboard = await MainActor.run {
-            NSPasteboard.general.string(forType: .string) ?? ""
+    static let empty = PromptContext(selectedText: "", clipboardText: "")
+
+    /// Return only the context fields referenced by a prompt. Some modes use
+    /// selection outside their prompt template and can request it explicitly.
+    static func captureRequirements(
+        for prompt: String,
+        requiresSelection: Bool = false
+    ) -> CaptureRequirements {
+        var requirements: CaptureRequirements = []
+        if requiresSelection || prompt.contains("{selected}") {
+            requirements.insert(.selected)
         }
-        var selected = await readSelectedTextAsync(timeoutMs: 500)
-        if selected.isEmpty {
-            selected = await readSelectedTextByTemporaryCopy(timeoutMs: 250)
+        if prompt.contains("{clipboard}") {
+            requirements.insert(.clipboard)
+        }
+        return requirements
+    }
+
+    /// Capture only the requested fields. Clipboard is read before the
+    /// selected-text fallback because that fallback temporarily replaces it.
+    /// AX calls run on a detached task with a short timeout.
+    static func capture(
+        requirements: CaptureRequirements = [.selected, .clipboard]
+    ) async -> PromptContext {
+        guard !requirements.isEmpty else { return .empty }
+
+        let clipboard: String
+        if requirements.contains(.clipboard) {
+            clipboard = await MainActor.run {
+                NSPasteboard.general.string(forType: .string) ?? ""
+            }
+        } else {
+            clipboard = ""
+        }
+
+        var selected = ""
+        if requirements.contains(.selected) {
+            let axSelectedText = await readSelectedTextAsync(timeoutMs: 500)
+            selected = shouldUseTemporaryCopy(axSelectedText: axSelectedText)
+                ? await readSelectedTextByTemporaryCopy(timeoutMs: 250)
+                : (axSelectedText ?? "")
         }
         return PromptContext(selectedText: selected, clipboardText: clipboard)
+    }
+
+    func merging(_ other: PromptContext) -> PromptContext {
+        PromptContext(
+            selectedText: other.selectedText.isEmpty ? selectedText : other.selectedText,
+            clipboardText: other.clipboardText.isEmpty ? clipboardText : other.clipboardText
+        )
+    }
+
+    /// An empty string is a successful AX result meaning the focused control has
+    /// no selection. Simulating Command+C in that case makes many apps play the
+    /// macOS error beep. Only fall back to temporary copy when AX is unavailable,
+    /// unsupported, or timed out (`nil`).
+    internal static func shouldUseTemporaryCopy(axSelectedText: String?) -> Bool {
+        axSelectedText == nil
     }
 
     /// Expand context variables (`{selected}`, `{clipboard}`, `{tools_json}`) in
@@ -59,12 +119,12 @@ struct PromptContext: Sendable {
     /// accessibility implementation is slow or deadlocked, it blocks indefinitely.
     /// Uses two racing detached tasks (AX read vs timeout) with OSAllocatedUnfairLock
     /// to ensure the continuation is resumed exactly once.
-    private static func readSelectedTextAsync(timeoutMs: Int) async -> String {
-        guard AXIsProcessTrusted() else { return "" }
-        return await withCheckedContinuation { continuation in
+    private static func readSelectedTextAsync(timeoutMs: Int) async -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
             let finished = OSAllocatedUnfairLock(initialState: false)
             Task.detached {
-                let text = readSelectedText() ?? ""
+                let text = readSelectedText()
                 if finished.withLock({ let old = $0; $0 = true; return !old }) {
                     continuation.resume(returning: text)
                 }
@@ -72,7 +132,7 @@ struct PromptContext: Sendable {
             Task.detached {
                 try? await Task.sleep(for: .milliseconds(timeoutMs))
                 if finished.withLock({ let old = $0; $0 = true; return !old }) {
-                    continuation.resume(returning: "")
+                    continuation.resume(returning: nil)
                 }
             }
         }
@@ -114,15 +174,27 @@ struct PromptContext: Sendable {
 
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
         var copiedText = ""
+        var copiedChangeCount: Int?
         while Date() < deadline {
             try? await Task.sleep(for: .milliseconds(25))
             if pasteboard.changeCount != previousChangeCount {
                 copiedText = pasteboard.string(forType: .string) ?? ""
+                copiedChangeCount = pasteboard.changeCount
                 break
             }
         }
 
-        snapshot.restore(to: pasteboard)
+        // Command+C is a no-op when there is no selection in many apps. Avoid
+        // rewriting an unchanged pasteboard because clipboard-history apps treat
+        // the restoration as a fresh user copy. The expected count also avoids
+        // overwriting a clipboard change made by another app in the meantime.
+        if let copiedChangeCount,
+           PasteboardHistoryPolicy.shouldRestoreTemporaryCopy(
+               previousChangeCount: previousChangeCount,
+               currentChangeCount: copiedChangeCount
+           ) {
+            snapshot.restore(to: pasteboard, expectedChangeCount: copiedChangeCount)
+        }
         return copiedText
     }
 
@@ -153,7 +225,8 @@ struct PromptContext: Sendable {
         }
 
         @MainActor
-        func restore(to pasteboard: NSPasteboard) {
+        func restore(to pasteboard: NSPasteboard, expectedChangeCount: Int) {
+            guard pasteboard.changeCount == expectedChangeCount else { return }
             pasteboard.clearContents()
             guard !items.isEmpty else { return }
 
@@ -162,6 +235,7 @@ struct PromptContext: Sendable {
                 for (type, data) in storedItem {
                     item.setData(data, forType: type)
                 }
+                PasteboardHistoryPolicy.markTransient(item)
                 return item
             }
             pasteboard.writeObjects(restoredItems)

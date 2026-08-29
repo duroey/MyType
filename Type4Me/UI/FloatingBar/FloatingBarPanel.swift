@@ -1,6 +1,34 @@
 import AppKit
 import SwiftUI
 
+struct FloatingBarPanelLayout: Equatable {
+    static let hidden = FloatingBarPanelLayout(contentSize: .zero)
+
+    let contentSize: NSSize
+    var horizontalOverflow: CGFloat = 0
+    var capsuleSize: NSSize? = nil
+
+    var hasVisibleContent: Bool {
+        contentSize.width > 0 && contentSize.height > 0
+    }
+
+    var panelSize: NSSize {
+        guard hasVisibleContent else { return NSSize(width: 1, height: 1) }
+        return NSSize(
+            width: ceil(contentSize.width + 2 * (horizontalOverflow + TF.floatingPanelShadowInset)),
+            height: ceil(contentSize.height + 2 * TF.floatingPanelShadowInset)
+        )
+    }
+
+    static func fallback(for style: RecordingIndicatorStyle) -> FloatingBarPanelLayout {
+        let size = NSSize(
+            width: TF.barWidthCompact,
+            height: style == .compact ? TF.compactIndicatorHeight : TF.barHeight
+        )
+        return FloatingBarPanelLayout(contentSize: size, capsuleSize: size)
+    }
+}
+
 // MARK: - NSPanel Subclass
 
 /// Non-activating floating panel that never steals focus from the target app.
@@ -23,6 +51,8 @@ final class FloatingBarPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovableByWindowBackground = false
         hidesOnDeactivate = false
+        ignoresMouseEvents = true
+        acceptsMouseMovedEvents = true
         animationBehavior = .utilityWindow
         appearance = NSAppearance(named: .darkAqua)
     }
@@ -30,13 +60,25 @@ final class FloatingBarPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    /// Positions the panel at the bottom center of the active screen.
-    func positionAtBottomCenter() {
-        guard let screen = activeScreen() else { return }
-        let visible = screen.visibleFrame
-        let x = visible.midX - frame.width / 2
-        let y = visible.origin.y + TF.barBottomOffset - 16  // compensate for shadow inset
-        setFrameOrigin(NSPoint(x: x, y: y))
+    static func screenUnderMouse() -> NSScreen? {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+    }
+
+    static func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+            .uint32Value
+    }
+
+    static func bottomCenteredFrame(size: NSSize, visibleFrame: NSRect) -> NSRect {
+        NSRect(
+            x: visibleFrame.midX - size.width / 2,
+            y: visibleFrame.minY + TF.barBottomOffset - TF.floatingPanelShadowInset,
+            width: size.width,
+            height: size.height
+        )
     }
 
     /// Positions the panel near the right side of the camera/notch area.
@@ -218,42 +260,71 @@ private final class NotchIndicatorController {
 
 // MARK: - Controller
 
-/// Manages the floating bar panel lifecycle.
-/// All visual styling is handled in SwiftUI (FloatingBarView).
+/// Manages the floating bar panel lifecycle and keeps its mouse hit area at the
+/// smallest single rectangle containing the currently visible bar and overlay.
 @MainActor
 final class FloatingBarController {
 
-    private let panel: FloatingBarPanel
+    private static let capsuleShrinkDelay: Duration = .seconds(TF.recordingCapsuleSpringResponse)
+
+    let panel: FloatingBarPanel
     private let notchIndicator = NotchIndicatorController()
     private let state: AppState
-    private let barPanelSize: NSSize
+    private var currentLayout = FloatingBarPanelLayout.hidden
+    private var anchorDisplayID: CGDirectDisplayID?
     private var panelGeneration = 0
+    private var panelShrinkTask: Task<Void, Never>?
 
     init(state: AppState) {
         self.state = state
 
-        let inset: CGFloat = 16  // extra room for shadow/glow
-        let contentHeight = TF.barHeight + TF.transcriptPopupGap + TF.transcriptPopupMaxHeight
-        let frame = NSRect(x: 0, y: 0, width: TF.barWidth + inset * 2, height: contentHeight + inset * 2)
-        barPanelSize = frame.size
+        let initialLayout = FloatingBarPanelLayout.fallback(for: RecordingIndicatorStyle.current())
+        let frame = NSRect(origin: .zero, size: initialLayout.panelSize)
         panel = FloatingBarPanel(contentRect: frame)
 
-        let barView = FloatingBarView<AppState>(state: state)
+        let barView = FloatingBarView<AppState>(
+            state: state,
+            onPanelLayoutChange: { [weak self] layout in
+                self?.updatePanelLayout(layout)
+            }
+        )
         let hosting = NSHostingView(rootView: barView)
+        hosting.sizingOptions = []
         hosting.layer?.backgroundColor = .clear
-        hosting.frame = NSRect(origin: .zero, size: frame.size)
+        hosting.frame = frame
         hosting.autoresizingMask = [.width, .height]
 
         panel.contentView = hosting
         panel.setFrame(frame, display: false)
-        panel.positionAtBottomCenter()
 
         state.onShowPanel = { [weak self] in self?.show() }
         state.onHidePanel = { [weak self] in self?.hide() }
-        state.onUpdatePanelLayout = { [weak self] in self?.updateLayout(animated: true) }
     }
 
-    /// Shows the floating panel using the layout for the current app phase.
+    func updatePanelLayout(_ layout: FloatingBarPanelLayout) {
+        let previousLayout = currentLayout
+        currentLayout = layout
+
+        panel.ignoresMouseEvents = !layout.hasVisibleContent || state.barPhase == .hidden
+
+        // Let the existing fade-out finish at its current size. Mouse events are
+        // already disabled above, so the disappearing panel cannot block clicks.
+        guard state.barPhase != .hidden || !panel.isVisible else {
+            cancelPendingPanelShrink()
+            return
+        }
+
+        let shouldShow = layout.hasVisibleContent
+            && state.barPhase != .hidden
+            && !panel.isVisible
+            && panelGeneration > 0
+        resizePanel(from: previousLayout, to: layout, display: panel.isVisible)
+
+        if shouldShow {
+            show()
+        }
+    }
+
     func show() {
         panelGeneration &+= 1
         if state.barPhase == .focusWaiting {
@@ -262,14 +333,24 @@ final class FloatingBarController {
             return
         }
 
-        showBarPanel()
-    }
-
-    /// Shows the regular floating transcription panel.
-    private func showBarPanel() {
         notchIndicator.hide()
+
+        if anchorDisplayID == nil || state.barPhase == .preparing {
+            anchorDisplayID = FloatingBarPanel.screenUnderMouse()
+                .flatMap(FloatingBarPanel.displayID)
+        }
+
+        let layout = layoutForShow()
+        guard layout.hasVisibleContent else {
+            panel.ignoresMouseEvents = true
+            panel.orderOut(nil)
+            return
+        }
+
+        resizePanel(from: currentLayout, to: layout, display: panel.isVisible)
+        panel.ignoresMouseEvents = false
+
         panel.contentView?.layer?.removeAllAnimations()
-        applyBarPanelLayout(animated: false)
         panel.alphaValue = 0
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
@@ -283,6 +364,9 @@ final class FloatingBarController {
     func hide() {
         notchIndicator.hide()
         guard panel.isVisible else { return }
+        cancelPendingPanelShrink()
+        panel.ignoresMouseEvents = true
+
         let expectedGeneration = panelGeneration
         let panelRef = panel
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -293,55 +377,103 @@ final class FloatingBarController {
             MainActor.assumeIsolated {
                 guard let self, self.panelGeneration == expectedGeneration else { return }
                 panelRef.orderOut(nil)
+                self.anchorDisplayID = nil
             }
         })
     }
 
-    /// Updates panel size and placement to match the current phase.
-    ///
-    /// Args:
-    ///   animated: Whether the size and origin change should be animated.
-    private func updateLayout(animated: Bool) {
-        if state.barPhase == .focusWaiting {
-            panelGeneration &+= 1
-            hideBarPanelImmediately()
-            notchIndicator.show()
-            return
-        }
-        notchIndicator.hide()
-        guard state.barPhase != .hidden else { return }
-        if !panel.isVisible {
-            showBarPanel()
-            return
-        }
-        applyBarPanelLayout(animated: animated)
-    }
-
     /// Immediately removes the regular bar panel before the notch indicator is shown.
     private func hideBarPanelImmediately() {
+        cancelPendingPanelShrink()
+        panel.ignoresMouseEvents = true
         panel.contentView?.layer?.removeAllAnimations()
         panel.alphaValue = 0
         panel.orderOut(nil)
     }
 
-    /// Applies size and placement for the regular bottom floating panel.
-    ///
-    /// Args:
-    ///   animated: Whether the size and origin change should be animated.
-    private func applyBarPanelLayout(animated: Bool) {
-        let targetFrame = NSRect(origin: panel.frame.origin, size: barPanelSize)
-        let applyFrame = {
-            self.panel.setFrame(targetFrame, display: false)
-            self.panel.positionAtBottomCenter()
+    private func layoutForShow() -> FloatingBarPanelLayout {
+        if currentLayout.hasVisibleContent {
+            return currentLayout
         }
-        guard animated, panel.isVisible else {
-            applyFrame()
-            return
+
+        return .fallback(for: RecordingIndicatorStyle.current())
+    }
+
+    private func resizePanel(
+        from previousLayout: FloatingBarPanelLayout,
+        to layout: FloatingBarPanelLayout,
+        display: Bool
+    ) {
+        cancelPendingPanelShrink()
+
+        let targetSize = layout.panelSize
+        let currentSize = panel.frame.size
+        guard !approximatelyEqual(currentSize, targetSize) else { return }
+
+        let capsuleWidthShrinks = previousLayout.capsuleSize.map { previous in
+            layout.capsuleSize.map { $0.width < previous.width - 0.5 } ?? false
+        } ?? false
+        let capsuleHeightShrinks = previousLayout.capsuleSize.map { previous in
+            layout.capsuleSize.map { $0.height < previous.height - 0.5 } ?? false
+        } ?? false
+        let delaysWidth = display
+            && targetSize.width < currentSize.width - 0.5
+            && capsuleWidthShrinks
+        let delaysHeight = display
+            && targetSize.height < currentSize.height - 0.5
+            && capsuleHeightShrinks
+
+        // Overlay-only axes resize immediately. Only axes whose visible capsule
+        // is still springing retain their old bounds until that spring ends.
+        let transitionSize = NSSize(
+            width: delaysWidth ? max(currentSize.width, targetSize.width) : targetSize.width,
+            height: delaysHeight ? max(currentSize.height, targetSize.height) : targetSize.height
+        )
+        if !approximatelyEqual(currentSize, transitionSize) {
+            applyPanelSize(transitionSize, display: display)
         }
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            applyFrame()
+
+        guard delaysWidth || delaysHeight else { return }
+
+        panelShrinkTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.capsuleShrinkDelay)
+            guard !Task.isCancelled, let self else { return }
+            guard self.state.barPhase != .hidden,
+                  self.approximatelyEqual(self.currentLayout.panelSize, targetSize)
+            else { return }
+
+            self.applyPanelSize(targetSize, display: self.panel.isVisible)
+            self.panelShrinkTask = nil
         }
+    }
+
+    private func cancelPendingPanelShrink() {
+        panelShrinkTask?.cancel()
+        panelShrinkTask = nil
+    }
+
+    private func applyPanelSize(_ size: NSSize, display: Bool) {
+        guard let screen = resolvedAnchorScreen() else { return }
+        let frame = FloatingBarPanel.bottomCenteredFrame(
+            size: size,
+            visibleFrame: screen.visibleFrame
+        )
+        panel.setFrame(frame, display: display)
+    }
+
+    private func resolvedAnchorScreen() -> NSScreen? {
+        if let anchorDisplayID,
+           let screen = NSScreen.screens.first(where: {
+               FloatingBarPanel.displayID(for: $0) == anchorDisplayID
+           }) {
+            return screen
+        }
+        let replacement = FloatingBarPanel.screenUnderMouse()
+        anchorDisplayID = replacement.flatMap(FloatingBarPanel.displayID)
+        return replacement
+    }
+
+    private func approximatelyEqual(_ lhs: NSSize, _ rhs: NSSize) -> Bool {
+        abs(lhs.width - rhs.width) < 0.5 && abs(lhs.height - rhs.height) < 0.5
     }
 }

@@ -242,7 +242,13 @@ enum SnippetStorage {
     static let didChangeNotification = Notification.Name("SnippetStorageDidChange")
 
     static func save(_ snippets: [(trigger: String, value: String)]) {
-        writeFile(snippets, to: userFileURL)
+        try? saveOrThrow(snippets)
+    }
+
+    /// Persist global user snippets while surfacing file-system failures.
+    /// The regular Settings UI intentionally keeps its best-effort behavior.
+    static func saveOrThrow(_ snippets: [(trigger: String, value: String)]) throws {
+        try writeFileOrThrow(snippets, to: userFileURL)
         invalidateCache()
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
@@ -467,12 +473,16 @@ enum SnippetStorage {
     }
 
     private static func writeFile(_ snippets: [(trigger: String, value: String)], to url: URL) {
+        try? writeFileOrThrow(snippets, to: url)
+    }
+
+    private static func writeFileOrThrow(_ snippets: [(trigger: String, value: String)], to url: URL) throws {
         let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let entries = snippets.map { Entry(trigger: $0.trigger, replacement: $0.value) }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
-        guard let data = try? encoder.encode(entries) else { return }
-        try? data.write(to: url, options: .atomic)
+        let data = try encoder.encode(entries)
+        try data.write(to: url, options: .atomic)
     }
 }

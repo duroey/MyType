@@ -2,6 +2,114 @@ import XCTest
 @testable import Type4Me
 
 final class FocusWakeupControllerTests: XCTestCase {
+    func testExternalAudioHandoffCapacityCoversSharedStartWait() {
+        let configuredSafetyFrames = 25
+        let capacity = FocusExternalAudioHandoffCapacityPolicy.frameCapacity(
+            preRollFrames: configuredSafetyFrames
+        )
+        let expectedWaitFrames = Int(ceil(
+            FocusExternalAudioHandoffCapacityPolicy.sharedRecordingStartWaitSeconds
+                * 1_000
+                / Double(AudioCaptureEngine.frameDurationMs)
+        ))
+
+        XCTAssertEqual(capacity, expectedWaitFrames + configuredSafetyFrames)
+        XCTAssertGreaterThanOrEqual(
+            Double(capacity * AudioCaptureEngine.frameDurationMs) / 1_000,
+            FocusExternalAudioHandoffCapacityPolicy.sharedRecordingStartWaitSeconds
+        )
+    }
+
+    func testExternalAudioHandoffCapacityAddsConfiguredSafetyMargin() {
+        let capacity = FocusExternalAudioHandoffCapacityPolicy.frameCapacity(
+            preRollFrames: 200,
+            startWaitSeconds: 3,
+            frameDurationMs: 20
+        )
+
+        XCTAssertEqual(capacity, 350)
+    }
+
+    func testExternalAudioHandoffCapacityRoundsUpPartialFrame() {
+        let capacity = FocusExternalAudioHandoffCapacityPolicy.frameCapacity(
+            preRollFrames: 0,
+            startWaitSeconds: 0.101,
+            frameDurationMs: 20
+        )
+
+        XCTAssertEqual(capacity, 6)
+    }
+
+    func testExternalAudioHandoffBuffersThenSwitchesToDirectDelivery() {
+        var handoff = FocusExternalAudioHandoffBuffer()
+        let first = Data([1])
+        let second = Data([2])
+        let direct = Data([3])
+
+        handoff.beginBuffering(maxBufferedFrames: 3)
+
+        XCTAssertEqual(handoff.route(first), .buffered)
+        XCTAssertEqual(handoff.route(second), .buffered)
+        let generation = handoff.claimDirectDelivery()
+        XCTAssertEqual(handoff.route(direct), .queuedForDirectDelivery)
+        XCTAssertEqual(handoff.phase, .direct)
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation!), first)
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation!), second)
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation!), direct)
+        XCTAssertNil(handoff.takeNextDeliveryFrame(ownerGeneration: generation!))
+    }
+
+    func testExternalAudioHandoffQueuesFramesAfterAtomicClaimExactlyOnce() {
+        var handoff = FocusExternalAudioHandoffBuffer()
+        let beforeClaim = Data([1])
+        let afterClaim = Data([2])
+        let nextLiveFrame = Data([3])
+
+        handoff.beginBuffering(maxBufferedFrames: 3)
+        XCTAssertEqual(handoff.route(beforeClaim), .buffered)
+        let generation = handoff.claimDirectDelivery()!
+        XCTAssertEqual(handoff.route(afterClaim), .queuedForDirectDelivery)
+        XCTAssertEqual(handoff.route(nextLiveFrame), .queuedForDirectDelivery)
+
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation), beforeClaim)
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation), afterClaim)
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation), nextLiveFrame)
+        XCTAssertNil(handoff.takeNextDeliveryFrame(ownerGeneration: generation))
+    }
+
+    func testExternalAudioHandoffUsesConfiguredFrameLimit() {
+        var handoff = FocusExternalAudioHandoffBuffer()
+        let dropped = Data([1])
+        let retainedFirst = Data([2])
+        let retainedSecond = Data([3])
+
+        handoff.beginBuffering(maxBufferedFrames: 2)
+        XCTAssertEqual(handoff.route(dropped), .buffered)
+        XCTAssertEqual(handoff.route(retainedFirst), .buffered)
+        XCTAssertEqual(handoff.route(retainedSecond), .buffered)
+
+        let generation = handoff.claimDirectDelivery()!
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation), retainedFirst)
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: generation), retainedSecond)
+        XCTAssertNil(handoff.takeNextDeliveryFrame(ownerGeneration: generation))
+    }
+
+    func testExternalAudioHandoffResetInvalidatesOldDeliveryGeneration() {
+        var handoff = FocusExternalAudioHandoffBuffer()
+        handoff.beginBuffering(maxBufferedFrames: 2)
+        XCTAssertEqual(handoff.route(Data([1])), .buffered)
+        let oldGeneration = handoff.claimDirectDelivery()!
+
+        handoff.reset()
+        handoff.beginBuffering(maxBufferedFrames: 2)
+        XCTAssertEqual(handoff.route(Data([2])), .buffered)
+        let newGeneration = handoff.claimDirectDelivery()!
+
+        XCTAssertTrue(handoff.bufferedFrames.isEmpty)
+        XCTAssertNil(handoff.takeNextDeliveryFrame(ownerGeneration: oldGeneration))
+        XCTAssertEqual(handoff.takeNextDeliveryFrame(ownerGeneration: newGeneration), Data([2]))
+    }
+
     func testShouldRestoreFocusWaitingWhenMonitorIsRunningAndPanelHidden() {
         let now = Date(timeIntervalSinceReferenceDate: 100)
 

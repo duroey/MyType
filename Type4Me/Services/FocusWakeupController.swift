@@ -1,6 +1,144 @@
 import AppKit
 import ApplicationServices
 
+/// Resolves a safe frame budget for the focus-to-session ownership handoff.
+enum FocusExternalAudioHandoffCapacityPolicy {
+    /// Mirrors the longest shared-session idle wait before a queued start is rejected.
+    static let sharedRecordingStartWaitSeconds: TimeInterval = 3
+
+    /// Calculates how many monitor frames cover shared-start wait plus safety margin.
+    ///
+    /// Args:
+    ///   preRollFrames: Existing configured frame budget reused as claim-scheduling margin.
+    ///   startWaitSeconds: Maximum time the shared recording start may remain queued.
+    ///   frameDurationMs: Duration of one monitor frame in milliseconds.
+    ///
+    /// Returns:
+    ///   A frame count covering the full wait plus the configured pre-roll margin.
+    static func frameCapacity(
+        preRollFrames: Int,
+        startWaitSeconds: TimeInterval = sharedRecordingStartWaitSeconds,
+        frameDurationMs: Int = AudioCaptureEngine.frameDurationMs
+    ) -> Int {
+        let normalizedPreRollFrames = max(0, preRollFrames)
+        guard startWaitSeconds > 0, frameDurationMs > 0 else {
+            return normalizedPreRollFrames
+        }
+        let waitMilliseconds = startWaitSeconds * 1_000
+        let waitFrames = Int(ceil(waitMilliseconds / Double(frameDurationMs)))
+        return waitFrames + normalizedPreRollFrames
+    }
+}
+
+/// Buffers focus-triggered audio until the shared recognition session owns input.
+struct FocusExternalAudioHandoffBuffer {
+    enum Phase: Equatable {
+        case inactive
+        case buffering
+        case direct
+    }
+
+    enum RouteResult: Equatable {
+        case ignored
+        case buffered
+        case queuedForDirectDelivery
+    }
+
+    private(set) var phase: Phase = .inactive
+    private(set) var generation = 0
+    private(set) var bufferedFrames: [Data] = []
+    private var maxBufferedFrames = 0
+    private var deliveryFrames: [Data] = []
+    private var deliveryReadIndex = 0
+
+    var hasPendingDelivery: Bool {
+        deliveryReadIndex < deliveryFrames.count
+    }
+
+    /// Starts a new bounded handoff window.
+    ///
+    /// Args:
+    ///   maxBufferedFrames: Maximum number of post-trigger frames retained before claim.
+    mutating func beginBuffering(maxBufferedFrames: Int) {
+        generation &+= 1
+        self.maxBufferedFrames = max(0, maxBufferedFrames)
+        bufferedFrames.removeAll(keepingCapacity: true)
+        deliveryFrames.removeAll(keepingCapacity: true)
+        deliveryReadIndex = 0
+        phase = .buffering
+    }
+
+    /// Routes one monitor frame according to current handoff ownership.
+    ///
+    /// Args:
+    ///   frame: PCM frame received from the long-lived focus monitor.
+    ///
+    /// Returns:
+    ///   How the frame was retained or queued for ordered delivery.
+    mutating func route(_ frame: Data) -> RouteResult {
+        switch phase {
+        case .buffering:
+            guard maxBufferedFrames > 0 else { return .ignored }
+            bufferedFrames.append(frame)
+            if bufferedFrames.count > maxBufferedFrames {
+                bufferedFrames.removeFirst(bufferedFrames.count - maxBufferedFrames)
+            }
+            return .buffered
+
+        case .direct:
+            deliveryFrames.append(frame)
+            return .queuedForDirectDelivery
+
+        case .inactive:
+            return .ignored
+        }
+    }
+
+    /// Atomically moves every retained claim frame into the ordered delivery queue.
+    ///
+    /// Returns:
+    ///   The generation that now owns direct delivery, or `nil` without a pending claim.
+    mutating func claimDirectDelivery() -> Int? {
+        guard phase == .buffering else { return nil }
+        deliveryFrames.append(contentsOf: bufferedFrames)
+        bufferedFrames.removeAll(keepingCapacity: true)
+        phase = .direct
+        return generation
+    }
+
+    /// Takes one frame for a serial delivery pump owned by the same focus generation.
+    ///
+    /// Args:
+    ///   ownerGeneration: Focus generation that created the delivery pump.
+    ///
+    /// Returns:
+    ///   The next ordered frame, or `nil` when ownership changed or the queue drained.
+    mutating func takeNextDeliveryFrame(ownerGeneration: Int) -> Data? {
+        guard phase == .direct,
+              generation == ownerGeneration,
+              deliveryReadIndex < deliveryFrames.count else {
+            return nil
+        }
+        let frame = deliveryFrames[deliveryReadIndex]
+        deliveryReadIndex += 1
+        if deliveryReadIndex == deliveryFrames.count {
+            deliveryFrames.removeAll(keepingCapacity: true)
+            deliveryReadIndex = 0
+        }
+        return frame
+    }
+
+    /// Clears all queued frames and returns to inactive monitoring state.
+    mutating func reset() {
+        generation &+= 1
+        phase = .inactive
+        bufferedFrames.removeAll(keepingCapacity: true)
+        deliveryFrames.removeAll(keepingCapacity: true)
+        deliveryReadIndex = 0
+        maxBufferedFrames = 0
+    }
+}
+
 @MainActor
 final class FocusWakeupController {
     private struct FocusSignature: Equatable {
@@ -92,7 +230,8 @@ final class FocusWakeupController {
 
     private weak var appState: AppState?
     private let session: RecognitionSession
-    var onRecordingOwnerResolved: ((UUID) -> Void)?
+    var onRecordingStartRequested: ((ProcessingMode, [Data], Float) -> Bool)?
+    var onRecordingCancellationRequested: (() -> Void)?
     private let monitorAudio = AudioCaptureEngine()
     private var timer: Timer?
     private var currentFocus: FocusSignature?
@@ -110,6 +249,10 @@ final class FocusWakeupController {
     private var config: Config
     private var focusRetentionPolicy: FocusWakeupRetentionPolicy<FocusSignature>
     private var lastFocusTriggerRMS: Float?
+    private var externalAudioHandoff = FocusExternalAudioHandoffBuffer()
+    private var externalAudioDeliveryTask: Task<Void, Never>?
+    private var externalAudioDeliveryTaskGeneration: Int?
+    private var externalAudioSessionGeneration: Int?
 
     nonisolated static let focusWakeupModeIdKey = "tf_focusWakeupModeId"
 
@@ -186,6 +329,7 @@ final class FocusWakeupController {
 
     /// Stops focus watching and releases the local monitor microphone stream.
     func stop() {
+        let shouldCancelRecording = isFocusRecording
         timer?.invalidate()
         timer = nil
         isStartGatePausedByEscape = false
@@ -193,6 +337,11 @@ final class FocusWakeupController {
         currentFocus = nil
         focusRetentionPolicy.reset()
         isFocusRecording = false
+        lastFocusTriggerRMS = nil
+        resetExternalAudioHandoff()
+        if shouldCancelRecording {
+            onRecordingCancellationRequested?()
+        }
     }
 
     /// Pauses only the start RMS gate after the user presses Escape in waiting state.
@@ -225,6 +374,7 @@ final class FocusWakeupController {
         isFocusRecording = false
         isManualRecordingPaused = false
         lastFocusTriggerRMS = nil
+        resetExternalAudioHandoff()
         rearmBlockedUntil = Date().addingTimeInterval(config.rearmDelay)
     }
 
@@ -236,6 +386,7 @@ final class FocusWakeupController {
             _ = FalseStartRMSProfileStore.record(triggerRMS, source: "focus")
         }
         lastFocusTriggerRMS = nil
+        resetExternalAudioHandoff()
         rearmBlockedUntil = Date().addingTimeInterval(config.falseStartCooldown)
         DebugFileLogger.log(
             "focus wakeup: false-start cooldown=\(String(format: "%.1f", config.falseStartCooldown))s stableThreshold=true"
@@ -408,7 +559,9 @@ final class FocusWakeupController {
         lastFrameAt = Date()
         monitorFrameCount += 1
         if isFocusRecording {
-            Task { await session.acceptExternalAudioFrame(data) }
+            if externalAudioHandoff.route(data) == .queuedForDirectDelivery {
+                startExternalAudioDeliveryIfNeeded()
+            }
             return
         }
         guard currentFocus != nil, !isManualRecordingPaused else { return }
@@ -461,31 +614,96 @@ final class FocusWakeupController {
         preRollFrames = []
         consecutiveSpeechFrames = 0
         isFocusRecording = true
+        resetExternalAudioHandoff()
+        let handoffCapacity = FocusExternalAudioHandoffCapacityPolicy.frameCapacity(
+            preRollFrames: config.preRollFrames
+        )
+        externalAudioHandoff.beginBuffering(maxBufferedFrames: handoffCapacity)
 
         let mode = Self.resolvedFocusWakeupMode(
             modes: ModeStorage().load(),
             storedModeId: UserDefaults.standard.string(forKey: Self.focusWakeupModeIdKey),
             provider: KeychainService.selectedASRProvider
         )
-        Task { @MainActor in
-            let ready = await session.awaitIdle()
-            if !ready {
-                DebugFileLogger.log("focus wakeup: previous session did not reach idle before start")
-                isFocusRecording = false
-                sessionDidFinish()
-                return
-            }
-            onRecordingOwnerResolved?(mode.id)
-            appState?.currentMode = mode
-            appState?.startRecording()
-            await session.startRecording(
-                mode: mode,
-                autoStopOnSilence: true,
-                initialAudioChunks: initialChunks,
-                autoStopThresholdOverride: triggerThreshold,
-                externalAudioInput: true
+        guard onRecordingStartRequested?(mode, initialChunks, triggerThreshold) == true else {
+            DebugFileLogger.log("focus wakeup: shared recording start gate rejected request")
+            isFocusRecording = false
+            sessionDidFinish()
+            return
+        }
+        DebugFileLogger.log(
+            "focus wakeup: external audio awaiting claim capacity=\(handoffCapacity) frames"
+        )
+    }
+
+    /// Claims post-trigger audio and starts one generation-owned serial delivery pump.
+    ///
+    /// This method performs the buffer-to-direct transition without suspending on the
+    /// main actor. Frames arriving afterward append behind the retained claim frames,
+    /// so one pump delivers the complete sequence without duplication or reordering.
+    ///
+    /// Args:
+    ///   sessionGeneration: Recognition session generation that owns delivered frames.
+    func sessionDidClaimExternalAudioInput(sessionGeneration: Int) {
+        guard isFocusRecording else {
+            resetExternalAudioHandoff()
+            return
+        }
+        guard externalAudioHandoff.claimDirectDelivery() != nil else { return }
+        externalAudioSessionGeneration = sessionGeneration
+        startExternalAudioDeliveryIfNeeded()
+    }
+
+    /// Starts the serial external-audio pump when direct frames are waiting.
+    private func startExternalAudioDeliveryIfNeeded() {
+        guard externalAudioDeliveryTask == nil,
+              isFocusRecording,
+              externalAudioHandoff.phase == .direct,
+              externalAudioHandoff.hasPendingDelivery else {
+            return
+        }
+        let ownerGeneration = externalAudioHandoff.generation
+        externalAudioDeliveryTaskGeneration = ownerGeneration
+        externalAudioDeliveryTask = Task { @MainActor [weak self] in
+            await self?.deliverExternalAudioFrames(ownerGeneration: ownerGeneration)
+        }
+    }
+
+    /// Delivers claimed and live monitor frames in FIFO order for one generation.
+    ///
+    /// Args:
+    ///   ownerGeneration: Focus generation that owns this delivery pump.
+    private func deliverExternalAudioFrames(ownerGeneration: Int) async {
+        guard let sessionGeneration = externalAudioSessionGeneration else { return }
+        while !Task.isCancelled,
+              isFocusRecording,
+              externalAudioHandoff.generation == ownerGeneration,
+              let frame = externalAudioHandoff.takeNextDeliveryFrame(
+                  ownerGeneration: ownerGeneration
+              ) {
+            await session.acceptExternalAudioFrame(
+                frame,
+                expectedGeneration: sessionGeneration
             )
         }
+
+        guard externalAudioDeliveryTaskGeneration == ownerGeneration else { return }
+        externalAudioDeliveryTask = nil
+        externalAudioDeliveryTaskGeneration = nil
+        if isFocusRecording,
+           externalAudioHandoff.generation == ownerGeneration,
+           externalAudioHandoff.hasPendingDelivery {
+            startExternalAudioDeliveryIfNeeded()
+        }
+    }
+
+    /// Invalidates the current focus generation and cancels queued delivery work.
+    private func resetExternalAudioHandoff() {
+        externalAudioDeliveryTask?.cancel()
+        externalAudioDeliveryTask = nil
+        externalAudioDeliveryTaskGeneration = nil
+        externalAudioSessionGeneration = nil
+        externalAudioHandoff.reset()
     }
 
     /// Restarts the RMS monitor when AVCapture stopped delivering frames.

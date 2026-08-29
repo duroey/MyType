@@ -17,43 +17,37 @@ struct HotkeyRecorderView: View {
         HStack(spacing: 6) {
             // Display current hotkey
             Text(displayText)
-                .font(.system(size: 12))
-                .foregroundStyle(isRecording ? TF.settingsAccentRed : TF.settingsTextSecondary)
-                .frame(minWidth: 100, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
+                .font(.system(size: 13))
+                .lineLimit(1)
+                .foregroundStyle(isRecording ? TF.settingsAccentRed : TF.settingsText)
+                .frame(minWidth: 106, minHeight: 32, alignment: .leading)
+                .padding(.horizontal, 12)
                 .background(
-                    RoundedRectangle(cornerRadius: 6).fill(TF.settingsBg)
+                    RoundedRectangle(cornerRadius: 8).fill(TF.settingsCardAlt)
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: 8)
                         .stroke(
                             isRecording
                                 ? TF.settingsAccentRed.opacity(0.5)
-                                : TF.settingsTextTertiary.opacity(0.2),
+                                : .clear,
                             lineWidth: 1
                         )
                 )
 
             if isRecording {
                 Button(L("取消", "Cancel")) { stopRecording() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(TF.settingsTextSecondary)
+                    .buttonStyle(RecorderControlButtonStyle())
             } else {
                 Button(L("录制", "Record")) { startRecording() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(TF.settingsTextSecondary)
+                    .buttonStyle(RecorderControlButtonStyle())
 
                 if keyCode != nil {
                     Button(L("清除", "Clear")) {
                         keyCode = nil
                         modifiers = nil
                     }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(TF.settingsTextTertiary)
+                    .buttonStyle(RecorderControlButtonStyle(isDestructive: true))
                 }
             }
         }
@@ -212,14 +206,7 @@ struct HotkeyRecorderView: View {
     }
 
     private func isModifierPressed(keyCode: Int, flags: NSEvent.ModifierFlags) -> Bool {
-        switch keyCode {
-        case 54, 55: return flags.contains(.command)
-        case 56, 60: return flags.contains(.shift)
-        case 58, 61: return flags.contains(.option)
-        case 59, 62: return flags.contains(.control)
-        case 63: return flags.contains(.function)
-        default: return false
-        }
+        ModeBinding.isModifierPressed(keyCode: keyCode, flags: CGEventFlags(rawValue: UInt64(flags.rawValue)))
     }
 
     // MARK: - Modifier Combo Helpers
@@ -366,5 +353,30 @@ struct HotkeyRecorderView: View {
 
         guard status == noErr, length > 0 else { return nil }
         return String(utf16CodeUnits: chars, count: length).uppercased()
+    }
+}
+
+private struct RecorderControlButtonStyle: ButtonStyle {
+    var isDestructive: Bool = false
+    @State private var isHovered = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .medium))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: true)
+            .foregroundStyle(isDestructive ? TF.settingsTextTertiary : TF.settingsText)
+            .padding(.horizontal, 12)
+            .frame(height: 32)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovered ? TF.settingsCardAlt.opacity(0.85) : TF.settingsCardAlt)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(TF.settingsBorder.opacity(isHovered ? 0.8 : 0.4), lineWidth: 1)
+            )
+            .opacity(configuration.isPressed ? 0.75 : 1.0)
+            .onHover { isHovered = $0 }
     }
 }

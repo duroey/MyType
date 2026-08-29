@@ -80,6 +80,7 @@ enum DebugFileLogger {
 
     private static let formatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
+        f.timeZone = .autoupdatingCurrent
         return f
     }()
 

@@ -6,6 +6,8 @@ final class HotkeyManagerTests: XCTestCase {
         private let lock = NSLock()
         private(set) var started: [UUID] = []
         private(set) var stopped: [UUID] = []
+        private(set) var crossModeFinishes: [UUID] = []
+        private(set) var busyConflictCount = 0
 
         /// Records a mode start callback.
         ///
@@ -26,9 +28,26 @@ final class HotkeyManagerTests: XCTestCase {
             stopped.append(modeId)
             lock.unlock()
         }
+
+        /// Records a cross-mode finish callback.
+        ///
+        /// Args:
+        ///   modeId: Mode ID whose shortcut ended the active recording.
+        func crossModeFinish(_ modeId: UUID) {
+            lock.lock()
+            crossModeFinishes.append(modeId)
+            lock.unlock()
+        }
+
+        /// Records a rejected attempt to start while processing.
+        func busyConflict() {
+            lock.lock()
+            busyConflictCount += 1
+            lock.unlock()
+        }
     }
 
-    func testDifferentModifierToggleHotkeyPassesThroughDuringActiveOwner() {
+    func testDifferentModifierToggleHotkeyFinishesActiveOwnerAndIsConsumed() {
         let manager = HotkeyManager()
         let firstModeId = UUID()
         let secondModeId = UUID()
@@ -50,17 +69,21 @@ final class HotkeyManagerTests: XCTestCase {
                 onStop: { recorder.stop(secondModeId) }
             ),
         ])
+        manager.onCrossModeFinish = { recorder.crossModeFinish($0) }
 
         sendFlagsChanged(to: manager, keyCode: 54, flags: .maskCommand)
         sendFlagsChanged(to: manager, keyCode: 54, flags: [])
-        let passedThrough = sendFlagsChanged(to: manager, keyCode: 61, flags: .maskAlternate)
+        let pressPassedThrough = sendFlagsChanged(to: manager, keyCode: 61, flags: .maskAlternate)
+        let releasePassedThrough = sendFlagsChanged(to: manager, keyCode: 61, flags: [])
 
         XCTAssertEqual(recorder.started, [firstModeId])
         XCTAssertEqual(recorder.stopped, [])
-        XCTAssertTrue(passedThrough)
+        XCTAssertEqual(recorder.crossModeFinishes, [secondModeId])
+        XCTAssertFalse(pressPassedThrough)
+        XCTAssertTrue(releasePassedThrough)
     }
 
-    func testDifferentRegularToggleHotkeyPassesThroughDuringActiveOwner() {
+    func testDifferentRegularToggleHotkeyFinishesActiveOwnerAndIsConsumed() {
         let manager = HotkeyManager()
         let firstModeId = UUID()
         let secondModeId = UUID()
@@ -82,6 +105,7 @@ final class HotkeyManagerTests: XCTestCase {
                 onStop: { recorder.stop(secondModeId) }
             ),
         ])
+        manager.onCrossModeFinish = { recorder.crossModeFinish($0) }
 
         sendKeyDown(to: manager, keyCode: 18, flags: .maskCommand)
         let passedThrough = sendKeyDown(to: manager, keyCode: 19, flags: .maskCommand)
@@ -89,8 +113,9 @@ final class HotkeyManagerTests: XCTestCase {
 
         XCTAssertEqual(recorder.started, [firstModeId])
         XCTAssertEqual(recorder.stopped, [])
-        XCTAssertTrue(passedThrough)
-        XCTAssertTrue(keyUpPassedThrough)
+        XCTAssertEqual(recorder.crossModeFinishes, [secondModeId])
+        XCTAssertFalse(passedThrough)
+        XCTAssertFalse(keyUpPassedThrough)
     }
 
     func testOwnerRegularToggleHotkeyStopsActiveOwner() {
@@ -136,6 +161,146 @@ final class HotkeyManagerTests: XCTestCase {
 
         XCTAssertEqual(recorder.started, [])
         XCTAssertEqual(recorder.stopped, [modeId])
+        XCTAssertFalse(passedThrough)
+    }
+
+    /// Verifies that stale processing state cannot block a matching external toggle stop.
+    func testProcessingFlagDoesNotBlockMatchingExternalToggleStop() {
+        let manager = HotkeyManager()
+        let modeId = UUID()
+        let recorder = CallbackRecorder()
+
+        manager.registerBindings([
+            makeBinding(
+                modeId: modeId,
+                keyCode: 18,
+                modifiers: .maskCommand,
+                onStart: { recorder.start(modeId) },
+                onStop: { recorder.stop(modeId) }
+            ),
+        ])
+        manager.onBusyConflict = { recorder.busyConflict() }
+        manager.setExternalRecordingOwner(modeId: modeId)
+        manager.isProcessing = true
+
+        let passedThrough = sendKeyDown(to: manager, keyCode: 18, flags: .maskCommand)
+
+        XCTAssertEqual(recorder.started, [])
+        XCTAssertEqual(recorder.stopped, [modeId])
+        XCTAssertEqual(recorder.busyConflictCount, 0)
+        XCTAssertFalse(passedThrough)
+    }
+
+    /// Verifies that stale processing state cannot block a matching external hold stop.
+    func testProcessingFlagDoesNotBlockMatchingExternalHoldStop() {
+        let manager = HotkeyManager()
+        let modeId = UUID()
+        let recorder = CallbackRecorder()
+        let binding = ModeBinding(
+            bindingId: UUID(),
+            modeId: modeId,
+            keyCode: 18,
+            modifiers: .maskCommand,
+            style: .hold,
+            onStart: { recorder.start(modeId) },
+            onStop: { recorder.stop(modeId) }
+        )
+
+        manager.registerBindings([binding])
+        manager.onBusyConflict = { recorder.busyConflict() }
+        manager.setExternalRecordingOwner(modeId: modeId)
+        manager.isProcessing = true
+
+        let passedThrough = sendKeyDown(to: manager, keyCode: 18, flags: .maskCommand)
+
+        XCTAssertEqual(recorder.started, [])
+        XCTAssertEqual(recorder.stopped, [modeId])
+        XCTAssertEqual(recorder.busyConflictCount, 0)
+        XCTAssertFalse(manager.isHoldActive(for: binding.bindingId))
+        XCTAssertFalse(manager.hasPendingSafetyTimer(for: binding.bindingId))
+        XCTAssertFalse(passedThrough)
+    }
+
+    /// Verifies that processing still rejects a genuinely new idle recording.
+    func testProcessingFlagStillBlocksIdleStart() {
+        let manager = HotkeyManager()
+        let modeId = UUID()
+        let recorder = CallbackRecorder()
+
+        manager.registerBindings([
+            makeBinding(
+                modeId: modeId,
+                keyCode: 18,
+                modifiers: .maskCommand,
+                onStart: { recorder.start(modeId) },
+                onStop: { recorder.stop(modeId) }
+            ),
+        ])
+        manager.onBusyConflict = { recorder.busyConflict() }
+        manager.isProcessing = true
+
+        let passedThrough = sendKeyDown(to: manager, keyCode: 18, flags: .maskCommand)
+
+        XCTAssertEqual(recorder.started, [])
+        XCTAssertEqual(recorder.stopped, [])
+        XCTAssertEqual(recorder.busyConflictCount, 1)
+        XCTAssertFalse(passedThrough)
+    }
+
+    /// Verifies that a menu-started Revise recording stops on its first Revise shortcut press.
+    func testExternalReviseOwnerStopsOnFirstMatchingHotkeyPress() {
+        let manager = HotkeyManager()
+        let stoppedOwnerId = UUID()
+        let recorder = CallbackRecorder()
+        let reviseBinding = ModeBinding(
+            bindingId: UUID(),
+            owner: .globalAction(.revise),
+            keyCode: 20,
+            modifiers: .maskCommand,
+            style: .toggle,
+            onStart: {},
+            onStop: { recorder.stop(stoppedOwnerId) }
+        )
+
+        manager.registerBindings([reviseBinding])
+        manager.setExternalRecordingOwner(owner: .globalAction(.revise))
+
+        let passedThrough = sendKeyDown(to: manager, keyCode: 20, flags: .maskCommand)
+
+        XCTAssertEqual(recorder.stopped, [stoppedOwnerId])
+        XCTAssertFalse(passedThrough)
+    }
+
+    /// Verifies that a mode shortcut can stop a menu-started Revise recording once.
+    func testModeHotkeyStopsExternalReviseOwner() {
+        let manager = HotkeyManager()
+        let stoppedOwnerId = UUID()
+        let targetModeId = UUID()
+        let recorder = CallbackRecorder()
+        let reviseBinding = ModeBinding(
+            bindingId: UUID(),
+            owner: .globalAction(.revise),
+            keyCode: 20,
+            modifiers: .maskCommand,
+            style: .toggle,
+            onStart: {},
+            onStop: { recorder.stop(stoppedOwnerId) }
+        )
+        let modeBinding = makeBinding(
+            modeId: targetModeId,
+            keyCode: 21,
+            modifiers: .maskCommand,
+            onStart: { recorder.start(targetModeId) },
+            onStop: { recorder.stop(targetModeId) }
+        )
+
+        manager.registerBindings([reviseBinding, modeBinding])
+        manager.setExternalRecordingOwner(owner: .globalAction(.revise))
+
+        let passedThrough = sendKeyDown(to: manager, keyCode: 21, flags: .maskCommand)
+
+        XCTAssertEqual(recorder.started, [])
+        XCTAssertEqual(recorder.stopped, [stoppedOwnerId])
         XCTAssertFalse(passedThrough)
     }
 

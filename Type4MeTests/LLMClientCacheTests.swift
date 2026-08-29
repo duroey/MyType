@@ -62,6 +62,72 @@ final class LLMClientCacheTests: XCTestCase {
         XCTAssertNotNil(resolution.invalidated)
     }
 
+    func testRuntimeResolutionUsesOneClientForRepeatedRequests() {
+        var cache = LLMClientCache()
+        var creationCount = 0
+        let config = LLMConfig(
+            apiKey: "key",
+            model: "model",
+            baseURL: "https://example.com/v1"
+        )
+
+        let first = LLMRuntime.resolveCached(
+            providerID: "doubao",
+            config: config,
+            bypassProxy: false,
+            cache: &cache
+        ) {
+            creationCount += 1
+            return StubLLMClient()
+        }
+        let second = LLMRuntime.resolveCached(
+            providerID: "doubao",
+            config: config,
+            bypassProxy: false,
+            cache: &cache
+        ) {
+            creationCount += 1
+            return StubLLMClient()
+        }
+
+        XCTAssertEqual(creationCount, 1)
+        XCTAssertFalse(first.reused)
+        XCTAssertTrue(second.reused)
+        XCTAssertEqual(
+            ObjectIdentifier(first.runtime.client),
+            ObjectIdentifier(second.runtime.client)
+        )
+        XCTAssertNil(second.invalidated)
+    }
+
+    func testRuntimeResolutionReturnsOldClientWhenProxyChanges() async {
+        var cache = LLMClientCache()
+        let config = LLMConfig(
+            apiKey: "key",
+            model: "model",
+            baseURL: "https://example.com/v1"
+        )
+        let first = LLMRuntime.resolveCached(
+            providerID: "doubao",
+            config: config,
+            bypassProxy: false,
+            cache: &cache
+        ) { StubLLMClient() }
+        let second = LLMRuntime.resolveCached(
+            providerID: "doubao",
+            config: config,
+            bypassProxy: true,
+            cache: &cache
+        ) { StubLLMClient() }
+
+        XCTAssertEqual(second.invalidationReasons, ["proxyBypass"])
+        XCTAssertNotNil(second.invalidated)
+        await second.invalidated?.invalidate()
+        let oldClient = first.runtime.client as? StubLLMClient
+        let wasInvalidated = await oldClient?.isInvalidated
+        XCTAssertEqual(wasInvalidated, true)
+    }
+
     private func makeKey() -> LLMClientCacheKey {
         LLMClientCacheKey(
             providerID: "doubao",

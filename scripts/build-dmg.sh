@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && /bin/pwd -P)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)"
-APP_VERSION="${APP_VERSION:-2.0.0}"
+APP_VERSION="${APP_VERSION:-2.3.0}"
 APP_FLAVOR="${APP_FLAVOR:-mytype}"  # mytype, public, or personal
 VARIANT="${VARIANT:-pure}"          # pure, official, local, or cloud(alias pure)
 ARCH="${ARCH:-}"                    # arm64 or universal (default: universal for pure/official, arm64 for local)
@@ -13,6 +13,7 @@ NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
 TIMESTAMP_URL="${TIMESTAMP_URL:-http://timestamp.apple.com/ts01}"
 SKIP_NOTARIZE="${SKIP_NOTARIZE:-0}"
 KEEP_OUT_DIR="${KEEP_OUT_DIR:-0}"
+ENABLE_CPPJIEBA="${ENABLE_CPPJIEBA:-0}"
 
 case "$APP_FLAVOR" in
     mytype)
@@ -54,10 +55,13 @@ if [ -z "$ARCH" ]; then
     fi
 fi
 
+LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     SIGNING_IDENTITY="$CODESIGN_IDENTITY"
+elif [ -f "$LOGIN_KEYCHAIN" ] && security find-identity -v -p codesigning "$LOGIN_KEYCHAIN" 2>/dev/null | grep -q "Developer ID Application"; then
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$LOGIN_KEYCHAIN" 2>/dev/null | grep "Developer ID Application" | head -1 | awk '{print $2}')
 elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
-    SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | awk '{print $2}')
 else
     SIGNING_IDENTITY="-"
 fi
@@ -66,6 +70,26 @@ if [ "$SKIP_NOTARIZE" != "1" ] && [ "$SIGNING_IDENTITY" = "-" ]; then
     echo "ERROR: Notarized DMG builds require a Developer ID Application identity."
     echo "       Set CODESIGN_IDENTITY or use SKIP_NOTARIZE=1 for local smoke tests."
     exit 1
+fi
+
+NOTARYTOOL_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+if [ -n "$NOTARY_KEYCHAIN" ]; then
+    NOTARYTOOL_AUTH+=(--keychain "$NOTARY_KEYCHAIN")
+fi
+
+if [ "$SKIP_NOTARIZE" != "1" ]; then
+    echo "Checking notarization profile '$NOTARY_PROFILE'..."
+    if ! xcrun notarytool history "${NOTARYTOOL_AUTH[@]}" >/dev/null 2>&1; then
+        echo "ERROR: Notarization profile '$NOTARY_PROFILE' is unavailable or invalid."
+        if [ -n "$NOTARY_KEYCHAIN" ]; then
+            echo "       Requested keychain: $NOTARY_KEYCHAIN"
+        else
+            echo "       Expected location: the current user's login keychain."
+        fi
+        echo "       Run: bash scripts/setup-notary-profile.sh"
+        echo "       The deployment keychain password is unrelated to Apple notarization credentials."
+        exit 1
+    fi
 fi
 
 APP_BUNDLE="${APP_NAME}.app"
@@ -97,6 +121,10 @@ cleanup() {
         mv "$PROJECT_DIR/Type4Me/CloudSubscription/marker.hidden" \
            "$PROJECT_DIR/Type4Me/CloudSubscription/marker"
     fi
+    if [ -f "$PROJECT_DIR/CppJiebaBridge/marker.hidden" ]; then
+        mv "$PROJECT_DIR/CppJiebaBridge/marker.hidden" \
+           "$PROJECT_DIR/CppJiebaBridge/marker"
+    fi
 }
 trap cleanup EXIT
 
@@ -111,7 +139,9 @@ SHERPA_AVAILABLE="no"
 [ -f "$PROJECT_DIR/Frameworks/sherpa-onnx.xcframework/Info.plist" ] && SHERPA_AVAILABLE="yes"
 SUB_AVAILABLE="no"
 [ -f "$PROJECT_DIR/Type4Me/CloudSubscription/marker" ] && SUB_AVAILABLE="yes"
-BUILD_STATE="${VARIANT}-sherpa:${SHERPA_AVAILABLE}-sub:${SUB_AVAILABLE}"
+JIEBA_AVAILABLE="no"
+[ "$ENABLE_CPPJIEBA" = "1" ] && [ -f "$PROJECT_DIR/CppJiebaBridge/marker" ] && JIEBA_AVAILABLE="yes"
+BUILD_STATE="${VARIANT}-sherpa:${SHERPA_AVAILABLE}-sub:${SUB_AVAILABLE}-jieba:${JIEBA_AVAILABLE}"
 LAST_STATE_FILE="$PROJECT_DIR/.build/.variant-state"
 if [ -f "$LAST_STATE_FILE" ] && [ "$(cat "$LAST_STATE_FILE")" != "$BUILD_STATE" ]; then
     echo "Build state changed, cleaning build cache..."
@@ -130,6 +160,12 @@ if [ "$NEEDS_SUBSCRIPTION" = "0" ] && [ -f "$PROJECT_DIR/Type4Me/CloudSubscripti
        "$PROJECT_DIR/Type4Me/CloudSubscription/marker.hidden"
 fi
 
+if [ "$ENABLE_CPPJIEBA" != "1" ] && [ -f "$PROJECT_DIR/CppJiebaBridge/marker" ]; then
+    echo "Hiding optional CppJieba bridge for ${VARIANT} build..."
+    mv "$PROJECT_DIR/CppJiebaBridge/marker" \
+       "$PROJECT_DIR/CppJiebaBridge/marker.hidden"
+fi
+
 cat > "$OUT_DIR/build-info.txt" <<INFO
 app_name=$APP_NAME
 app_bundle_id=$APP_BUNDLE_ID
@@ -137,6 +173,7 @@ url_scheme=$URL_SCHEME
 app_flavor=$APP_FLAVOR
 variant=$VARIANT
 arch=$ARCH
+cppjieba=$JIEBA_AVAILABLE
 notary_profile=$NOTARY_PROFILE
 notary_keychain=$NOTARY_KEYCHAIN
 signing_identity=$SIGNING_IDENTITY
@@ -203,11 +240,6 @@ fi
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 if [ "$SKIP_NOTARIZE" != "1" ] && [ "$SIGNING_IDENTITY" != "-" ]; then
-    NOTARYTOOL_AUTH=(--keychain-profile "$NOTARY_PROFILE")
-    if [ -n "$NOTARY_KEYCHAIN" ]; then
-        NOTARYTOOL_AUTH+=(--keychain "$NOTARY_KEYCHAIN")
-    fi
-
     echo "Submitting app for notarization..."
     ditto -c -k --keepParent "$APP" "$APP_ZIP"
     xcrun notarytool submit "$APP_ZIP" \

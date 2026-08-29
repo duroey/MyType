@@ -122,7 +122,13 @@ enum HotwordStorage {
     }
 
     static func save(_ words: [String]) {
-        writeFile(words, to: userFileURL)
+        try? saveOrThrow(words)
+    }
+
+    /// Persist user hotwords and surface file-system failures to callers that
+    /// need all-or-nothing behavior (for example correction learning).
+    static func saveOrThrow(_ words: [String]) throws {
+        try writeFileOrThrow(words, to: userFileURL)
         cacheLock.lock()
         cachedUser = nil
         cacheLock.unlock()
@@ -211,11 +217,15 @@ enum HotwordStorage {
     }
 
     private static func writeFile(_ words: [String], to url: URL) {
+        try? writeFileOrThrow(words, to: url)
+    }
+
+    private static func writeFileOrThrow(_ words: [String], to url: URL) throws {
         let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
-        guard let data = try? encoder.encode(words) else { return }
-        try? data.write(to: url, options: .atomic)
+        let data = try encoder.encode(words)
+        try data.write(to: url, options: .atomic)
     }
 }

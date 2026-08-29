@@ -24,6 +24,119 @@ enum VolcASRError: Error, LocalizedError {
     }
 }
 
+enum VolcTranscriptTransition: String, Equatable {
+    case snapshot
+    case revision
+    case blankHeld
+    case final
+}
+
+struct VolcTranscriptAccumulation: Equatable {
+    let transcript: RecognitionTranscript
+    let transition: VolcTranscriptTransition
+}
+
+/// Converts each Volcano response into a complete canonical text snapshot.
+/// Server revisions replace the previous hypothesis instead of being appended
+/// as locally confirmed text.
+struct VolcTranscriptAccumulator {
+    private var lastCanonicalText = ""
+    private var lastTranscript: RecognitionTranscript = .empty
+
+    mutating func reset() {
+        self = VolcTranscriptAccumulator()
+    }
+
+    mutating func apply(
+        result: VolcASRResult,
+        isFinal: Bool
+    ) -> VolcTranscriptAccumulation {
+        let resultText = nonBlank(result.text) ? result.text : ""
+        let utteranceText = result.utterances
+            .map(\.text)
+            .filter { !$0.isEmpty }
+            .joined()
+
+        let incomingText = !resultText.isEmpty ? resultText : utteranceText
+        if incomingText.isEmpty, !isFinal, !lastCanonicalText.isEmpty {
+            return VolcTranscriptAccumulation(
+                transcript: lastTranscript,
+                transition: .blankHeld
+            )
+        }
+
+        let canonicalText = incomingText.isEmpty ? lastCanonicalText : incomingText
+        let previousCanonicalText = lastCanonicalText
+        let transcript = makeTranscript(
+            canonicalText: canonicalText,
+            utterances: result.utterances,
+            isFinal: isFinal
+        )
+
+        if !canonicalText.isEmpty {
+            lastCanonicalText = canonicalText
+            lastTranscript = transcript
+        }
+
+        let transition: VolcTranscriptTransition
+        if isFinal {
+            transition = .final
+        } else if !previousCanonicalText.isEmpty,
+                  canonicalText != previousCanonicalText {
+            transition = .revision
+        } else {
+            transition = .snapshot
+        }
+
+        return VolcTranscriptAccumulation(
+            transcript: transcript,
+            transition: transition
+        )
+    }
+
+    private func makeTranscript(
+        canonicalText: String,
+        utterances: [VolcUtterance],
+        isFinal: Bool
+    ) -> RecognitionTranscript {
+        if isFinal {
+            return RecognitionTranscript(
+                confirmedSegments: canonicalText.isEmpty ? [] : [canonicalText],
+                partialText: "",
+                authoritativeText: canonicalText,
+                isFinal: true
+            )
+        }
+
+        let serverConfirmed = utterances
+            .filter(\.definite)
+            .map(\.text)
+            .filter { !$0.isEmpty }
+        let confirmedText = serverConfirmed.joined()
+
+        let confirmedSegments: [String]
+        let partialText: String
+        if !confirmedText.isEmpty, canonicalText.hasPrefix(confirmedText) {
+            confirmedSegments = serverConfirmed
+            partialText = String(canonicalText.dropFirst(confirmedText.count))
+        } else {
+            confirmedSegments = []
+            partialText = canonicalText
+        }
+
+        return RecognitionTranscript(
+            confirmedSegments: confirmedSegments,
+            partialText: partialText,
+            authoritativeText: canonicalText,
+            isFinal: false
+        )
+    }
+
+    private func nonBlank(_ text: String) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 actor VolcASRClient: SpeechRecognizer {
 
     private static let endpoint =
@@ -38,8 +151,7 @@ actor VolcASRClient: SpeechRecognizer {
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var session: URLSession?
-    private var ownsSession = false
-    private var receiveTask: Task<Void, Never>?
+    private var receiveGeneration = 0
 
     private var eventContinuation: AsyncStream<RecognitionEvent>.Continuation?
     private var _events: AsyncStream<RecognitionEvent>?
@@ -99,11 +211,9 @@ actor VolcASRClient: SpeechRecognizer {
         )
         let message = VolcProtocol.encodeMessage(header: header, payload: payload)
 
-        let initialSession = options.resolvedSession
-        var activeSession = initialSession
-        var activeTask = initialSession.webSocketTask(with: request)
-        var activeOwnsSession = options.bypassProxy
-        activeTask.resume()
+        let session = URLSession(configuration: options.urlSessionConfiguration)
+        let task = session.webSocketTask(with: request)
+        task.resume()
 
         lastTranscript = .empty
         audioPacketCount = 0
@@ -111,42 +221,22 @@ actor VolcASRClient: SpeechRecognizer {
         didRequestEnd = false
         sessionStartTime = ContinuousClock.now
         lastTranscriptTime = nil
-        localConfirmedSegments = []
-        lastPartialText = ""
-        lastServerConfirmedCount = 0
+        transcriptAccumulator.reset()
         NSLog("[ASR] Sending full_client_request (%d bytes), connectId=%@", message.count, connectId)
         do {
-            try await activeTask.send(.data(message))
+            try await task.send(.data(message))
         } catch {
-            // Long-idle shared URLSession sockets can fail on the first write.
-            // Retry once with a fresh session before showing a user-visible error.
-            NSLog("[ASR] WebSocket send failed: %@, retrying with fresh session...", String(describing: error))
-            activeTask.cancel(with: .goingAway, reason: nil)
-
-            let retrySession = URLSession(configuration: options.urlSessionConfiguration)
-            let retryTask = retrySession.webSocketTask(with: request)
-            retryTask.resume()
-            do {
-                try await retryTask.send(.data(message))
-                activeSession = retrySession
-                activeTask = retryTask
-                activeOwnsSession = true
-                NSLog("[ASR] WebSocket retry sent full_client_request OK")
-            } catch {
-                retryTask.cancel(with: .goingAway, reason: nil)
-                retrySession.invalidateAndCancel()
-                // WebSocket handshake failed — probe with HTTP to get real auth/vendor errors.
-                NSLog("[ASR] WebSocket retry failed: %@, probing for server error...", String(describing: error))
-                if let serverError = await Self.probeServerError(request: request) {
-                    throw serverError
-                }
-                throw error
+            task.cancel(with: .goingAway, reason: nil)
+            session.invalidateAndCancel()
+            NSLog("[ASR] WebSocket send failed: %@, probing for server error...", String(describing: error))
+            if let serverError = await Self.probeServerError(request: request) {
+                throw serverError
             }
+            throw error
         }
 
-        self.session = activeSession
-        self.ownsSession = activeOwnsSession
-        self.webSocketTask = activeTask
+        self.session = session
+        self.webSocketTask = task
 
         NSLog("[ASR] full_client_request sent OK")
 
@@ -204,15 +294,7 @@ actor VolcASRClient: SpeechRecognizer {
     private var lastTranscript: RecognitionTranscript = .empty
     private var lastTranscriptTime: ContinuousClock.Instant?
     private var sessionStartTime: ContinuousClock.Instant?
-
-    /// Locally promoted confirmed segments from dropped partials.
-    /// When the server starts a new utterance without confirming the previous partial,
-    /// we preserve the old partial here to prevent UI flicker.
-    private var localConfirmedSegments: [String] = []
-    /// Previous partial text for drop detection.
-    private var lastPartialText: String = ""
-    /// Previous server confirmed count, to detect genuine new confirmations vs stale state.
-    private var lastServerConfirmedCount: Int = 0
+    private var transcriptAccumulator = VolcTranscriptAccumulator()
 
     func sendAudio(_ data: Data) async throws {
         guard let task = webSocketTask else { return }
@@ -240,16 +322,15 @@ actor VolcASRClient: SpeechRecognizer {
 
     // MARK: - Disconnect
 
-    func disconnect() {
-        receiveTask?.cancel()
-        receiveTask = nil
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+    func disconnect() async {
+        receiveGeneration &+= 1
+        let socket = webSocketTask
         webSocketTask = nil
-        if ownsSession {
-            session?.invalidateAndCancel()
-        }
-        ownsSession = false
-        // Don't invalidate shared session — just release our reference
+        // Use URLSessionTask.cancel() here instead of the graceful WebSocket
+        // close overload. At teardown the transcript is already settled; a
+        // pending close handshake would keep CFNetwork continuations alive.
+        socket?.cancel()
+        session?.invalidateAndCancel()
         session = nil
         eventContinuation?.finish()
         eventContinuation = nil
@@ -260,36 +341,55 @@ actor VolcASRClient: SpeechRecognizer {
     // MARK: - Receive Loop
 
     private func startReceiveLoop() {
-        receiveTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                do {
-                    guard let task = await self.webSocketTask else { break }
-                    let message = try await task.receive()
-                    await self.handleMessage(message)
-                } catch {
-                    NSLog("[ASR] Receive loop error: %@", String(describing: error))
-                    if !Task.isCancelled {
-                        if await self.didRequestEnd {
-                            // We already sent end-of-stream — socket close is normal.
-                            NSLog("[ASR] Treating as normal session end (sent %d packets)", await self.audioPacketCount)
-                        } else if await self.audioPacketCount == 0 {
-                            // No audio sent yet — real connection/auth error.
-                            await self.emitEvent(.error(error))
-                        } else {
-                            // Audio was flowing but we never sent end-of-stream — network failure.
-                            NSLog("[ASR] Unexpected close during audio (sent %d packets)", await self.audioPacketCount)
-                            await self.emitEvent(.error(error))
-                        }
-                        await self.emitEvent(.completed)
-                    }
-                    break
-                }
-            }
-            NSLog("[ASR] Receive loop ended")
-            // Finish the event stream so consumers (eventConsumptionTask) can complete.
-            await self.eventContinuation?.finish()
+        receiveGeneration &+= 1
+        guard let task = webSocketTask else { return }
+        scheduleReceive(on: task, generation: receiveGeneration)
+    }
+
+    /// URLSessionWebSocketTask's async `receive()` leaves a Foundation
+    /// continuation graph alive after cancellation on current macOS releases.
+    /// Drive the socket with the callback API so each receive owns no suspended
+    /// Swift task while preserving actor-isolated message handling.
+    private func scheduleReceive(on task: URLSessionWebSocketTask, generation: Int) {
+        task.receive { [weak self, weak task] result in
+            guard let self, let task else { return }
+            Task { await self.handleReceiveResult(result, task: task, generation: generation) }
         }
+    }
+
+    private func handleReceiveResult(
+        _ result: Result<URLSessionWebSocketTask.Message, Error>,
+        task: URLSessionWebSocketTask,
+        generation: Int
+    ) {
+        guard generation == receiveGeneration, task === webSocketTask else { return }
+
+        switch result {
+        case .success(let message):
+            handleMessage(message)
+            if generation == receiveGeneration, task === webSocketTask {
+                scheduleReceive(on: task, generation: generation)
+            } else {
+                finishReceiveLoop()
+            }
+        case .failure(let error):
+            NSLog("[ASR] Receive loop error: %@", String(describing: error))
+            if didRequestEnd {
+                NSLog("[ASR] Treating as normal session end (sent %d packets)", audioPacketCount)
+            } else if audioPacketCount == 0 {
+                emitEvent(.error(error))
+            } else {
+                NSLog("[ASR] Unexpected close during audio (sent %d packets)", audioPacketCount)
+                emitEvent(.error(error))
+            }
+            emitEvent(.completed)
+            finishReceiveLoop()
+        }
+    }
+
+    private func finishReceiveLoop() {
+        NSLog("[ASR] Receive loop ended")
+        eventContinuation?.finish()
     }
 
     private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
@@ -313,17 +413,28 @@ actor VolcASRClient: SpeechRecognizer {
                     NSLog("[ASR] Session ended by server after %d audio packets", audioPacketCount)
                 }
                 emitEvent(.completed)
-                webSocketTask?.cancel(with: .normalClosure, reason: nil)
+                // The server has already ended the logical session. A graceful
+                // close here leaves CFNetwork's close-handshake graph retained;
+                // force task cancellation so the completed WebSocket can detach.
+                webSocketTask?.cancel()
                 webSocketTask = nil
+                session?.invalidateAndCancel()
+                session = nil
                 return
             }
 
             do {
                 let response = try VolcProtocol.decodeServerResponse(data)
-                let transcript = makeTranscript(
-                    from: response.result,
+                let accumulation = transcriptAccumulator.apply(
+                    result: response.result,
                     isFinal: response.header.flags == .asyncFinal
                 )
+                let transcript = accumulation.transcript
+                if accumulation.transition == .blankHeld {
+                    DebugFileLogger.log(
+                        "ASR transcript transition=blankHeld canonical=\(transcript.authoritativeText.count)chars"
+                    )
+                }
                 guard transcript != lastTranscript else { return }
                 lastTranscript = transcript
 
@@ -333,7 +444,7 @@ actor VolcASRClient: SpeechRecognizer {
                 lastTranscriptTime = now
 
                 let gapMs = Int(sinceLastUpdate.components.seconds * 1000 + sinceLastUpdate.components.attoseconds / 1_000_000_000_000_000)
-                DebugFileLogger.log("ASR transcript +\(sinceStart) gap=\(gapMs)ms confirmed=\(transcript.confirmedSegments.count) partial=\(transcript.partialText.count) final=\(transcript.isFinal)")
+                DebugFileLogger.log("ASR transcript +\(sinceStart) gap=\(gapMs)ms transition=\(accumulation.transition.rawValue) canonical=\(transcript.authoritativeText.count) confirmed=\(transcript.confirmedSegments.count) partial=\(transcript.partialText.count) final=\(transcript.isFinal)")
 
                 NSLog(
                     "[ASR] Transcript update +%@ gap=%dms confirmed=%d partial=%d final=%@",
@@ -363,85 +474,5 @@ actor VolcASRClient: SpeechRecognizer {
 
     private func emitEvent(_ event: RecognitionEvent) {
         eventContinuation?.yield(event)
-    }
-
-    private func makeTranscript(from result: VolcASRResult, isFinal: Bool) -> RecognitionTranscript {
-        let serverConfirmed = result.utterances
-            .filter(\.definite)
-            .map(\.text)
-            .filter { !$0.isEmpty }
-        let partialText = result.utterances.last(where: { !$0.definite && !$0.text.isEmpty })?.text ?? ""
-
-        let prevServerConfirmedCount = lastServerConfirmedCount
-        lastServerConfirmedCount = serverConfirmed.count
-
-        // When the server confirms new segments, sync local state
-        if serverConfirmed.count > localConfirmedSegments.count {
-            localConfirmedSegments = serverConfirmed
-        }
-
-        // Detect dropped partial: server started a new utterance without confirming the old one.
-        // Conditions: (1) server confirmed count didn't increase since last response,
-        // (2) old partial was substantial.
-        // Two sub-cases:
-        //   a) new partial is non-empty but shares <50% prefix with old → replaced
-        //   b) new partial is empty → server cleared it (e.g. during finalization)
-        if !isFinal,
-           serverConfirmed.count <= prevServerConfirmedCount,
-           lastPartialText.count >= 4
-        {
-            if partialText.isEmpty {
-                NSLog("[ASR] Partial cleared without confirmation: \"%@\", promoting to local confirmed",
-                      lastPartialText)
-                localConfirmedSegments.append(lastPartialText)
-            } else {
-                let lcp = longestCommonPrefixLength(lastPartialText, partialText)
-                let ratio = Double(lcp) / Double(lastPartialText.count)
-                if ratio < 0.5 {
-                    NSLog("[ASR] Dropped partial detected: \"%@\" → \"%@\" (LCP=%d ratio=%.2f), promoting to local confirmed",
-                          lastPartialText, partialText, lcp, ratio)
-                    localConfirmedSegments.append(lastPartialText)
-                }
-            }
-        }
-
-        lastPartialText = partialText
-
-        // Guard against false promotion: if the new partial overlaps significantly
-        // with the last promoted segment, the server merely re-analyzed — undo.
-        if !partialText.isEmpty && localConfirmedSegments.count > serverConfirmed.count {
-            let lastPromoted = localConfirmedSegments.last!
-            let lcp = longestCommonPrefixLength(lastPromoted, partialText)
-            let ratio = Double(lcp) / Double(lastPromoted.count)
-            if ratio >= 0.5 {
-                NSLog("[ASR] Un-promoting \"%@\" — partial \"%@\" reclaims it (LCP ratio=%.2f)",
-                      lastPromoted, partialText, ratio)
-                localConfirmedSegments.removeLast()
-            }
-        }
-
-        // Use local confirmed segments (which may include promoted partials)
-        let effectiveConfirmed = localConfirmedSegments.count > serverConfirmed.count
-            ? localConfirmedSegments : serverConfirmed
-
-        let composedText = (effectiveConfirmed + (partialText.isEmpty ? [] : [partialText])).joined()
-        let authoritativeText = result.text.isEmpty ? composedText : result.text
-        return RecognitionTranscript(
-            confirmedSegments: effectiveConfirmed,
-            partialText: partialText,
-            authoritativeText: authoritativeText,
-            isFinal: isFinal
-        )
-    }
-
-    private func longestCommonPrefixLength(_ a: String, _ b: String) -> Int {
-        var count = 0
-        var ai = a.startIndex, bi = b.startIndex
-        while ai < a.endIndex, bi < b.endIndex, a[ai] == b[bi] {
-            count += 1
-            ai = a.index(after: ai)
-            bi = b.index(after: bi)
-        }
-        return count
     }
 }

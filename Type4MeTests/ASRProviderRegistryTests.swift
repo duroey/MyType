@@ -4,7 +4,7 @@ import XCTest
 final class ASRProviderRegistryTests: XCTestCase {
 
     func testAvailableProvidersSupportDirectMode() {
-        for provider in [ASRProvider.volcano, .stepfunBatch, .baidu, .bailian, .deepgram, .assemblyai, .soniox, .openai] {
+        for provider in [ASRProvider.volcano, .stepfunBatch, .mimo, .baidu, .bailian, .deepgram, .assemblyai, .soniox, .openai] {
             XCTAssertTrue(ASRProviderRegistry.supports(.direct, for: provider))
         }
     }
@@ -53,5 +53,46 @@ final class ASRProviderRegistryTests: XCTestCase {
 
     func testSettingsCredentialValidationRejectsEmptyVolcanoCredentials() {
         XCTAssertFalse(ASRSettingsCard.hasValidASRCredentials(provider: .volcano, values: [:]))
+    }
+
+    func testRegistry_exposesMiMoProviderConfiguration() {
+        let entry = ASRProviderRegistry.entry(for: .mimo)
+        XCTAssertNotNil(entry)
+        XCTAssertTrue(entry?.isAvailable ?? false)
+        XCTAssertTrue(ASRProviderRegistry.configType(for: .mimo) == MiMoASRConfig.self)
+        XCTAssertNotNil(ASRProviderRegistry.createClient(for: .mimo))
+
+        let caps = ASRProviderRegistry.capabilities(for: .mimo)
+        XCTAssertTrue(caps.isAvailable)
+        XCTAssertFalse(caps.isStreaming)
+        XCTAssertFalse(caps.supportsRealtimeRecognition)
+        XCTAssertEqual(caps.audioInput, .pcmData)
+    }
+
+    func testCapabilities_distinguishRealtimeAndNonRealtimeProviders() {
+        // Non-realtime (batch audio submission after hotkey release)
+        for nonRealtime in [ASRProvider.openai, .stepfunBatch, .mimo] {
+            let caps = ASRProviderRegistry.capabilities(for: nonRealtime)
+            XCTAssertTrue(caps.isAvailable)
+            XCTAssertFalse(caps.isStreaming)
+            XCTAssertFalse(caps.supportsRealtimeRecognition)
+        }
+
+        // Realtime streaming providers
+        for realtime in [
+            ASRProvider.apple, .volcano, .deepgram, .cartesia,
+            .assemblyai, .elevenlabs, .grok, .soniox, .bailian, .baidu
+        ] {
+            let caps = ASRProviderRegistry.capabilities(for: realtime)
+            XCTAssertTrue(caps.isAvailable)
+            XCTAssertTrue(caps.isStreaming)
+            XCTAssertTrue(caps.supportsRealtimeRecognition)
+        }
+    }
+
+    func testProviderDisplayNames_areCleanWithoutBatchSuffix() {
+        XCTAssertEqual(ASRProvider.stepfunBatch.displayName, L("阶跃星辰", "StepFun"))
+        XCTAssertEqual(ASRProvider.mimo.displayName, L("小米 MiMo", "Xiaomi MiMo"))
+        XCTAssertEqual(ASRProvider.openai.displayName, "OpenAI")
     }
 }

@@ -3,8 +3,10 @@ import Foundation
 struct ModeStorage {
 
     let fileURL: URL
+    let userDefaults: UserDefaults
 
-    init(fileURL: URL? = nil) {
+    init(fileURL: URL? = nil, userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
         if let url = fileURL {
             self.fileURL = url
         } else {
@@ -17,6 +19,11 @@ struct ModeStorage {
         try data.write(to: fileURL, options: .atomic)
     }
 
+    /// Loads persisted modes and applies all compatibility migrations.
+    ///
+    /// Returns:
+    ///   The user's modes in their persisted order, with required built-ins
+    ///   and newly introduced fields migrated in place.
     func load() -> [ProcessingMode] {
         guard let data = try? Data(contentsOf: fileURL),
               let saved = try? JSONDecoder().decode([ProcessingMode].self, from: data),
@@ -27,18 +34,27 @@ struct ModeStorage {
 
         // Migrate legacy built-in flags for default modes, and drop unknown built-ins.
         var result = saved.compactMap { mode -> ProcessingMode? in
+            // Legacy translation records are user data. Preserve every field,
+            // including old built-in flags, prompts, bindings, and ordering.
+            if ProcessingMode.legacyTranslationModeIDs.contains(mode.id) {
+                return mode
+            }
             if mode.id == ProcessingMode.directId {
                 var d = ProcessingMode.direct
-                d.hotkeyCode = mode.hotkeyCode
-                d.hotkeyModifiers = mode.hotkeyModifiers
-                d.hotkeyStyle = mode.hotkeyStyle
+                d.hotkeyBindings = mode.hotkeyBindings
+                d.shortTextExemption = mode.shortTextExemption
+                d.punctuationMode = mode.punctuationMode
+                return d
+            }
+            if mode.id == ProcessingMode.intelliSenseId {
+                var d = ProcessingMode.intelliSense
+                d.hotkeyBindings = mode.hotkeyBindings
+                d.shortTextExemption = mode.shortTextExemption
+                d.punctuationMode = mode.punctuationMode
                 return d
             }
             if mode.id == ProcessingMode.smartDirectId {
                 return migrateDefaultMode(mode, fallback: .smartDirect)
-            }
-            if mode.id == ProcessingMode.translateId {
-                return migrateDefaultMode(mode, fallback: .translate)
             }
             if mode.id == ProcessingMode.formalWritingId {
                 let legacyPrompts: Set<String> = [
@@ -54,9 +70,10 @@ struct ModeStorage {
                     || mode.prompt.contains("内容包含多个要点时")
                     || isV4
                 var d = ProcessingMode.formalWriting
-                d.hotkeyCode = mode.hotkeyCode
-                d.hotkeyModifiers = mode.hotkeyModifiers
-                d.hotkeyStyle = mode.hotkeyStyle
+                d.hotkeyBindings = mode.hotkeyBindings
+                d.description = mode.description
+                d.shortTextExemption = mode.shortTextExemption
+                d.punctuationMode = mode.punctuationMode
                 // If user customized the prompt, keep theirs
                 if !isLegacy {
                     d.name = mode.name
@@ -67,9 +84,8 @@ struct ModeStorage {
             }
             if mode.id == ProcessingMode.selectionAskId {
                 var d = ProcessingMode.selectionAsk
-                d.hotkeyCode = mode.hotkeyCode
-                d.hotkeyModifiers = mode.hotkeyModifiers
-                d.hotkeyStyle = mode.hotkeyStyle
+                d.hotkeyBindings = mode.hotkeyBindings
+                d.punctuationMode = mode.punctuationMode
                 if mode.prompt != ProcessingMode.selectionAsk.prompt,
                    !selectionAskPromptIsLegacy(mode.prompt) {
                     d.name = mode.name
@@ -78,12 +94,22 @@ struct ModeStorage {
                 }
                 return d
             }
-            if mode.id == ProcessingMode.translate.id {
-                return migrateSeededDefaultPrompt(
-                    mode,
-                    legacyPrompts: [ProcessingMode.legacyTranslatePromptTemplate],
-                    fallbackPrompt: ProcessingMode.translate.prompt
-                )
+            if mode.id == ProcessingMode.macActionId {
+                var d = ProcessingMode.macAction
+                d.hotkeyBindings = mode.hotkeyBindings
+                d.punctuationMode = mode.punctuationMode
+                return d
+            }
+            if mode.id == ProcessingMode.translationModeId {
+                var canonical = ProcessingMode.translation()
+                canonical.hotkeyBindings = mode.hotkeyBindings
+                canonical.punctuationMode = mode.punctuationMode
+                let storedCode = mode.translationTargetLanguageCode?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                canonical.translationTargetLanguageCode =
+                    storedCode.flatMap { $0.isEmpty ? nil : $0 }
+                    ?? TranslationLanguage.english.rawValue
+                return canonical
             }
             if mode.id == ProcessingMode.promptOptimize.id {
                 // Detect any previous version by unique substrings
@@ -91,18 +117,18 @@ struct ModeStorage {
                     || (mode.prompt.contains("不编造具体方向") && !mode.prompt.contains("分析/研究/方案类任务"))  // V3 without complexity fix
                 if isLegacy {
                     var migrated = ProcessingMode.promptOptimize
-                    migrated.hotkeyCode = mode.hotkeyCode
-                    migrated.hotkeyModifiers = mode.hotkeyModifiers
-                    migrated.hotkeyStyle = mode.hotkeyStyle
+                    migrated.hotkeyBindings = mode.hotkeyBindings
+                    migrated.description = mode.description
+                    migrated.punctuationMode = mode.punctuationMode
                     return migrated
                 }
                 return mode
             }
             if mode.id == ProcessingMode.agentRouterModeId {
                 var migrated = ProcessingMode.agentRouterMode
-                migrated.hotkeyCode = mode.hotkeyCode
-                migrated.hotkeyModifiers = mode.hotkeyModifiers
-                migrated.hotkeyStyle = mode.hotkeyStyle
+                migrated.hotkeyBindings = mode.hotkeyBindings
+                migrated.shortTextExemption = mode.shortTextExemption
+                migrated.punctuationMode = mode.punctuationMode
                 return migrated
             }
             // Drop legacy dual-channel mode (replaced by global "enhanced ASR" toggle)
@@ -124,7 +150,17 @@ struct ModeStorage {
             ProcessingMode.directId,
             ProcessingMode.formalWritingId,
         ]
+        var insertedRequiredBuiltin = false
         for builtin in ProcessingMode.builtins where !resultIds.contains(builtin.id) {
+            var builtin = builtin
+            if builtin.id == ProcessingMode.translationModeId {
+                let selectedID = userDefaults.string(forKey: ModeSelectionPreference.storageKey)
+                    .flatMap(UUID.init(uuidString:))
+                let target: TranslationLanguage = selectedID == ProcessingMode.translateToChineseId
+                    ? .simplifiedChinese
+                    : .english
+                builtin = ProcessingMode.translation(target: target)
+            }
             if originalBuiltinIds.contains(builtin.id),
                let idx = ProcessingMode.builtins.firstIndex(where: { $0.id == builtin.id }) {
                 let insertAt = min(idx, result.count)
@@ -132,21 +168,24 @@ struct ModeStorage {
             } else {
                 result.append(builtin)
             }
+            insertedRequiredBuiltin = true
+        }
+        if insertedRequiredBuiltin {
+            try? save(result)
         }
 
         // One-time seeds for deletable default modes on existing installs.
         // Once seeded, deleting one is respected and will not re-inject it.
         let seededDefaults: [(mode: ProcessingMode, key: String)] = [
-            (.translateToChinese, "tf_translateToChineseModeSeeded"),
             (.agentMode, "tf_agentModeSeeded"),
         ]
         var seededAnyMode = false
-        for seed in seededDefaults where !UserDefaults.standard.bool(forKey: seed.key) {
+        for seed in seededDefaults where !userDefaults.bool(forKey: seed.key) {
             if !result.contains(where: { $0.id == seed.mode.id }) {
                 result.append(seed.mode)
                 seededAnyMode = true
             }
-            UserDefaults.standard.set(true, forKey: seed.key)
+            userDefaults.set(true, forKey: seed.key)
         }
         if seededAnyMode {
             // Persist immediately so seeded modes survive even if the user
@@ -154,14 +193,19 @@ struct ModeStorage {
             try? save(result)
         }
 
-        // One-time seed of agentRouterMode for existing installs.
-        let agentRouterSeedKey = "tf_agentRouterModeSeeded"
-        if !UserDefaults.standard.bool(forKey: agentRouterSeedKey) {
-            if !result.contains(where: { $0.id == ProcessingMode.agentRouterModeId }) {
-                result.append(ProcessingMode.agentRouterMode)
+        // One-time migration: the short-text-skip threshold used to be a single
+        // global UserDefaults value that only applied to 语音润色 (formal writing).
+        // Move it onto that mode so the per-mode setting preserves existing behavior.
+        let exemptionMigratedKey = "tf_shortTextExemptionMigrated"
+        if !userDefaults.bool(forKey: exemptionMigratedKey) {
+            let legacyGlobal = Int(userDefaults.string(forKey: "tf_shortTextExemption") ?? "0") ?? 0
+            if legacyGlobal > 0,
+               let idx = result.firstIndex(where: { $0.id == ProcessingMode.formalWritingId }),
+               result[idx].shortTextExemption == 0 {
+                result[idx].shortTextExemption = legacyGlobal
                 try? save(result)
             }
-            UserDefaults.standard.set(true, forKey: agentRouterSeedKey)
+            userDefaults.set(true, forKey: exemptionMigratedKey)
         }
 
         return result
@@ -177,22 +221,12 @@ struct ModeStorage {
         if !mode.processingLabel.isEmpty {
             migrated.processingLabel = mode.processingLabel
         }
-        migrated.hotkeyCode = mode.hotkeyCode
-        migrated.hotkeyModifiers = mode.hotkeyModifiers
-        migrated.hotkeyStyle = mode.hotkeyStyle
-        migrated.isBuiltin = false
-        return migrated
-    }
-
-    private func migrateSeededDefaultPrompt(
-        _ mode: ProcessingMode,
-        legacyPrompts: Set<String>,
-        fallbackPrompt: String
-    ) -> ProcessingMode {
-        guard legacyPrompts.contains(mode.prompt) else { return mode }
-
-        var migrated = mode
-        migrated.prompt = fallbackPrompt
+        if !mode.description.isEmpty {
+            migrated.description = mode.description
+        }
+        migrated.hotkeyBindings = mode.hotkeyBindings
+        migrated.shortTextExemption = mode.shortTextExemption
+        migrated.punctuationMode = mode.punctuationMode
         migrated.isBuiltin = false
         return migrated
     }

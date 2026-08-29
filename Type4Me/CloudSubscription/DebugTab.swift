@@ -5,11 +5,9 @@
 import SwiftUI
 import os
 
-struct DebugTab: View, SettingsCardHelpers {
-
-    static var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "tf_debug_panel")
-    }
+/// Cloud-only diagnostics embedded by the universal Debug settings page.
+/// This file is excluded from packages that do not include CloudSubscription.
+struct CloudDebugDiagnosticsSection: View, SettingsCardHelpers {
 
     @State private var cnMs: String = "—"
     @State private var usMs: String = "—"
@@ -19,12 +17,6 @@ struct DebugTab: View, SettingsCardHelpers {
     private let logger = Logger(subsystem: "com.mytype.app", category: "DebugTab")
 
     var body: some View {
-        SettingsSectionHeader(
-            label: L("调试", "DEBUG"),
-            title: L("诊断", "Diagnostics"),
-            description: L("区域切换、延迟测试与端点信息。", "Region switching, latency testing, endpoint info.")
-        )
-
         regionCard
         Spacer().frame(height: 16)
         endpointsCard

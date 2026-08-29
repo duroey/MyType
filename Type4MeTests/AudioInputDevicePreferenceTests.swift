@@ -103,6 +103,59 @@ final class AudioInputDevicePreferenceTests: XCTestCase {
         XCTAssertNil(resolved)
     }
 
+    func testActiveDeviceUsesSystemDefaultWhenFollowingSystem() {
+        AudioInputDevicePreferenceStore.resetToSystemDefault()
+        let systemDefault = AudioInputDevice(
+            uid: "built-in",
+            name: "MacBook Pro Microphone",
+            category: .builtIn
+        )
+
+        let active = AudioInputDevicePreferenceStore.activeInputDevice(
+            devices: [systemDefault],
+            systemDefault: systemDefault
+        )
+
+        XCTAssertEqual(active, systemDefault)
+    }
+
+    func testActiveDeviceFallsBackToSystemDefaultWhenNoPriorityDeviceIsAvailable() {
+        AudioInputDevicePreferenceStore.savePriorityEntries([
+            AudioInputDevicePreferenceEntry(uid: "airpods", name: "AirPods Pro"),
+        ])
+        let systemDefault = AudioInputDevice(
+            uid: "built-in",
+            name: "MacBook Pro Microphone",
+            category: .builtIn
+        )
+
+        let active = AudioInputDevicePreferenceStore.activeInputDevice(
+            devices: [systemDefault],
+            systemDefault: systemDefault
+        )
+
+        XCTAssertEqual(active, systemDefault)
+    }
+
+    func testActiveDevicePrefersAvailablePriorityDeviceOverSystemDefault() {
+        let airPods = AudioInputDevice(uid: "airpods", name: "AirPods Pro", category: .bluetooth)
+        let systemDefault = AudioInputDevice(
+            uid: "built-in",
+            name: "MacBook Pro Microphone",
+            category: .builtIn
+        )
+        AudioInputDevicePreferenceStore.savePriorityEntries([
+            AudioInputDevicePreferenceEntry(uid: airPods.uid, name: airPods.name),
+        ])
+
+        let active = AudioInputDevicePreferenceStore.activeInputDevice(
+            devices: [systemDefault, airPods],
+            systemDefault: systemDefault
+        )
+
+        XCTAssertEqual(active, airPods)
+    }
+
     func testPriorityEntryStoragePreservesDeviceNamesAndOrder() {
         let entries = [
             AudioInputDevicePreferenceEntry(uid: "airpods", name: "AirPods Pro"),

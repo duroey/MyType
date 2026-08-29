@@ -51,7 +51,8 @@ struct QuickCorrectionSheet: View {
                             .foregroundStyle(TF.settingsTextTertiary)
                         if !selectedChars.isEmpty {
                             Text(selectedText)
-                                .foregroundStyle(TF.settingsAccentAmber)
+                                .foregroundStyle(TF.settingsText)
+                                .fontWeight(.semibold)
                         }
                     }
                     .font(.system(size: 11))
@@ -133,7 +134,7 @@ struct QuickCorrectionSheet: View {
                             .padding(.vertical, 7)
                             .background(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .fill(canAdd ? TF.settingsAccentGreen : TF.settingsTextTertiary.opacity(0.3))
+                                    .fill(canAdd ? TF.settingsText : TF.settingsTextTertiary.opacity(0.3))
                             )
                             .contentShape(Rectangle())
                     }
@@ -180,7 +181,7 @@ struct QuickCorrectionSheet: View {
             .foregroundStyle(isSelected ? .white : TF.settingsText)
             .background(
                 RoundedRectangle(cornerRadius: TF.cornerSM)
-                    .fill(isSelected ? TF.settingsAccentAmber : TF.settingsBg)
+                    .fill(isSelected ? TF.settingsText : TF.settingsBg)
             )
             .background(
                 GeometryReader { geo in

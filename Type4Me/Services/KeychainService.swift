@@ -46,9 +46,18 @@ enum KeychainService {
         activeStorageConfiguration.legacyGroupedService
     }
 
-    private static var credentialsURL: URL {
+    static var credentialsFileURL: URL {
         activeStorageConfiguration.credentialsURL
             ?? AppIdentity.appSupportDirectory().appendingPathComponent("credentials.json")
+    }
+
+    private static var credentialsURL: URL {
+        credentialsFileURL
+    }
+
+    /// Indicates whether credential operations are redirected away from production storage.
+    static var isUsingTestStorage: Bool {
+        testingStorageConfiguration != nil
     }
 
     /// Redirects credential reads and writes to an isolated namespace for tests.
@@ -83,7 +92,7 @@ enum KeychainService {
     /// Load without acquiring lock — caller must hold `lock`.
     private static func _loadAllUnlocked() -> [String: Any] {
         if let cached = cachedCredentials { return cached }
-        guard let data = try? Data(contentsOf: credentialsURL),
+        guard let data = try? Data(contentsOf: credentialsFileURL),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return [:] }
         cachedCredentials = dict
@@ -99,10 +108,10 @@ enum KeychainService {
 
     private static func saveAll(_ dict: [String: Any]) throws {
         let data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
-        try data.write(to: credentialsURL, options: .atomic)
+        try data.write(to: credentialsFileURL, options: .atomic)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
-            ofItemAtPath: credentialsURL.path
+            ofItemAtPath: credentialsFileURL.path
         )
     }
 
@@ -424,9 +433,18 @@ enum KeychainService {
     /// Migrate legacy flat keys to provider-grouped format,
     /// move Application Support directory, and migrate UserDefaults from old bundle ID.
     static func migrateIfNeeded() {
+        migrateSettingsIfNeeded()
+        migrateStoredCredentials()
+    }
+
+    /// Migrates non-Keychain state needed before `AppState` is constructed.
+    ///
+    /// This method intentionally excludes credential reads so startup can restore
+    /// legacy modes and selections before creating UI state without prompting for
+    /// Keychain access earlier than the normal launch lifecycle.
+    static func migrateSettingsIfNeeded() {
         migrateAppSupportDirectory()
         migrateUserDefaults()
-        migrateStoredCredentials()
     }
 
     static func migrateStoredCredentials() {

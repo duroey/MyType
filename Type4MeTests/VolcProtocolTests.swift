@@ -288,6 +288,37 @@ final class VolcProtocolTests: XCTestCase {
         XCTAssertEqual(response.result.utterances.first?.text, "修正后的整句")
     }
 
+    func testDecodeServerResponsePreservesCanonicalRevisionAndUtteranceMetadata() throws {
+        let jsonPayload: [String: Any] = [
+            "result": [
+                "text": "最新修订后的完整文本",
+                "utterances": [
+                    ["text": "已确认前缀。", "definite": true],
+                    ["text": "新的临时文本", "definite": false],
+                ],
+            ]
+        ]
+        let jsonData = try JSONSerialization.data(withJSONObject: jsonPayload)
+        let header = VolcHeader(
+            messageType: .serverResponse,
+            flags: .noSequence,
+            serialization: .json,
+            compression: .none
+        )
+        let message = VolcProtocol.encodeMessage(header: header, payload: jsonData)
+
+        let response = try VolcProtocol.decodeServerResponse(message)
+
+        XCTAssertEqual(response.result.text, "最新修订后的完整文本")
+        XCTAssertEqual(
+            response.result.utterances,
+            [
+                VolcUtterance(text: "已确认前缀。", definite: true),
+                VolcUtterance(text: "新的临时文本", definite: false),
+            ]
+        )
+    }
+
     func testDecodeServerMessage_uncompressed() throws {
         let jsonPayload: [String: Any] = [
             "text": "test",
