@@ -232,10 +232,10 @@ final class FocusWakeupController {
     private let session: RecognitionSession
     var onRecordingStartRequested: ((ProcessingMode, [Data], Float) -> Bool)?
     var onRecordingCancellationRequested: (() -> Void)?
-    private let monitorAudio = AudioCaptureEngine()
+    private let monitorAudio = FocusAudioMonitor()
     private var timer: Timer?
     private var currentFocus: FocusSignature?
-    private var isMonitoringAudio = false
+    private var isMonitoringAudio: Bool { monitorAudio.state == .running }
     private var isFocusRecording = false
     private var isManualRecordingPaused = false
     private var isStartGatePausedByEscape = false
@@ -311,6 +311,7 @@ final class FocusWakeupController {
     /// Starts watching focused editable elements.
     func start() {
         config = Config.load()
+        monitorAudio.resetFailure()
         focusRetentionPolicy.updateConfig(config.focusRetentionConfig)
         isStartGatePausedByEscape = false
         guard config.enabled else {
@@ -360,6 +361,14 @@ final class FocusWakeupController {
     func pauseForManualRecording() {
         isManualRecordingPaused = true
         stopAudioMonitoring()
+    }
+
+    /// Waits for the background monitor to release the device before manual capture.
+    ///
+    /// Returns:
+    ///   True only after actual teardown; false when cancelled or the driver is stuck.
+    func waitForAudioRelease() async -> Bool {
+        await monitorAudio.waitUntilStopped()
     }
 
     /// Resumes the start RMS gate when a hotkey starts the main pipeline.
@@ -433,9 +442,7 @@ final class FocusWakeupController {
 
         case .none:
             currentFocus = nil
-            if isMonitoringAudio {
-                stopAudioMonitoring(hideWaiting: true)
-            }
+            stopAudioMonitoring(hideWaiting: true)
         }
     }
 
@@ -448,33 +455,44 @@ final class FocusWakeupController {
             )
             return
         }
+        // Polls may continue while hardware is starting, stopping, or failed.
+        // Coalesce them instead of repeatedly opening the same audio device.
+        guard monitorAudio.state == .idle else { return }
         rmsWindow = []
         preRollFrames = []
         consecutiveSpeechFrames = 0
         monitorStartedAt = nil
         lastFrameAt = nil
         monitorFrameCount = 0
-        monitorAudio.selectedDeviceUID = AudioInputDevicePreferenceStore.resolvedCachedDeviceUID()
-        monitorAudio.onAudioFrame = { [weak self] data in
-            Task { @MainActor in
-                self?.handleMonitorAudio(data)
+        monitorAudio.start(
+            deviceUID: AudioInputDevicePreferenceStore.resolvedCachedDeviceUID(),
+            onFrame: { [weak self] data in self?.handleMonitorAudio(data) },
+            onReady: { [weak self] in self?.audioMonitorDidStart() },
+            onFailure: { [weak self] error in
+                DebugFileLogger.log("focus wakeup: local RMS monitor suspended error=\(error)")
+                guard let self, !self.isManualRecordingPaused else { return }
+                if self.appState?.barPhase == .hidden || self.appState?.barPhase == .focusWaiting {
+                    self.appState?.showError(AudioCaptureError.converterCreationFailed.localizedDescription)
+                }
             }
+        )
+    }
+
+    /// Publishes readiness only after the background driver has actually started.
+    private func audioMonitorDidStart() {
+        guard config.enabled, currentFocus != nil,
+              !isManualRecordingPaused, !isStartGatePausedByEscape else {
+            monitorAudio.stop()
+            return
         }
-        do {
-            try monitorAudio.start()
-            isMonitoringAudio = true
-            monitorStartedAt = Date()
-            appState?.showFocusWaiting()
-            let threshold = resolveStartThreshold()
-            let speechLow = threshold.speechLowRMS.map { String(Int($0)) } ?? "nil"
-            let falseStartHigh = threshold.falseStartHighRMS.map { String(Int($0)) } ?? "nil"
-            DebugFileLogger.log(
-                "focus wakeup: local RMS monitor started threshold=\(Int(threshold.finalThreshold)) noise=\(Int(threshold.noiseThreshold)) speechLow=\(speechLow) falseStartHigh=\(falseStartHigh) deviceUID=\(Self.selectedMicrophoneUIDDescription())"
-            )
-        } catch {
-            DebugFileLogger.log("focus wakeup: local RMS monitor failed \(error)")
-            isMonitoringAudio = false
-        }
+        monitorStartedAt = Date()
+        appState?.showFocusWaiting()
+        let threshold = resolveStartThreshold()
+        let speechLow = threshold.speechLowRMS.map { String(Int($0)) } ?? "nil"
+        let falseStartHigh = threshold.falseStartHighRMS.map { String(Int($0)) } ?? "nil"
+        DebugFileLogger.log(
+            "focus wakeup: local RMS monitor started threshold=\(Int(threshold.finalThreshold)) noise=\(Int(threshold.noiseThreshold)) speechLow=\(speechLow) falseStartHigh=\(falseStartHigh) deviceUID=\(Self.selectedMicrophoneUIDDescription())"
+        )
     }
 
     /// Restores the blue focus-waiting UI when the monitor stayed alive across sessions.
@@ -536,9 +554,8 @@ final class FocusWakeupController {
     /// Args:
     ///   hideWaiting: Whether a visible focus-waiting bar should be hidden.
     private func stopAudioMonitoring(hideWaiting: Bool = false) {
-        guard isMonitoringAudio else { return }
+        let wasActive = monitorAudio.state == .starting || isMonitoringAudio
         monitorAudio.stop()
-        isMonitoringAudio = false
         rmsWindow = []
         preRollFrames = []
         consecutiveSpeechFrames = 0
@@ -548,7 +565,9 @@ final class FocusWakeupController {
         if hideWaiting, appState?.barPhase == .focusWaiting {
             appState?.cancel()
         }
-        DebugFileLogger.log("focus wakeup: local RMS monitor stopped")
+        if wasActive {
+            DebugFileLogger.log("focus wakeup: local RMS monitor stop queued; callbacks detached")
+        }
     }
 
     /// Handles one audio chunk from the local monitor.

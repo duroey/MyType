@@ -55,6 +55,8 @@ enum NoiseFloorStore {
 }
 
 enum NoiseFloorCalibrator {
+    /// Optional app-owned barrier for the Focus monitor's asynchronous teardown.
+    @MainActor static var waitForFocusAudioRelease: (@MainActor () async -> Bool)?
     private static let samples = OSAllocatedUnfairLock(initialState: [Float]())
     private static let isRunning = OSAllocatedUnfairLock(initialState: false)
     private static let fallbackThreshold: Float = 500
@@ -124,6 +126,21 @@ enum NoiseFloorCalibrator {
             )
         }
         defer { isRunning.withLock { $0 = false } }
+
+        if let waitForRelease = await waitForFocusAudioRelease,
+           !(await waitForRelease()) {
+            DebugFileLogger.log("noise floor calibration skipped: Focus microphone still busy source=\(source)")
+            return NoiseFloorCalibrationResult(
+                success: false,
+                enabled: true,
+                samples: 0,
+                noiseFloor: nil,
+                threshold: configuredFallbackThreshold(),
+                duration: duration,
+                message: nil,
+                error: AudioCaptureError.converterCreationFailed.localizedDescription
+            )
+        }
 
         samples.withLock { $0.removeAll(keepingCapacity: true) }
         FocusWakeupLearningStore.resetForNoiseCalibration()

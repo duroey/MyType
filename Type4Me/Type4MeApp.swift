@@ -609,6 +609,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        NoiseFloorCalibrator.waitForFocusAudioRelease = { [weak self] in
+            await self?.focusWakeupController?.waitForAudioRelease() ?? true
+        }
         NotificationCenter.default.addObserver(
             forName: .noiseFloorCalibrationWillStart,
             object: nil,
@@ -746,13 +749,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func syncFocusWakeupState() {
         if isFocusWakeupEnabled() {
             focusWakeupController?.start()
+            AudioKeepAliveManager.syncMicState()
         } else {
             focusWakeupController?.stop()
             if appState.barPhase == .focusWaiting {
                 appState.cancel()
             }
+            // Disabling Focus may enable microphone keep-alive. Do not open its
+            // capture session before the asynchronous Focus teardown completes.
+            Task { @MainActor [weak self] in
+                guard let self,
+                      await self.focusWakeupController?.waitForAudioRelease() ?? true,
+                      !self.isFocusWakeupEnabled() else { return }
+                AudioKeepAliveManager.syncMicState()
+            }
         }
-        AudioKeepAliveManager.syncMicState()
     }
 
     /// Migrates legacy microphone preferences into the remembered profile.
@@ -1198,6 +1209,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingRecordingStartTask = nil
     }
 
+    /// Prevents manual capture from racing the background Focus microphone teardown.
+    ///
+    /// Args:
+    ///   startToken: Owner of the cancellable recording-start request.
+    ///   followUpGeneration: Selection Ask owner, when starting a follow-up.
+    ///
+    /// Returns:
+    ///   True after actual device release; false after cancellation or bounded failure.
+    private func awaitMonitorReleaseBeforeRecording(
+        startToken: Int,
+        followUpGeneration: Int? = nil
+    ) async -> Bool {
+        let released = await focusWakeupController?.waitForAudioRelease() ?? true
+        guard !Task.isCancelled, recordingStartGate.allowsStart(token: startToken) else { return false }
+        if let followUpGeneration,
+           selectionAskFollowUpStartGate.generation != followUpGeneration { return false }
+        if released { return true }
+
+        DebugFileLogger.log("manual recording blocked: Focus microphone teardown timed out; no competing capture started")
+        if let followUpGeneration {
+            cancelSelectionAskFollowUpStart(startToken: startToken, followUpGeneration: followUpGeneration)
+        } else if cancelRecordingStartAttempt(token: startToken) {
+            appState.cancel()
+            focusWakeupController?.sessionDidFinish()
+            hotkeyManager.resetActiveState()
+        }
+        appState.showError(AudioCaptureError.converterCreationFailed.localizedDescription)
+        return false
+    }
+
     /// Cancels a queued or recording Focus session when its monitor stops.
     private func cancelFocusWakeupRecording() {
         guard appState.barPhase == .preparing || appState.barPhase == .recording else {
@@ -1277,6 +1318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         pendingRecordingStartTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            if !externalAudioInput {
+                guard await self.awaitMonitorReleaseBeforeRecording(startToken: startToken) else { return }
+            }
             // Keep the existing session as the only recording owner and wait
             // for its previous teardown before starting a new capture.
             let ready = await self.session.awaitIdle()
@@ -1361,6 +1405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         pendingRecordingStartTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard await self.awaitMonitorReleaseBeforeRecording(startToken: startToken) else { return }
             let prepResult = await ReviseCoordinator.shared.prepareForRecording()
             guard !Task.isCancelled,
                   self.recordingStartGate.allowsStart(token: startToken) else {
@@ -1909,6 +1954,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.startRecording()
         pendingRecordingStartTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard await self.awaitMonitorReleaseBeforeRecording(
+                startToken: startToken, followUpGeneration: generation
+            ) else { return }
             let ready = await self.session.awaitIdle()
             guard !Task.isCancelled else {
                 _ = self.cancelRecordingStartAttempt(token: startToken)
