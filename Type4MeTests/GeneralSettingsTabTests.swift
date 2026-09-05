@@ -2,6 +2,22 @@ import XCTest
 @testable import Type4Me
 
 final class GeneralSettingsTabTests: XCTestCase {
+    /// Guards the UI boundary without opening hardware or changing real preferences.
+    ///
+    /// Direct keep-alive calls bypass the app-owned wait for Focus microphone release.
+    func testSettingsCannotBypassCoordinatedMicrophoneHandoff() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Type4Me/UI/Settings/GeneralSettingsTab.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertFalse(
+            source.contains("AudioKeepAliveManager."),
+            "Settings must notify the app coordinator so Focus releases the microphone first."
+        )
+    }
+
     func testEnablingMicKeepAliveDisablesFocusWakeup() {
         let resolved = GeneralSettingsTab.resolvedAudioFeatureSettings(
             micKeepAlive: false,

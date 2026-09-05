@@ -262,7 +262,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             setLoginItem(enabled: newValue)
         }
         .onChange(of: micKeepAlive) { _, _ in
-            AudioKeepAliveManager.syncMicState()
+            NotificationCenter.default.post(name: .focusWakeupSettingDidChange, object: nil)
         }
         .onChange(of: focusWakeupEnabled) { _, _ in
             NotificationCenter.default.post(name: .focusWakeupSettingDidChange, object: nil)
@@ -718,14 +718,12 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             changedFeature: changedFeature,
             enabled: enabled
         )
-        let focusChanged = focusWakeupEnabled != resolved.focusWakeupEnabled
         micKeepAlive = resolved.micKeepAlive
         focusWakeupEnabled = resolved.focusWakeupEnabled
         RememberedMicrophoneProfileStore.updateFocusWakeupEnabled(resolved.focusWakeupEnabled)
-        AudioKeepAliveManager.syncMicState()
-        if focusChanged {
-            NotificationCenter.default.post(name: .focusWakeupSettingDidChange, object: nil)
-        }
+        // The app coordinator waits for Focus teardown before enabling keep-alive,
+        // including changes that leave Focus disabled throughout.
+        NotificationCenter.default.post(name: .focusWakeupSettingDidChange, object: nil)
     }
 
     private var noiseCalibrationRow: some View {
