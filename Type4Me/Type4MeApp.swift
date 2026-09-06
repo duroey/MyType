@@ -633,8 +633,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forName: .noiseFloorCalibrationDidFinish,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            let quietThreshold = notification.userInfo?["quietThreshold"] as? Float
             MainActor.assumeIsolated { [weak self] in
+                if let quietThreshold { self?.focusWakeupController?.applyQuietCalibration(quietThreshold) }
                 self?.syncFocusWakeupState()
             }
         }

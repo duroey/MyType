@@ -255,6 +255,19 @@ final class FocusWakeupController {
     private var lastRecordingWasQuiet = false
     private var pendingQuietDeviceChange = false
 
+    /// Installs a successful calibration from the shared settings button.
+    ///
+    /// Args:
+    ///   threshold: Quiet-mode threshold computed from that capture's ambient frames.
+    func applyQuietCalibration(_ threshold: Float) {
+        guard !isFocusRecording,
+              FocusAcousticMode.resolve(UserDefaults.standard.string(forKey: FocusAcousticMode.storageKey)) == .quiet else { return }
+        acousticMode = .quiet
+        quietDeviceUID = AudioInputDevicePreferenceStore.activeCachedInputDevice()?.uid
+        quietGate = QuietWakeupGate(calibratedThreshold: threshold)
+        appState?.quietCalibrationSecondsRemaining = 0
+    }
+
     /// Invalidates calibration and reopens the quiet monitor after a device change.
     /// Active sessions retain their frozen gate and defer reopening until completion.
     func inputDeviceDidChange() {

@@ -718,12 +718,9 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                 Text(L("安静模式", "Quiet Mode")).tag(FocusAcousticMode.quiet.rawValue)
             }
             .pickerStyle(.segmented)
-            Text(L("安静模式：聚焦输入框后先保持安静 3 秒；校准后桌面讲话即可触发。更换麦克风会重新校准。切换从下一次监听生效。",
-                   "Quiet Mode: focus a text field and stay quiet for 3 seconds, then speak from your desk. A microphone change recalibrates. Switching applies to the next listening period."))
-                .font(.caption)
-                .foregroundStyle(TF.settingsTextTertiary)
-            Text(L("安静模式使用独立结束规则：低于起录门槛的 60% 持续 0.8 秒后结束，不使用下方的静音时长设置。",
-                   "Quiet Mode ends after 0.8 seconds below 60% of its start threshold; the silence-duration setting below does not apply."))
+            .labelsHidden()
+            Text(L("两种算法共用下方的底噪校准和自动提交延迟。",
+                   "Both algorithms use the noise calibration and auto-submit delay below."))
                 .font(.caption)
                 .foregroundStyle(TF.settingsTextTertiary)
             if appState.quietCalibrationSecondsRemaining > 0 {
@@ -1223,6 +1220,8 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             return
         }
 
+        let calibrationMode = FocusAcousticMode.resolve(focusAcousticMode)
+        let calibrationDeviceUID = AudioInputDevicePreferenceStore.activeCachedInputDevice()?.uid
         let duration: TimeInterval = 1.5
         isCalibratingNoise = true
         noiseCalibrationStatus = L(
@@ -1235,7 +1234,8 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             let result = await NoiseFloorCalibrator.calibrate(
                 duration: duration,
                 minSamples: 10,
-                source: "settings"
+                source: "settings",
+                acousticMode: calibrationMode
             )
             await MainActor.run {
                 isCalibratingNoise = false
@@ -1243,13 +1243,16 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                     let floor = Int((result.noiseFloor ?? 0).rounded())
                     let threshold = Int(result.threshold.rounded())
                     noiseCalibrationStatus = L(
-                        "底噪 \(floor)，判停阈值 \(threshold)",
-                        "Noise \(floor), stop threshold \(threshold)"
+                        "底噪 \(floor)，触发阈值 \(threshold)",
+                        "Noise \(floor), trigger threshold \(threshold)"
                     )
                 } else {
                     noiseCalibrationStatus = result.error ?? L("底噪校准失败", "Noise calibration failed")
                 }
-                NotificationCenter.default.post(name: .noiseFloorCalibrationDidFinish, object: nil)
+                let sameDevice = calibrationDeviceUID == AudioInputDevicePreferenceStore.activeCachedInputDevice()?.uid
+                let quietThreshold: Float? = result.success && sameDevice && calibrationMode == .quiet ? result.threshold : nil
+                NotificationCenter.default.post(name: .noiseFloorCalibrationDidFinish, object: nil,
+                    userInfo: quietThreshold.map { ["quietThreshold": $0] })
             }
         }
     }

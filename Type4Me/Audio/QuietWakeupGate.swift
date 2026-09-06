@@ -24,7 +24,6 @@ enum QuietWakeupConfiguration {
     static let noiseMargin: Float = 20
     static let windowFrames = 5
     static let onsetFrames = 6
-    static let releaseFrames = 40
     static let releaseRatio: Float = 0.6
 }
 
@@ -34,6 +33,28 @@ struct QuietWakeupGate: Sendable {
     private var consecutive = 0
     private(set) var threshold: Float?
     var calibrationRemaining: Int { max(0, QuietWakeupConfiguration.calibrationFrames - calibration.count) }
+
+    /// Creates a gate with an optional threshold supplied by the shared calibration button.
+    ///
+    /// Args:
+    ///   calibratedThreshold: Valid quiet threshold, or nil to collect startup samples.
+    init(calibratedThreshold: Float? = nil) {
+        if let value = calibratedThreshold, value.isFinite, value > 0 { threshold = value }
+    }
+
+    /// Calculates the quiet algorithm's threshold from ambient frame statistics.
+    ///
+    /// Args:
+    ///   samples: PCM16 RMS values collected by either calibration entry point.
+    /// Returns:
+    ///   The quiet threshold, or nil when there are no valid samples.
+    static func calibratedThreshold(samples: [Float]) -> Float? {
+        let sorted = samples.filter { $0.isFinite && $0 >= 0 }.sorted()
+        guard !sorted.isEmpty else { return nil }
+        let p95 = sorted[Int(Double(sorted.count) * 0.95)]
+        return max(QuietWakeupConfiguration.minimumThreshold,
+                   p95 * QuietWakeupConfiguration.noiseMultiplier, p95 + QuietWakeupConfiguration.noiseMargin)
+    }
 
     /// Feeds one frame, calibrating once and subsequently detecting an onset.
     ///
@@ -46,10 +67,7 @@ struct QuietWakeupGate: Sendable {
         guard let threshold else {
             calibration.append(rms)
             if calibration.count == QuietWakeupConfiguration.calibrationFrames {
-                let sorted = calibration.sorted()
-                let p95 = sorted[Int(Float(sorted.count) * 0.95)]
-                self.threshold = max(QuietWakeupConfiguration.minimumThreshold,
-                    p95 * QuietWakeupConfiguration.noiseMultiplier, p95 + QuietWakeupConfiguration.noiseMargin)
+                self.threshold = Self.calibratedThreshold(samples: calibration)
             }
             return false
         }
@@ -66,6 +84,7 @@ struct QuietWakeupGate: Sendable {
 
 struct QuietWakeupEndGate: Sendable {
     let threshold: Float
+    let silenceSeconds: Double
     private var window: [Float] = []
     private var quietFrames = 0
 
@@ -73,8 +92,10 @@ struct QuietWakeupEndGate: Sendable {
     ///
     /// Args:
     ///   onsetThreshold: Calibrated threshold that actually triggered this session.
-    init(onsetThreshold: Float) {
+    ///   silenceSeconds: Shared auto-submit delay, frozen for this session.
+    init(onsetThreshold: Float, silenceSeconds: Double = FocusAutoStopSilenceSetting.read()) {
         threshold = onsetThreshold * QuietWakeupConfiguration.releaseRatio
+        self.silenceSeconds = FocusAutoStopSilenceSetting.normalized(silenceSeconds)
     }
 
     /// Checks sustained silence using the same smoothing as the prototype.
@@ -82,13 +103,13 @@ struct QuietWakeupEndGate: Sendable {
     /// Args:
     ///   rms: RMS of one complete 20 ms frame.
     /// Returns:
-    ///   True after 800 ms of smoothed audio below the release threshold.
+    ///   True after the shared delay of smoothed audio below the release threshold.
     mutating func consume(_ rms: Float) -> Bool {
         guard rms.isFinite, rms >= 0 else { quietFrames = 0; return false }
         window.append(rms)
         if window.count > QuietWakeupConfiguration.windowFrames { window.removeFirst() }
         let average = window.reduce(0, +) / Float(window.count)
         quietFrames = average < threshold ? quietFrames + 1 : 0
-        return quietFrames >= QuietWakeupConfiguration.releaseFrames
+        return Double(quietFrames) * Double(AudioCaptureEngine.frameDurationMs) / 1000 >= silenceSeconds
     }
 }

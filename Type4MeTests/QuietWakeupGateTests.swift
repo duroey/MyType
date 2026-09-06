@@ -16,7 +16,7 @@ final class QuietWakeupGateTests: XCTestCase {
     }
 
     func testReleaseHysteresisAndScatteredDips() {
-        var gate = QuietWakeupEndGate(onsetThreshold: 50)
+        var gate = QuietWakeupEndGate(onsetThreshold: 50, silenceSeconds: 0.8)
         XCTAssertEqual(gate.threshold, 30, accuracy: 0.0001)
         for _ in 0..<100 { XCTAssertFalse(gate.consume(40)) }
         for index in 0..<400 { XCTAssertFalse(gate.consume(index % 20 < 3 ? 10 : 110)) }
@@ -37,5 +37,23 @@ final class QuietWakeupGateTests: XCTestCase {
         XCTAssertEqual(FocusAcousticMode.quiet.label(english: false), "安静模式")
         XCTAssertEqual(FocusAcousticMode.quiet.label(english: true), "Quiet Mode")
         XCTAssertEqual(FocusAcousticMode.noisy.label(english: false), "嘈杂模式")
+    }
+
+    func testSharedDelayControlsRelease() {
+        for seconds in [0.1, 0.8, 1.0, 2.0] {
+            var gate = QuietWakeupEndGate(onsetThreshold: 50, silenceSeconds: seconds)
+            let frames = Int(ceil(seconds * 50))
+            for _ in 0..<(frames - 1) { XCTAssertFalse(gate.consume(0)) }
+            XCTAssertTrue(gate.consume(0))
+        }
+    }
+
+    func testSharedCalibrationMatchesAutomaticCalibration() {
+        let samples = Array(repeating: Float(20), count: 150)
+        let calibrated = QuietWakeupGate.calibratedThreshold(samples: samples)
+        var gate = QuietWakeupGate(calibratedThreshold: calibrated)
+        XCTAssertEqual(gate.threshold, 50)
+        for _ in 0..<5 { XCTAssertFalse(gate.consume(110)) }
+        XCTAssertTrue(gate.consume(110))
     }
 }

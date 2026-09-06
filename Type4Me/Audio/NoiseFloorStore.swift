@@ -99,6 +99,7 @@ enum NoiseFloorCalibrator {
     ///   duration: Time window in seconds used to sample ambient audio.
     ///   minSamples: Minimum number of 20ms frames required to accept the result.
     ///   source: Short label written to diagnostic logs.
+    ///   acousticMode: Algorithm whose threshold is being calibrated; quiet leaves legacy learning untouched.
     ///
     /// Returns:
     ///   Calibration result using the Python MyType response shape.
@@ -106,7 +107,8 @@ enum NoiseFloorCalibrator {
     static func calibrate(
         duration: TimeInterval,
         minSamples: Int,
-        source: String
+        source: String,
+        acousticMode: FocusAcousticMode = .noisy
     ) async -> NoiseFloorCalibrationResult {
         let started = isRunning.withLock { running in
             guard !running else { return false }
@@ -143,7 +145,7 @@ enum NoiseFloorCalibrator {
         }
 
         samples.withLock { $0.removeAll(keepingCapacity: true) }
-        FocusWakeupLearningStore.resetForNoiseCalibration()
+        if acousticMode == .noisy { FocusWakeupLearningStore.resetForNoiseCalibration() }
         let engine = AudioCaptureEngine()
         engine.selectedDeviceUID = AudioInputDevicePreferenceStore.resolvedCachedDeviceUID()
         engine.onAudioFrame = { frame in
@@ -187,8 +189,11 @@ enum NoiseFloorCalibrator {
         }
         let calibration = calibrationStatistics(for: values)
         let floor = calibration.noiseFloor
-        let threshold = calibration.threshold
-        NoiseFloorStore.update(noiseFloor: floor, threshold: threshold, samples: values.count, source: source)
+        let threshold = acousticMode == .quiet
+            ? (QuietWakeupGate.calibratedThreshold(samples: values) ?? calibration.threshold) : calibration.threshold
+        if acousticMode == .noisy {
+            NoiseFloorStore.update(noiseFloor: floor, threshold: threshold, samples: values.count, source: source)
+        }
         DebugFileLogger.log(
             "noise floor stats source=\(source) median=\(Int(calibration.noiseFloor)) p95=\(Int(calibration.p95)) mad=\(Int(calibration.mad)) threshold=\(Int(threshold))"
         )
