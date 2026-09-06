@@ -26,6 +26,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @AppStorage("tf_bypassProxy") private var bypassProxy = "off"
     @AppStorage("tf_micKeepAlive") private var micKeepAlive = false
     @AppStorage("tf_focusWakeupEnabled") private var focusWakeupEnabled = true
+    @AppStorage(FocusAcousticMode.storageKey) private var focusAcousticMode = FocusAcousticMode.noisy.rawValue
     @AppStorage(FocusAutoStopSilenceSetting.storageKey) private var focusAutoStopSilenceSeconds = FocusAutoStopSilenceSetting.defaultSeconds
     @AppStorage(FocusWakeupController.focusWakeupModeIdKey) private var focusWakeupModeId = ""
     @AppStorage("tf_agentLauncherTerminal") private var agentLauncherTerminal = "auto"
@@ -114,6 +115,8 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                 crossModeFinishRow
                 SettingsDivider()
                 focusWakeupRow
+                SettingsDivider()
+                focusAcousticModeRow
                 SettingsDivider()
                 noiseCalibrationRow
                 SettingsDivider()
@@ -702,6 +705,31 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
                     ("off", L("关闭", "Off")),
                 ]
             )
+        }
+        .padding(.vertical, 6)
+    }
+
+    /// Selects the next focus recording's acoustic policy without interrupting audio.
+    private var focusAcousticModeRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L("声音触发模式", "Sound Trigger Mode"))
+            Picker(L("声音触发模式", "Sound Trigger Mode"), selection: $focusAcousticMode) {
+                Text(L("嘈杂模式", "Noisy Mode")).tag(FocusAcousticMode.noisy.rawValue)
+                Text(L("安静模式", "Quiet Mode")).tag(FocusAcousticMode.quiet.rawValue)
+            }
+            .pickerStyle(.segmented)
+            Text(L("安静模式：聚焦输入框后先保持安静 3 秒；校准后桌面讲话即可触发。更换麦克风会重新校准。切换从下一次监听生效。",
+                   "Quiet Mode: focus a text field and stay quiet for 3 seconds, then speak from your desk. A microphone change recalibrates. Switching applies to the next listening period."))
+                .font(.caption)
+                .foregroundStyle(TF.settingsTextTertiary)
+            Text(L("安静模式使用独立结束规则：低于起录门槛的 60% 持续 0.8 秒后结束，不使用下方的静音时长设置。",
+                   "Quiet Mode ends after 0.8 seconds below 60% of its start threshold; the silence-duration setting below does not apply."))
+                .font(.caption)
+                .foregroundStyle(TF.settingsTextTertiary)
+            if appState.quietCalibrationSecondsRemaining > 0 {
+                Text(L("请保持安静，校准剩余 \(appState.quietCalibrationSecondsRemaining) 秒",
+                       "Stay quiet: \(appState.quietCalibrationSecondsRemaining)s of calibration remaining"))
+            }
         }
         .padding(.vertical, 6)
     }

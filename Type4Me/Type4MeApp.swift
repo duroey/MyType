@@ -3,19 +3,25 @@ import SwiftUI
 
 @main
 struct Type4MeApp: App {
+    @AppStorage("tf_language") private var language = AppLanguage.systemDefault
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        MenuBarExtra(
-            "MyType",
-            systemImage: appDelegate.appState.barPhase == .hidden ? "mic" : "mic.fill"
-        ) {
+        MenuBarExtra {
             MenuBarContent()
                 .environment(appDelegate.appState)
                 .environment(appDelegate.appUpdater)
                 .environment(appDelegate.menuBarControlCenterModel)
                 .environment(appDelegate.menuBarActionCoordinator)
+        } label: {
+            if appDelegate.appState.quietCalibrationSecondsRemaining > 0 {
+                Text(L("安静 \(appDelegate.appState.quietCalibrationSecondsRemaining)秒",
+                       "Quiet \(appDelegate.appState.quietCalibrationSecondsRemaining)s"))
+            } else {
+                Image(systemName: appDelegate.appState.barPhase == .hidden ? "mic" : "mic.fill")
+                    .accessibilityLabel("MyType")
+            }
         }
 
         Window(L("MyType 设置", "MyType Settings"), id: "settings") {
@@ -291,13 +297,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await askAnythingCoordinator.restoreAfterLaunch() }
         let appState = self.appState
         let focusWakeupController = FocusWakeupController(appState: appState, session: session)
-        focusWakeupController.onRecordingStartRequested = { [weak self] mode, chunks, threshold in
+        focusWakeupController.onRecordingStartRequested = { [weak self] mode, chunks, threshold, quiet in
             self?.requestRecordingStart(
                 mode: mode,
                 source: .focusWakeup,
                 autoStopOnSilenceOverride: true,
                 initialAudioChunks: chunks,
                 autoStopThresholdOverride: threshold,
+                quietWakeup: quiet,
                 externalAudioInput: true
             ) ?? false
         }
@@ -930,6 +937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DebugFileLogger.log(
             "audio input changed effective=\(previous?.uid ?? "none") → \(current?.uid ?? "none")"
         )
+        focusWakeupController?.inputDeviceDidChange()
         guard notify else { return }
 
         let message: String
@@ -1261,6 +1269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   autoStopOnSilenceOverride: Optional end-RMS-gate override.
     ///   initialAudioChunks: Audio captured before the shared session starts.
     ///   autoStopThresholdOverride: Trigger threshold forwarded to the end gate.
+    ///   quietWakeup: Frozen quiet-room end policy supplied by the triggering monitor.
     ///   externalAudioInput: Whether another capture stream supplies audio frames.
     ///
     /// Returns:
@@ -1272,6 +1281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoStopOnSilenceOverride: Bool? = nil,
         initialAudioChunks: [Data] = [],
         autoStopThresholdOverride: Float? = nil,
+        quietWakeup: Bool = false,
         externalAudioInput: Bool = false
     ) -> Bool {
         switch appState.barPhase {
@@ -1373,6 +1383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 autoStopOnSilence: autoStopOnSilence,
                 initialAudioChunks: initialAudioChunks,
                 autoStopThresholdOverride: autoStopThresholdOverride,
+                quietWakeup: quietWakeup,
                 externalAudioInput: externalAudioInput,
                 onClaimed: onClaimed
             )

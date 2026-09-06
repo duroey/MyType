@@ -727,6 +727,7 @@ actor RecognitionSession {
     private var onAutoCancel: (@Sendable () -> Void)?
     private var autoStopOnSilence = false
     private var autoStopHadSpeech = false
+    private var quietWakeupEndGate: QuietWakeupEndGate?
     private var autoStopSilenceStart: ContinuousClock.Instant?
     private var autoStopRMSWindow: [Float] = []
     private var autoStopEffectiveThreshold: Float = 0
@@ -805,6 +806,7 @@ actor RecognitionSession {
     ///
     /// Args:
     ///   mode: Processing mode used for the current recording.
+    ///   quietWakeup: Whether this externally triggered session uses the quiet-room end gate.
     ///   requestedAt: Time when the user requested recording, used for startup diagnostics.
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
     ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
@@ -820,6 +822,7 @@ actor RecognitionSession {
         autoStopOnSilence: Bool = false,
         initialAudioChunks: [Data] = [],
         autoStopThresholdOverride: Float? = nil,
+        quietWakeup: Bool = false,
         externalAudioInput: Bool = false,
         selectionAskRequestContext: SelectionAskRequestContext? = nil,
         onClaimed: (@Sendable (Int) -> Void)? = nil
@@ -830,6 +833,7 @@ actor RecognitionSession {
             autoStopOnSilence: autoStopOnSilence,
             initialAudioChunks: initialAudioChunks,
             autoStopThresholdOverride: autoStopThresholdOverride,
+            quietWakeup: quietWakeup,
             externalAudioInput: externalAudioInput,
             selectionAskRequestContext: selectionAskRequestContext,
             onClaimed: onClaimed
@@ -895,6 +899,7 @@ actor RecognitionSession {
     ///
     /// Args:
     ///   purpose: Frozen behavior and mode for this recording session.
+    ///   quietWakeup: Whether this externally triggered session uses the quiet-room end gate.
     ///   requestedAt: Time when the user requested recording, used for startup diagnostics.
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
     ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
@@ -909,6 +914,7 @@ actor RecognitionSession {
         autoStopOnSilence: Bool = false,
         initialAudioChunks: [Data] = [],
         autoStopThresholdOverride: Float? = nil,
+        quietWakeup: Bool = false,
         externalAudioInput: Bool = false,
         selectionAskRequestContext: SelectionAskRequestContext? = nil,
         onClaimed: (@Sendable (Int) -> Void)? = nil
@@ -975,6 +981,8 @@ actor RecognitionSession {
         }
         speechDetected = externalAudioInput && !initialAudioChunks.isEmpty
         self.autoStopOnSilence = autoStopOnSilence
+        quietWakeupEndGate = quietWakeup && externalAudioInput
+            ? autoStopThresholdOverride.map { QuietWakeupEndGate(onsetThreshold: $0) } : nil
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
         autoStopRMSWindow = []
@@ -1532,7 +1540,7 @@ actor RecognitionSession {
             guard let self, !Task.isCancelled else { return }
             await self.autoStopIfRecording(expectedGeneration: expectedGeneration)
         }
-        if autoStopOnSilence {
+        if autoStopOnSilence && quietWakeupEndGate == nil {
             scheduleAutoStopFalseStart(expectedGeneration: expectedGeneration)
         }
     }
@@ -4100,6 +4108,7 @@ actor RecognitionSession {
 
     /// Clears state used by focus wakeup silence auto-stop.
     private func resetAutoStopState() {
+        quietWakeupEndGate = nil
         autoStopOnSilence = false
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
@@ -4174,6 +4183,17 @@ actor RecognitionSession {
         }
 
         let rms = Self.rms16(data)
+        if var gate = quietWakeupEndGate {
+            let ended = gate.consume(rms)
+            quietWakeupEndGate = gate
+            guard ended else { return }
+            // A triggered quiet session owns real buffered audio. Finish normally,
+            // even when partial ASR text has not arrived, rather than learning noise.
+            autoStopOnSilence = false
+            onAutoStop?()
+            await stopRecording(expectedGeneration: expectedGeneration)
+            return
+        }
         let defaults = UserDefaults.standard
         let windowFrames = max(
             1,

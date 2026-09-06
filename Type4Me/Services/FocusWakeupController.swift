@@ -230,7 +230,7 @@ final class FocusWakeupController {
 
     private weak var appState: AppState?
     private let session: RecognitionSession
-    var onRecordingStartRequested: ((ProcessingMode, [Data], Float) -> Bool)?
+    var onRecordingStartRequested: ((ProcessingMode, [Data], Float, Bool) -> Bool)?
     var onRecordingCancellationRequested: (() -> Void)?
     private let monitorAudio = FocusAudioMonitor()
     private var timer: Timer?
@@ -249,6 +249,23 @@ final class FocusWakeupController {
     private var config: Config
     private var focusRetentionPolicy: FocusWakeupRetentionPolicy<FocusSignature>
     private var lastFocusTriggerRMS: Float?
+    private var acousticMode = FocusAcousticMode.noisy
+    private var quietGate = QuietWakeupGate()
+    private var quietDeviceUID: String?
+    private var lastRecordingWasQuiet = false
+    private var pendingQuietDeviceChange = false
+
+    /// Invalidates calibration and reopens the quiet monitor after a device change.
+    /// Active sessions retain their frozen gate and defer reopening until completion.
+    func inputDeviceDidChange() {
+        guard acousticMode == .quiet else { return }
+        if isFocusRecording {
+            pendingQuietDeviceChange = true
+        } else {
+            quietGate = QuietWakeupGate()
+            stopAudioMonitoring()
+        }
+    }
     private var externalAudioHandoff = FocusExternalAudioHandoffBuffer()
     private var externalAudioDeliveryTask: Task<Void, Never>?
     private var externalAudioDeliveryTaskGeneration: Int?
@@ -383,6 +400,12 @@ final class FocusWakeupController {
         isFocusRecording = false
         isManualRecordingPaused = false
         lastFocusTriggerRMS = nil
+        quietGate.rearm()
+        if pendingQuietDeviceChange {
+            pendingQuietDeviceChange = false
+            quietGate = QuietWakeupGate()
+            stopAudioMonitoring()
+        }
         resetExternalAudioHandoff()
         rearmBlockedUntil = Date().addingTimeInterval(config.rearmDelay)
     }
@@ -391,10 +414,11 @@ final class FocusWakeupController {
     func sessionDidFalseStart() {
         isFocusRecording = false
         isManualRecordingPaused = false
-        if let triggerRMS = lastFocusTriggerRMS {
+        if !lastRecordingWasQuiet, let triggerRMS = lastFocusTriggerRMS {
             _ = FalseStartRMSProfileStore.record(triggerRMS, source: "focus")
         }
         lastFocusTriggerRMS = nil
+        quietGate.rearm()
         resetExternalAudioHandoff()
         rearmBlockedUntil = Date().addingTimeInterval(config.falseStartCooldown)
         DebugFileLogger.log(
@@ -554,6 +578,8 @@ final class FocusWakeupController {
     /// Args:
     ///   hideWaiting: Whether a visible focus-waiting bar should be hidden.
     private func stopAudioMonitoring(hideWaiting: Bool = false) {
+        appState?.quietCalibrationSecondsRemaining = 0
+        if quietGate.threshold == nil { quietGate = QuietWakeupGate() }
         let wasActive = monitorAudio.state == .starting || isMonitoringAudio
         monitorAudio.stop()
         rmsWindow = []
@@ -586,6 +612,17 @@ final class FocusWakeupController {
         guard currentFocus != nil, !isManualRecordingPaused else { return }
         guard Date() >= rearmBlockedUntil else { return }
 
+        let requestedMode = FocusAcousticMode.resolve(UserDefaults.standard.string(forKey: FocusAcousticMode.storageKey))
+        let deviceUID = AudioInputDevicePreferenceStore.activeCachedInputDevice()?.uid
+        if requestedMode != acousticMode || deviceUID != quietDeviceUID {
+            acousticMode = requestedMode
+            quietDeviceUID = deviceUID
+            quietGate = QuietWakeupGate()
+            rmsWindow = []
+            consecutiveSpeechFrames = 0
+            preRollFrames = []
+        }
+
         preRollFrames.append(data)
         if preRollFrames.count > config.preRollFrames {
             preRollFrames.removeFirst(preRollFrames.count - config.preRollFrames)
@@ -593,6 +630,25 @@ final class FocusWakeupController {
 
         let stats = AudioCaptureEngine.pcm16FrameStats(from: data)
         let rms = stats.rms
+        if acousticMode == .quiet {
+            let wasCalibrating = quietGate.threshold == nil
+            let triggered = quietGate.consume(rms)
+            let remaining = quietGate.threshold == nil
+                ? Int(ceil(Double(quietGate.calibrationRemaining) / 50)) : 0
+            if appState?.quietCalibrationSecondsRemaining != remaining {
+                appState?.quietCalibrationSecondsRemaining = remaining
+            }
+            if wasCalibrating, let threshold = quietGate.threshold {
+                DebugFileLogger.log("quiet wakeup: calibrated threshold=\(threshold)")
+            }
+            if triggered, let threshold = quietGate.threshold {
+                DebugFileLogger.log("quiet wakeup: triggered rms=\(rms) threshold=\(threshold)")
+                lastFocusTriggerRMS = rms
+                startFocusRecording(initialFrames: preRollFrames, triggerThreshold: threshold)
+            }
+            return
+        }
+        appState?.quietCalibrationSecondsRemaining = 0
         rmsWindow.append(rms)
         if rmsWindow.count > config.rmsWindowFrames {
             rmsWindow.removeFirst(rmsWindow.count - config.rmsWindowFrames)
@@ -633,6 +689,7 @@ final class FocusWakeupController {
         preRollFrames = []
         consecutiveSpeechFrames = 0
         isFocusRecording = true
+        lastRecordingWasQuiet = acousticMode == .quiet
         resetExternalAudioHandoff()
         let handoffCapacity = FocusExternalAudioHandoffCapacityPolicy.frameCapacity(
             preRollFrames: config.preRollFrames
@@ -644,7 +701,7 @@ final class FocusWakeupController {
             storedModeId: UserDefaults.standard.string(forKey: Self.focusWakeupModeIdKey),
             provider: KeychainService.selectedASRProvider
         )
-        guard onRecordingStartRequested?(mode, initialChunks, triggerThreshold) == true else {
+        guard onRecordingStartRequested?(mode, initialChunks, triggerThreshold, lastRecordingWasQuiet) == true else {
             DebugFileLogger.log("focus wakeup: shared recording start gate rejected request")
             isFocusRecording = false
             sessionDidFinish()

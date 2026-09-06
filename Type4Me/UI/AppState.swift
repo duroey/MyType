@@ -1415,6 +1415,7 @@ final class AudioLevelMeter: @unchecked Sendable {
 @Observable
 @MainActor
 final class AppState {
+    var quietCalibrationSecondsRemaining = 0
     private static let stalePartialTranscriptThresholdMs = 500
 
     // MARK: Floating Bar
