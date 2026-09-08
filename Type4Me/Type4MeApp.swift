@@ -794,22 +794,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// Args:
     ///   restartFocusWakeup: Whether to restart Auto Focus after reconciliation.
+    private var microphoneSelectionGeneration = 0
+    private var autoFocusConnectionOwner: String?
+
     private func reconcileRememberedMicrophoneProfile(restartFocusWakeup: Bool) {
+        // Manual selection invalidates delayed reconnect work but never changes Auto Focus.
+        microphoneSelectionGeneration &+= 1
+        autoFocusConnectionOwner = nil
         let defaults = UserDefaults.standard
         let devices = AudioCaptureEngine.availableAudioInputDevices()
         AudioInputDeviceMonitor.shared.replaceCachedDevices(devices)
         let preferenceMode = AudioInputDevicePreferenceStore.mode()
         let resolvedUID = AudioInputDevicePreferenceStore.resolvedDevice(devices: devices)?.uid
         let profile = RememberedMicrophoneProfileStore.load(defaults: defaults)
-        let savedFocusWakeupEnabled = profile?.focusWakeupEnabled
-            ?? Self.isFocusWakeupEnabledSetting(defaults: defaults)
-        let hasUsableInput = preferenceMode == .systemDefault || resolvedUID != nil
-        let effectiveFocusWakeupEnabled = savedFocusWakeupEnabled && hasUsableInput
+        let effectiveFocusWakeupEnabled = Self.isFocusWakeupEnabledSetting(defaults: defaults)
+        if !restartFocusWakeup, preferenceMode == .priority,
+           resolvedUID == AudioInputDevicePreferenceStore.priorityEntries().first?.uid,
+           effectiveFocusWakeupEnabled {
+            autoFocusConnectionOwner = resolvedUID
+        }
 
         if let profile {
             defaults.set(profile.deviceUID, forKey: "tf_lastUserSelectedMicrophoneUID")
         }
-        defaults.set(effectiveFocusWakeupEnabled, forKey: "tf_focusWakeupEnabled")
 
         DebugFileLogger.log(
             "microphone preference reconciled mode=\(preferenceMode.rawValue) "
@@ -827,26 +834,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Args:
     ///   device: Audio input device reported by AVFoundation.
     private func handleRememberedMicrophoneDisconnected(_ device: AVCaptureDevice) {
-        guard AudioInputDevicePreferenceStore.mode() == .priority,
-              AudioInputDevicePreferenceStore.priorityEntries().contains(where: {
-                  $0.uid == device.uniqueID
-              }) else { return }
+        guard autoFocusConnectionOwner == device.uniqueID else { return }
+        autoFocusConnectionOwner = nil
 
         let defaults = UserDefaults.standard
         let devices = AudioCaptureEngine.availableAudioInputDevices()
         AudioInputDeviceMonitor.shared.replaceCachedDevices(devices)
-        if let fallback = AudioInputDevicePreferenceStore.resolvedDevice(devices: devices) {
-            DebugFileLogger.log(
-                "preferred microphone disconnected uid=\(device.uniqueID); using fallback=\(fallback.uid)"
-            )
-            focusWakeupController?.stop()
-            syncFocusWakeupState()
-            return
-        }
-
         defaults.set(false, forKey: "tf_focusWakeupEnabled")
         DebugFileLogger.log(
-            "preferred microphone disconnected uid=\(device.uniqueID); no fallback, Auto Focus disabled"
+            "preferred microphone disconnected uid=\(device.uniqueID); Auto Focus disabled, fallback retained"
         )
         syncFocusWakeupState()
     }
@@ -857,14 +853,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   device: Audio input device reported by AVFoundation.
     private func handleRememberedMicrophoneConnected(_ device: AVCaptureDevice) {
         guard AudioInputDevicePreferenceStore.mode() == .priority,
-              AudioInputDevicePreferenceStore.priorityEntries().contains(where: {
-                  $0.uid == device.uniqueID
-              }) else { return }
+              AudioInputDevicePreferenceStore.priorityEntries().first?.uid == device.uniqueID else { return }
+        let expectedGeneration = microphoneSelectionGeneration
         DispatchQueue.main.asyncAfter(
             deadline: .now() + MicrophoneSelectionPolicy.reconnectRefreshDelaySeconds
         ) { [weak self] in
             MainActor.assumeIsolated { [weak self] in
-                self?.reconcileRememberedMicrophoneProfile(restartFocusWakeup: true)
+                guard let self, self.microphoneSelectionGeneration == expectedGeneration else { return }
+                let devices = AudioCaptureEngine.availableAudioInputDevices()
+                AudioInputDeviceMonitor.shared.replaceCachedDevices(devices)
+                guard AudioInputDevicePreferenceStore.mode() == .priority,
+                      AudioInputDevicePreferenceStore.priorityEntries().first?.uid == device.uniqueID,
+                      AudioInputDevicePreferenceStore.resolvedDevice(devices: devices)?.uid == device.uniqueID else { return }
+                self.autoFocusConnectionOwner = device.uniqueID
+                UserDefaults.standard.set(true, forKey: "tf_focusWakeupEnabled")
+                self.focusWakeupController?.stop()
+                self.syncFocusWakeupState()
             }
         }
     }
@@ -919,6 +923,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
+                    if name == .audioInputDevicePreferenceDidChange {
+                        // Menu-bar selection also publishes this event, without a profile notification.
+                        self?.microphoneSelectionGeneration &+= 1
+                        self?.autoFocusConnectionOwner = nil
+                    }
                     self?.updateEffectiveInputDevice(notify: true)
                 }
             }

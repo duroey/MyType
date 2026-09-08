@@ -2,6 +2,31 @@ import XCTest
 @testable import Type4Me
 
 final class RememberedMicrophoneProfileTests: XCTestCase {
+    /// Guards the event wiring against restoring profile state on manual selection.
+    func testManualSelectionCannotWriteAutoFocusSetting() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("Type4Me/Type4MeApp.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func reconcileRememberedMicrophoneProfile("))
+        let end = try XCTUnwrap(source.range(of: "private func handleRememberedMicrophoneDisconnected("))
+        let manual = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertFalse(manual.contains("forKey: \"tf_focusWakeupEnabled\""))
+        XCTAssertTrue(manual.contains("microphoneSelectionGeneration &+= 1"))
+        XCTAssertTrue(manual.contains("autoFocusConnectionOwner = nil"))
+    }
+
+    /// Ensures a fallback device cannot bypass shutdown and delayed reconnect checks remain present.
+    func testPhysicalEventsKeepOwnerAndStaleReconnectGuards() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("Type4Me/Type4MeApp.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func handleRememberedMicrophoneDisconnected("))
+        let end = try XCTUnwrap(source.range(of: "private func handleRememberedMicrophoneConnected("))
+        let disconnect = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(disconnect.contains("autoFocusConnectionOwner == device.uniqueID"))
+        XCTAssertTrue(disconnect.contains("defaults.set(false, forKey: \"tf_focusWakeupEnabled\")"))
+        XCTAssertFalse(disconnect.contains("if let fallback"))
+        XCTAssertTrue(source.contains("self.microphoneSelectionGeneration == expectedGeneration"))
+        XCTAssertTrue(source.contains("resolvedDevice(devices: devices)?.uid == device.uniqueID else { return }"))
+    }
     func testReplacingProfileKeepsOnlyLatestManualDevice() {
         let defaults = makeDefaults()
 
