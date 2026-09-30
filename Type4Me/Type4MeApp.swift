@@ -179,6 +179,10 @@ enum RecordingStartSource: String {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
+    /// Declared first on purpose: stored properties initialize in declaration
+    /// order, and the stores below open their files as soon as they are created.
+    private let legacyProfileStoresReconciled: Void = AppIdentity.reconcileLegacyProfileStoresIfNeeded()
+
     let appState: AppState
     let appUpdater = AppUpdater()
     let permissionGuideModel = PermissionGuideModel()
