@@ -111,7 +111,7 @@ test_packaging_overrides() {
     APP_PATH="$test_app_default" \
     BINARY="$dummy_bin" \
     SKIP_BUILD=1 \
-    SIGNING_IDENTITY="-" \
+    CODESIGN_IDENTITY="-" \
     bash "$script_dir/package-app.sh" >/dev/null
 
     test_bundle "$test_app_default"
@@ -128,7 +128,7 @@ test_packaging_overrides() {
     APP_PATH="$test_app_overrides" \
     BINARY="$dummy_bin" \
     SKIP_BUILD=1 \
-    SIGNING_IDENTITY="-" \
+    CODESIGN_IDENTITY="-" \
     MICROPHONE_USAGE_DESCRIPTION="$custom_mic_en" \
     SPEECH_RECOGNITION_USAGE_DESCRIPTION="$custom_speech_en" \
     APPLE_EVENTS_USAGE_DESCRIPTION="$custom_events_en" \

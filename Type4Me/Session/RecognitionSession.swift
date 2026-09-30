@@ -3522,7 +3522,9 @@ actor RecognitionSession {
         _ error: Error,
         expectedGeneration: Int
     ) async {
-        guard ownsSession(expectedGeneration) else { return }
+        // Once a stop owns the session it must finish: the text recognized before
+        // the verdict is still the user's, and tearing down here would discard it.
+        guard isRecordingGeneration(expectedGeneration) else { return }
         // Hand the reason over first: the teardown below is unrelated to why the
         // session ended, and the message is the only actionable part.
         emitRecognitionEvent(.error(error), ownerGeneration: expectedGeneration)
@@ -3836,7 +3838,7 @@ actor RecognitionSession {
         case .error(let error):
             lastStreamingError = error
             logger.error("ASR error: \(error)")
-            if (error as? TerminalASRError)?.isTerminalServerError == true {
+            if state == .recording, (error as? TerminalASRError)?.isTerminalServerError == true {
                 // Quota, billing, auth and rate limiting are verdicts about the
                 // account, not a dropped connection. Recovery would retry the
                 // same provider until it gives up and would replace the server's
@@ -5141,6 +5143,7 @@ actor RecognitionSession {
         audioEngine.onAudioFrame = nil
         audioEngine.onAudioLevel = nil
         clearExternalAudioInputState()
+        isManualInput = false
 
         let client = asrClient
         asrClient = nil

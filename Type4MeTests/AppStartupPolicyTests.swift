@@ -15,4 +15,15 @@ final class AppStartupPolicyTests: XCTestCase {
         defaults.set(true, forKey: "tf_focusWakeupEnabled")
         XCTAssertTrue(AppDelegate.shouldCalibrateNoiseFloorAtStartup(defaults: defaults))
     }
+
+    /// Focus wakeup keeps the bar in `.focusWaiting` while a text field has
+    /// focus; typed input must still be reachable from there.
+    func testManualInputCanBeginWhileFocusWakeupIsWaiting() {
+        for phase in [FloatingBarPhase.hidden, .focusWaiting, .done, .error] {
+            XCTAssertTrue(AppDelegate.canBeginManualInput(from: phase), "\(phase)")
+        }
+        for phase in [FloatingBarPhase.preparing, .recording, .processing, .recovering] {
+            XCTAssertFalse(AppDelegate.canBeginManualInput(from: phase), "\(phase)")
+        }
+    }
 }

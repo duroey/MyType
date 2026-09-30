@@ -311,6 +311,9 @@ final class FloatingBarController {
             cancelPendingPanelShrink()
             panel.ignoresMouseEvents = true
             panel.orderOut(nil)
+            // The editor replaces every recording surface, including the Focus
+            // waiting dot, which lives outside this panel.
+            notchIndicator.hide()
             anchorDisplayID = nil
         }
     }

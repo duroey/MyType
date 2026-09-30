@@ -1606,13 +1606,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectionAskController?.recordingDidEnd(action)
     }
 
+    /// Decides whether typed input may take over the pipeline from a bar phase.
+    ///
+    /// Focus wakeup parks the bar in `.focusWaiting` whenever a text field has
+    /// focus, which is exactly when typed input is wanted, so it counts as idle
+    /// here just as it does for every recording start.
+    ///
+    /// Args:
+    ///   phase: Current floating bar phase.
+    ///
+    /// Returns:
+    ///   `true` when no session currently owns the pipeline.
+    nonisolated static func canBeginManualInput(from phase: FloatingBarPhase) -> Bool {
+        switch phase {
+        case .hidden, .focusWaiting, .done, .error:
+            return true
+        case .preparing, .recording, .processing, .recovering:
+            return false
+        }
+    }
+
     private func toggleManualInput() {
         if isEditingManualInput {
             cancelManualInput()
             return
         }
         let modes = appState.availableModes.filter(\.supportsManualInput)
-        guard !modes.isEmpty, [.hidden, .done, .error].contains(appState.barPhase) else {
+        guard !modes.isEmpty, Self.canBeginManualInput(from: appState.barPhase) else {
             hotkeyManager.resetActiveState()
             return
         }
