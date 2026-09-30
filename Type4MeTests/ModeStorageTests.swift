@@ -150,7 +150,7 @@ final class ModeStorageTests: XCTestCase {
         })
         defer {
             for key in preferenceKeys {
-                if let value = previousValues[key] as? Any {
+                if let value = previousValues[key] ?? nil {
                     UserDefaults.standard.set(value, forKey: key)
                 } else {
                     UserDefaults.standard.removeObject(forKey: key)
