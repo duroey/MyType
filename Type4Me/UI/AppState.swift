@@ -37,7 +37,7 @@ enum RecordingIndicatorStyle: String, CaseIterable {
         case .regular:
             return L("常规", "Regular")
         case .compact:
-            return L("紧凑型", "Compact")
+            return L("紧凑", "Compact")
         }
     }
 
@@ -55,6 +55,14 @@ enum AppearancePreferenceDefaults {
 
     static let showCancelButtonKey = "tf_showCancelButton"
     static let showCancelButtonDefault = true
+
+    /// The compact capsule's stop square. Hiding it leaves the waveform on its
+    /// own and the hotkey as the way to end a recording.
+    ///
+    /// Compact only: the regular bar's finish control is the audio-metering orb,
+    /// which stays put.
+    static let showFinishButtonKey = "tf_showFinishButton"
+    static let showFinishButtonDefault = true
 }
 
 enum RecordingVisualStyle: String, CaseIterable {
@@ -136,11 +144,26 @@ enum LiveTranscriptDisplayPreference {
     static let storageKey = "tf_showLiveTranscript"
     static let defaultValue = true
 
+    static func isEnabled(userDefaults: UserDefaults = .standard) -> Bool {
+        guard userDefaults.object(forKey: storageKey) != nil else { return defaultValue }
+        return userDefaults.bool(forKey: storageKey)
+    }
+
     /// Disabling live text only affects the active recording phase. Recovery
     /// and final-result feedback can still show text that needs the user's attention.
     static func showsTranscript(isEnabled: Bool, phase: FloatingBarPhase) -> Bool {
         isEnabled || phase != .recording
     }
+}
+
+enum RecordingMetadataDisplayPreference {
+    static let showModeNameKey = "tf_showRecordingModeName"
+    static let showProviderNameKey = "tf_showRecordingProviderName"
+    static let showModelNameKey = "tf_showRecordingModelName"
+
+    static let showModeNameDefault = true
+    static let showProviderNameDefault = false
+    static let showModelNameDefault = false
 }
 
 enum CrossModeFinishPreference {
@@ -194,6 +217,7 @@ enum ModeSelectionPreference {
 /// machine still drives layout, this just modulates the look of `.done`/`.error`.
 enum FeedbackKind: Equatable {
     case standard
+    case warning
     case macActionSuccess
     case macActionFailure
     case macActionUnsure
@@ -246,6 +270,11 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     var isBuiltin: Bool
     var processingLabel: String
     var hotkeyBindings: [HotkeyBinding]
+    /// Retained for migration from the first per-mode manual-input preview.
+    var manualInputHotkey: HotkeyBinding? = nil
+
+    var supportsManualInput: Bool { id != Self.directId && executionKind == .recording && !prompt.isEmpty }
+    var allHotkeyBindings: [HotkeyBinding] { hotkeyBindings }
     /// Per-mode short-text-skip threshold. When the recognized text is shorter
     /// than this many characters, LLM post-processing is skipped. 0 disables it.
     var shortTextExemption: Int
@@ -310,7 +339,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
     enum CodingKeys: String, CodingKey {
         case id, name, description, prompt, isBuiltin, processingLabel
         case hotkeyBindings, shortTextExemption, executionKind, translationTargetLanguageCode
-        case punctuationMode
+        case punctuationMode, manualInputHotkey
         // Legacy single-hotkey keys, decoded for backward compatibility only.
         case hotkeyCode, hotkeyModifiers, hotkeyStyle
     }
@@ -339,6 +368,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             hotkeyBindings = []
         }
 
+        manualInputHotkey = try container.decodeIfPresent(HotkeyBinding.self, forKey: .manualInputHotkey)
         executionKind = try container.decodeIfPresent(ExecutionKind.self, forKey: .executionKind) ?? .recording
         translationTargetLanguageCode = try container.decodeIfPresent(
             String.self,
@@ -362,6 +392,7 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         try container.encode(processingLabel, forKey: .processingLabel)
         try container.encode(shortTextExemption, forKey: .shortTextExemption)
         // Only the new array format is written; legacy keys are intentionally omitted.
+        try container.encodeIfPresent(manualInputHotkey, forKey: .manualInputHotkey)
         try container.encode(hotkeyBindings, forKey: .hotkeyBindings)
         try container.encode(executionKind, forKey: .executionKind)
         try container.encodeIfPresent(
@@ -1423,6 +1454,8 @@ final class AppState {
     var barPhase: FloatingBarPhase = .hidden
     var segments: [TranscriptionSegment] = []
     var currentMode: ProcessingMode
+    var recordingProvider: ASRProvider? = nil
+    var recordingModelName: String? = nil
     @ObservationIgnored private let modeSelectionDefaults: UserDefaults
     @ObservationIgnored let audioLevel = AudioLevelMeter()
     var recordingStartDate: Date?
@@ -1494,7 +1527,8 @@ final class AppState {
 
     // MARK: Actions
 
-    func startRecording() {
+    func startRecording(showsPanel: Bool = true) {
+        captureRecordingMetadata()
         activityKind = .standard
         latestReviseUndoTicketID = nil
         awaitsSuppressedCancellationFinalization = false
@@ -1506,12 +1540,12 @@ final class AppState {
         processingLabelOverride = nil
         pinsTranscriptPopup = false
         barPhase = .preparing
-        // Notify the controller for every style so a live settings change from
-        // `.hidden` can reveal the indicator immediately.
-        onShowPanel?()
+        // Typed input uses its own key-capable panel while editing.
+        if showsPanel { onShowPanel?() }
     }
 
     func startReviseRecording() {
+        captureRecordingMetadata()
         activityKind = .revise
         latestReviseUndoTicketID = nil
         awaitsSuppressedCancellationFinalization = false
@@ -1649,7 +1683,7 @@ final class AppState {
         showDone(message: message, delay: .seconds(2.5))
     }
 
-    func finalize(text: String, outcome: InjectionOutcome) {
+    func finalize(text: String, outcome: InjectionOutcome, llmFailed: Bool = false) {
         // Only accept finalization while the bar is in processing state.
         // A suppressed raw/no-copy cancellation can also finalize from .hidden.
         // A stale event from a previous session is still rejected because a
@@ -1666,7 +1700,29 @@ final class AppState {
             return
         }
         segments = [TranscriptionSegment(text: text, isConfirmed: true)]
-        showDone(message: outcome.completionMessage)
+        if llmFailed {
+            feedbackKind = .warning
+            let message: String
+            switch outcome {
+            case .copiedToClipboard:
+                message = L("处理失败，原文已保留至剪贴板", "Processing failed; raw text copied to clipboard")
+            case .notInserted:
+                message = L("处理失败，未找到输入位置", "Processing failed; no editable field found")
+            case .discarded, .actionFailed:
+                message = outcome.completionMessage
+            case .inserted:
+                message = L("处理失败，已输出原文", "Processing failed; raw text output")
+            case .pasteAttemptedClipboardRetained:
+                message = L(
+                    "处理失败，已尝试输入，原文已保留至剪贴板",
+                    "Processing failed; paste attempted, raw text kept in clipboard"
+                )
+            }
+            showDone(message: message, delay: .seconds(2.0))
+        } else {
+            feedbackKind = .standard
+            showDone(message: outcome.completionMessage)
+        }
         if shouldRevealSuppressedFinalization {
             onShowPanel?()
         }
@@ -1837,6 +1893,13 @@ final class AppState {
         segments.map(\.text).joined()
     }
 
+    private func captureRecordingMetadata() {
+        let provider = KeychainService.selectedASRProvider
+        let metadata = RecordingDisplayMetadata.current(for: provider)
+        recordingProvider = provider
+        recordingModelName = metadata.modelName
+    }
+
     func reconcileCurrentMode(for provider: ASRProvider) {
         let resolved = ASRProviderRegistry.resolvedMode(for: currentMode, provider: provider)
         guard resolved.id != currentMode.id else { return }
@@ -1890,6 +1953,37 @@ final class AppState {
 
 extension AppState: FloatingBarState {}
 
+private struct RecordingDisplayMetadata {
+    let modelName: String?
+
+    static func current(for provider: ASRProvider) -> Self {
+        if provider == .sherpa {
+            return Self(
+                modelName: ModelManager.selectedStreamingModel.displayName
+            )
+        }
+        if provider == .cartesia {
+            return Self(
+                modelName: CartesiaASRConfig.model
+            )
+        }
+        if provider == .grok {
+            return Self(modelName: GrokASRConfig.model)
+        }
+
+        let model: String?
+        if let credentials = KeychainService.loadASRConfig(for: provider)?.toCredentials() {
+            model = ["model", "resourceId", "devPid", "lmId"]
+                .compactMap { credentials[$0]?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+        } else {
+            model = nil
+        }
+
+        return Self(modelName: model)
+    }
+}
+
 extension Notification.Name {
     static let modesDidChange = Notification.Name("mytypeModesDidChange")
     static let asrProviderDidChange = Notification.Name("mytypeASRProviderDidChange")
@@ -1899,6 +1993,7 @@ extension Notification.Name {
     static let navigateToHistory = Notification.Name("mytypeNavigateToHistory")
     static let navigateToVocabulary = Notification.Name("mytypeNavigateToVocabulary")
     static let selectMode = Notification.Name("mytypeSelectMode")
+    static let credentialsDidChange = Notification.Name("tf_credentialsDidChange")
     static let focusWakeupSettingDidChange = Notification.Name("MyTypeFocusWakeupSettingDidChange")
     static let noiseFloorCalibrationWillStart = Notification.Name("MyTypeNoiseFloorCalibrationWillStart")
     static let noiseFloorCalibrationDidFinish = Notification.Name("MyTypeNoiseFloorCalibrationDidFinish")

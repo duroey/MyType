@@ -47,8 +47,19 @@ final class HotkeyManagerTests: XCTestCase {
         }
     }
 
-    func testDifferentModifierToggleHotkeyFinishesActiveOwnerAndIsConsumed() {
+    /// Creates a manager whose event handling does not depend on the test
+    /// process holding Accessibility permission.
+    ///
+    /// Returns:
+    ///   A hotkey manager that treats every handled event as trusted.
+    private func makeManager() -> HotkeyManager {
         let manager = HotkeyManager()
+        manager.isAccessibilityTrusted = { true }
+        return manager
+    }
+
+    func testDifferentModifierToggleHotkeyFinishesActiveOwnerAndIsConsumed() {
+        let manager = makeManager()
         let firstModeId = UUID()
         let secondModeId = UUID()
         let recorder = CallbackRecorder()
@@ -80,11 +91,14 @@ final class HotkeyManagerTests: XCTestCase {
         XCTAssertEqual(recorder.stopped, [])
         XCTAssertEqual(recorder.crossModeFinishes, [secondModeId])
         XCTAssertFalse(pressPassedThrough)
-        XCTAssertTrue(releasePassedThrough)
+        XCTAssertFalse(
+            releasePassedThrough,
+            "A modifier release that dispatches a hotkey must be swallowed"
+        )
     }
 
     func testDifferentRegularToggleHotkeyFinishesActiveOwnerAndIsConsumed() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let firstModeId = UUID()
         let secondModeId = UUID()
         let recorder = CallbackRecorder()
@@ -119,7 +133,7 @@ final class HotkeyManagerTests: XCTestCase {
     }
 
     func testOwnerRegularToggleHotkeyStopsActiveOwner() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let modeId = UUID()
         let recorder = CallbackRecorder()
 
@@ -142,7 +156,7 @@ final class HotkeyManagerTests: XCTestCase {
     }
 
     func testExternalOwnerCanBeStoppedByMatchingHotkey() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let modeId = UUID()
         let recorder = CallbackRecorder()
 
@@ -166,7 +180,7 @@ final class HotkeyManagerTests: XCTestCase {
 
     /// Verifies that stale processing state cannot block a matching external toggle stop.
     func testProcessingFlagDoesNotBlockMatchingExternalToggleStop() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let modeId = UUID()
         let recorder = CallbackRecorder()
 
@@ -193,7 +207,7 @@ final class HotkeyManagerTests: XCTestCase {
 
     /// Verifies that stale processing state cannot block a matching external hold stop.
     func testProcessingFlagDoesNotBlockMatchingExternalHoldStop() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let modeId = UUID()
         let recorder = CallbackRecorder()
         let binding = ModeBinding(
@@ -223,7 +237,7 @@ final class HotkeyManagerTests: XCTestCase {
 
     /// Verifies that processing still rejects a genuinely new idle recording.
     func testProcessingFlagStillBlocksIdleStart() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let modeId = UUID()
         let recorder = CallbackRecorder()
 
@@ -249,7 +263,7 @@ final class HotkeyManagerTests: XCTestCase {
 
     /// Verifies that a menu-started Revise recording stops on its first Revise shortcut press.
     func testExternalReviseOwnerStopsOnFirstMatchingHotkeyPress() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let stoppedOwnerId = UUID()
         let recorder = CallbackRecorder()
         let reviseBinding = ModeBinding(
@@ -273,7 +287,7 @@ final class HotkeyManagerTests: XCTestCase {
 
     /// Verifies that a mode shortcut can stop a menu-started Revise recording once.
     func testModeHotkeyStopsExternalReviseOwner() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let stoppedOwnerId = UUID()
         let targetModeId = UUID()
         let recorder = CallbackRecorder()
@@ -305,7 +319,7 @@ final class HotkeyManagerTests: XCTestCase {
     }
 
     func testNonVoiceKeyDoesNotStopActiveOwner() {
-        let manager = HotkeyManager()
+        let manager = makeManager()
         let modeId = UUID()
         let recorder = CallbackRecorder()
 

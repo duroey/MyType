@@ -11,7 +11,11 @@ actor ModelManager {
     // MARK: - Paths
 
     static var defaultModelsDir: String {
-        return AppIdentity.appSupportDirectory()
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first!
+        return appSupport
+            .appendingPathComponent(AppDataLocation.profileDirectoryName, isDirectory: true)
             .appendingPathComponent("models", isDirectory: true)
             .path
     }

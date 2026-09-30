@@ -22,6 +22,18 @@ final class DeepgramASRConfigTests: XCTestCase {
         XCTAssertFalse(DeepgramASRConfig.supportedModels.contains("flux-general-multi"))
     }
 
+    func testModelFieldAllowsCustomInput() {
+        let modelField = DeepgramASRConfig.credentialFields.first { $0.key == "model" }
+
+        XCTAssertTrue(modelField?.allowCustomInput ?? false)
+    }
+
+    func testFluxModelDetectionIsCaseInsensitive() {
+        XCTAssertTrue(DeepgramASRConfig.isFluxModel("flux-general-en"))
+        XCTAssertTrue(DeepgramASRConfig.isFluxModel("Flux Medical"))
+        XCTAssertFalse(DeepgramASRConfig.isFluxModel("qwen3-asr"))
+    }
+
     func testInit_rejectsMissingAPIKey() {
         XCTAssertNil(DeepgramASRConfig(credentials: [:]))
     }

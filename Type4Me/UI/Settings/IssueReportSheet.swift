@@ -54,7 +54,7 @@ struct IssueReportSheet: View {
                     .font(.system(size: 12))
                     .scrollContentBackground(.hidden)
                     .padding(7)
-                    .background(Color.white)
+                    .background(TF.settingsCard)
                     .overlay(
                         RoundedRectangle(cornerRadius: 6)
                             .stroke(TF.settingsTextTertiary.opacity(0.25), lineWidth: 1)

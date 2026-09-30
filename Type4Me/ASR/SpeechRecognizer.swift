@@ -80,6 +80,9 @@ struct RecognitionTranscript: Sendable, Equatable {
 
 enum InjectionOutcome: Sendable, Equatable {
     case inserted
+    /// Cmd+V was sent to an AX-opaque editor, but insertion cannot be proven.
+    /// The dictated result intentionally remains in the clipboard.
+    case pasteAttemptedClipboardRetained
     case copiedToClipboard
     case actionFailed(String)
     case notInserted
@@ -89,6 +92,11 @@ enum InjectionOutcome: Sendable, Equatable {
         switch self {
         case .inserted:
             return L("已完成", "Done")
+        case .pasteAttemptedClipboardRetained:
+            return L(
+                "已尝试输入，文本已保留到剪贴板",
+                "Paste attempted; text kept in clipboard"
+            )
         case .copiedToClipboard:
             return L("已粘贴到剪贴板", "Copied to clipboard")
         case .actionFailed(let message):
@@ -113,7 +121,7 @@ enum RecognitionEvent: Sendable {
     case recoverySucceeded(text: String, message: String)
     case recoveryFailed(text: String, message: String)
     case recoveryInterrupted(text: String, message: String)
-    case finalized(text: String, injection: InjectionOutcome)
+    case finalized(text: String, injection: InjectionOutcome, llmFailed: Bool)
     /// Mac Action mode: action result to surface in the floating bar with
     /// status-specific icon and color, holding for ~3 seconds.
     case macActionResult(message: String, status: MacActionResultStatus)

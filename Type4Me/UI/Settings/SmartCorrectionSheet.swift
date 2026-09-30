@@ -323,7 +323,7 @@ struct SmartCorrectionSheet: View {
             Text(char)
                 .font(.system(size: 14))
                 .frame(width: 32, height: 32)
-                .foregroundStyle(isSelected ? .white : TF.settingsText)
+                .foregroundStyle(isSelected ? TF.settingsOnStrong : TF.settingsText)
                 .background(
                     RoundedRectangle(cornerRadius: TF.cornerSM)
                         .fill(isSelected ? TF.settingsText : TF.settingsBg)
@@ -527,7 +527,7 @@ struct SmartCorrectionSheet: View {
                         Text(L("生成变体", "Generate Variants"))
                     }
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(TF.settingsOnStrong)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 7)
                     .background(
@@ -588,7 +588,7 @@ struct SmartCorrectionSheet: View {
                 } label: {
                     Text(L("添加选中项 (\(selectedCount))", "Add Selected (\(selectedCount))"))
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(TF.settingsOnStrong)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 7)
                         .background(

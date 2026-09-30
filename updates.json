@@ -1,6 +1,105 @@
 {
-  "latest": "2.3.0",
+  "latest": "2.10.0",
   "releases": [
+    {
+      "version": "2.10.0",
+      "date": "2026-09-23",
+      "notes": "### 新功能\n\n- **小米 MiMo 文本处理服务**：新增 MiMo 服务商，可在设置中配置凭证并选择常用模型。\n- **百炼 Qwen-Audio 3.1 流式识别**：支持新一代实时识别模型，扩展语言提示选项；原有百炼配置继续可用。\n- **StepFun 实时识别区域选择**：可选择中国或全球服务区域；现有配置继续默认使用中国区。\n\n<p align=\"center\">\n  <img src=\"https://github.com/user-attachments/assets/2e66c13c-511d-4dfa-97d8-4f325e39a0d2\" width=\"646\" alt=\"StepFun 实时语音识别的区域选择设置\" />\n</p>\n\n- **Grok 实时识别模型**：固定使用 Grok Voice Transcribe 2.0，并在录音信息和历史记录中显示模型名称。\n- **菜单栏切换文本处理引擎**：新增处理引擎子菜单，可直接切换已配置的 LLM；麦克风、识别引擎和翻译目标等当前选项也会正确显示系统勾选标记。\n\n### 改进与修复\n\n- **语音改口支持所有输入模式**：无论文字来自哪种输入模式，都可在符合现有定位和写入安全检查时追踪并修改。\n- **改口文本读取权限检查**：读取无障碍文本前再次确认前台应用和焦点元素归属，避免切换应用时读取排除应用的内容。\n- **火山引擎热词生效**：将直传热词放入服务端定义的请求字段，去重并遵守请求容量限制，避免配置的热词被服务端忽略。\n- **短录音识别更干净**：抑制 Gemini 短录音中的纯热词回声，同时保留用户真实说出的单个热词。\n- **历史质量统计更清晰**：在识别引擎统计中突出差评比例，并在下方显示差评条数。\n\n<p align=\"center\">\n  <img src=\"https://github.com/user-attachments/assets/17f976d1-c9bf-4e75-afb6-0e0a632d5478\" width=\"154\" alt=\"识别质量统计中的差评比例和记录条数\" />\n</p>\n\n- **应用内更新说明支持格式和图片**：更新说明可按 Markdown 排版，并显示其中的图片，阅读更清晰。\n\n<p align=\"center\">\n  <img src=\"https://github.com/user-attachments/assets/fc409463-a887-4712-93ac-8a28ab592c19\" width=\"900\" alt=\"应用内格式化显示带图片的更新说明\" />\n</p>",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.10.0/Type4Me-v2.10.0-cloud.dmg",
+      "cloud_dmg_size": 13952837,
+      "cloud_dmg_sha256": "9d4b485ffd329526aca658a90bd4cf4b84780ed9dea2b16b0c208583db1af9b8",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.10.0/Type4Me-v2.10.0-local-apple-silicon.dmg",
+      "local_dmg_size": 718083648,
+      "local_dmg_sha256": "ca9d4a14a7390ab3252215bdd039bdb9dc9e4f219e6c553f7d6cda3db94b8978"
+    },
+    {
+      "version": "2.9.0",
+      "date": "2026-09-18",
+      "notes": "### 新功能\n\n- **历史与用量看板**：历史页面新增听写记录、语音引擎和大模型用量三段视图；集中查看 Token、预估费用、请求成功率与耗时、每日趋势、模型/场景汇总及逐条请求明细，旧的 LLM 历史会自动估算补全。\n\n<p align=\"center\">\n  <img src=\"https://github.com/user-attachments/assets/3008f47a-7718-4f83-9961-7a0339568ceb\" width=\"900\" alt=\"历史与用量看板中的听写记录、语音引擎和大模型用量视图\" />\n</p>\n\n- **本地数据备份**：每天自动为历史、模式、词汇、快捷键和配置创建本地快照，最多保留七份；设置中可查看最新备份并在 Finder 中打开备份文件夹。\n- **历史修正来源说明**：历史中的纠正页会说明最终输出为何不同于原始识别文本，并可直接定位当时实际生效的全局或 App 专属片段替换规则。\n\n### 改进与修复\n\n- **只处理最终转写**：移除录音中的推测式 LLM 请求，改为在最终转写就绪后只发起一次处理，避免未完成文本、重复调用和不必要的 Token 消耗。\n- **处理失败提示**：LLM 处理失败而回退原文时，录音浮窗会以警告状态明确提示，区分正常完成与原文降级输出。\n- **智能感知场景更准确**：停止录音后再读取当前输入位置的上下文；录音期间切换 App 时，润色提示和历史会归属到实际接收文本的场景。\n- **系统权限文案本地化**：macOS 麦克风、语音识别和自动化权限提示会随系统语言显示中文或英文。",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.9.0/Type4Me-v2.9.0-cloud.dmg",
+      "cloud_dmg_size": 13871068,
+      "cloud_dmg_sha256": "aed434c2d3473e13fb2b6c01daa632604bf8d683203edbccf20515ae0bb5752d",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.9.0/Type4Me-v2.9.0-local-apple-silicon.dmg",
+      "local_dmg_size": 718048076,
+      "local_dmg_sha256": "a4622914d13daae0f43e062f424acbc35b72d3e6e0aaa28976fea6a12126ddef"
+    },
+    {
+      "version": "2.8.0",
+      "date": "2026-09-11",
+      "notes": "### 新功能\n\n- **当前键盘焦点输入**：手动听写、菜单栏和手动输入窗口会把结果直接粘贴到结束时当前接收键盘事件的位置，兼容自定义渲染编辑器、终端等不完整支持 Accessibility 的应用；URL Scheme 自动化和语音改口继续使用各自的安全目标机制。\n- **紧凑录音条可隐藏停止按钮**：使用快捷键结束录音时，可在外观设置中隐藏紧凑录音条的停止按钮；两侧控件同时隐藏后，波形保持居中并获得更宽的显示空间。\n\n### 改进与修复\n\n- **浅色录音条可读性**：浅色 Liquid Glass 覆盖深色网页、编辑器或壁纸时，文字、波形和纠错提示保持清晰；亮色主题切换会即时应用到纠错提示面板。\n- **火山引擎错误提示**：配额、鉴权和限流等服务端错误会直接显示在录音和“测试连接”中，不再静默结束或被重试提示覆盖。",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.8.0/Type4Me-v2.8.0-cloud.dmg",
+      "cloud_dmg_size": 12839308,
+      "cloud_dmg_sha256": "54a947c9951d09438874e4df38fc45a565ad33a89e496703a51907ff17615e33",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.8.0/Type4Me-v2.8.0-local-apple-silicon.dmg",
+      "local_dmg_size": 717890326,
+      "local_dmg_sha256": "20436f43c55565274e10d3fa5ec5431b510d351bd9e936873f74b75c2703ad64"
+    },
+    {
+      "version": "2.7.1",
+      "date": "2026-09-09",
+      "notes": "- 重新设计首次设置与权限引导，统一步骤侧栏、权限卡片和按钮样式，保留欢迎与授权两步流程。\n- 引导、权限恢复及拖拽授权提示与主窗口共享主题，支持浅色、深色和跟随系统。\n- 可在“设置 → 系统权限 → 设置引导”重新查看流程；中英文切换即时生效。\n- 主窗口新增主题选择，并同步优化设置控件及选中文字后的“随便问”窗口在深色下的显示。",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.7.1/Type4Me-v2.7.1-cloud.dmg",
+      "cloud_dmg_size": 12895005,
+      "cloud_dmg_sha256": "0aae9105bafe575328147b3d71286f0ea196f4c7127ccc9f27adaabab968a815",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.7.1/Type4Me-v2.7.1-local-apple-silicon.dmg",
+      "local_dmg_size": 717922317,
+      "local_dmg_sha256": "1ecc28ce3abed15b23a54ef508b9e3840f4f34c5a18bcb7c8bd957761bc979a4"
+    },
+    {
+      "version": "2.7.0",
+      "date": "2026-09-07",
+      "notes": "- 新增全局手动输入快捷键，不方便说话时也能输入或粘贴文字，再调用翻译、润色等已有模式。\n- 浮窗顶部展示可用模式及快捷键，支持鼠标悬停、点击选择和模式快捷键提交。\n- 输入区默认一行，随内容自动增高；延续明亮、深色主题，优化自动聚焦、拼音组字占位提示与阴影边缘。\n- 手动输入设置位于录音设置下方，快捷键录制、编辑、删除和冲突处理与模式设置保持一致。\n- 保留原有安全写入与剪贴板回退，手动输入不启动麦克风或语音识别。\n- 修复 Meta Muse 热词超过 20 个字符的问题。",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.7.0/Type4Me-v2.7.0-cloud.dmg",
+      "cloud_dmg_size": 12803263,
+      "cloud_dmg_sha256": "9f42a59eea4a64f47944ce5b0b8fadc4d0b141beb9103979c3fde736f18173f2",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.7.0/Type4Me-v2.7.0-local-apple-silicon.dmg",
+      "local_dmg_size": 717871269,
+      "local_dmg_sha256": "f0d9a37944414d738c1e8ea4b0946b60678d219730e04b750ae8e0bea8cdf7bc"
+    },
+    {
+      "version": "2.6.1",
+      "date": "2026-09-05",
+      "notes": "- 修复“倾听中”在显示或隐藏取消按钮时的居中位置\n- 按录音球与取消按钮的可见边缘统一文字间距，缩小左侧空隙并保留右侧留白\n- 长转写文本两端加入渐隐效果，避免文字紧贴边缘\n- 增加轻微阴影，让纯白背景下的悬浮窗边界更清楚",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.6.1/Type4Me-v2.6.1-cloud.dmg",
+      "cloud_dmg_size": 12601105,
+      "cloud_dmg_sha256": "62db023144555dddda4e774c78914e2bc04a9f0883d294d4fc1fe6e9806ae7a5",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.6.1/Type4Me-v2.6.1-local-apple-silicon.dmg",
+      "local_dmg_size": 717405974,
+      "local_dmg_sha256": "b87cc03da86bc78624ed1a7be104d2c1e08f6da965dbdab0706d4c8413e3e325"
+    },
+    {
+      "version": "2.6.0",
+      "date": "2026-09-04",
+      "notes": "- 首次设置简化为欢迎与权限两步，支持辅助功能拖拽授权引导\n- 首页提醒未配置的语音识别与文本处理服务，并可直接跳转设置\n- 新增 Meta Muse 实时语音识别，支持流式转写、热词与语言提示\n- 液态玻璃录音球随语音节奏响应，改善边缘清晰度并尊重减少动态效果设置\n- 修复语音输入意外静音和错误启用蓝牙麦克风的问题\n- 修复终端已粘贴成功却提示无法输入的误判\n- 优化大量片段替换词条的打开、滚动与编辑体验\n- 改进权限变更恢复、凭证通知稳定性和中英文即时切换",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.6.0/Type4Me-v2.6.0-cloud.dmg",
+      "cloud_dmg_size": 12600342,
+      "cloud_dmg_sha256": "c8c9c0f578e197d7c67c291aa8f37557ebe7750d1f371cc7f4ed1f5af7b78a95",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.6.0/Type4Me-v2.6.0-local-apple-silicon.dmg",
+      "local_dmg_size": 717359822,
+      "local_dmg_sha256": "3f9bcf4989d67ce9ae7d9345c478fd6d02c059314916679cf6faeff18c6507a1"
+    },
+    {
+      "version": "2.5.0",
+      "date": "2026-09-01",
+      "notes": "- 全新模型与模式设置，统一主从布局、服务商分组、品牌图标、配置状态与凭证操作\n- 手动录音支持安全写入停止录音时明确聚焦的输入框，无法确认时保留到剪贴板\n- macOS 26 录音条升级为原生 Apple Liquid Glass，macOS 14/15 自动回落为原生磨砂\n- 模型配置支持清空凭证并保存，测试连接不再隐式保存草稿\n- 修复中英文设置侧栏标签换行与版本号挤压问题\n- 改进写入目标归属、安全回退及录音条主题与布局稳定性",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.5.0/Type4Me-v2.5.0-cloud.dmg",
+      "cloud_dmg_size": 12396869,
+      "cloud_dmg_sha256": "7bde09a7c34e939e28ab0a423cd23220028df33a4654884920d75760efab8805",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.5.0/Type4Me-v2.5.0-local-apple-silicon.dmg",
+      "local_dmg_size": 718337704,
+      "local_dmg_sha256": "a48fcac9ff86db265b16f1c40bf72b7e27df646ecd5cd715f1415b47e2376035"
+    },
+    {
+      "version": "2.4.0",
+      "date": "2026-08-30",
+      "notes": "- 新增 Gemini 3.5 Transcribe 实时语音识别，支持 Smart / Verbatim、语言提示和热词\n- 新增阶跃星辰 WebSocket 实时语音识别，连接准备期间自动缓存并补发音频\n- 录音浮窗新增浅色主题与 macOS 原生毛玻璃材质\n- 首页“我的模式”支持就地管理快捷键与排序\n- Compact 指示条支持显示实时识别文本\n- 历史记录展示实际模式、服务商和模型，并支持识别质量反馈统计\n- 修复语音润色误回答问句或执行命令的问题\n- 改进 Deepgram 自定义模型、兼容端点鉴权与设置交互",
+      "cloud_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.4.0/Type4Me-v2.4.0-cloud.dmg",
+      "cloud_dmg_size": 11872688,
+      "cloud_dmg_sha256": "7bf25e5c123858d142b4b81523a282fc76c9fc40ddd8bf578e1b4bf17c96e057",
+      "local_dmg_url": "https://github.com/joewongjc/type4me/releases/download/v2.4.0/Type4Me-v2.4.0-local-apple-silicon.dmg",
+      "local_dmg_size": 716876232,
+      "local_dmg_sha256": "433828da5fe9aeea9f275598479dac902fa5b7d9ace1dea2e4bd72241411744a"
+    },
     {
       "version": "2.3.0",
       "date": "2026-08-26",

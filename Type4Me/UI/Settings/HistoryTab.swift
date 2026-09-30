@@ -25,6 +25,13 @@ struct HistoryRecord: Identifiable, Hashable {
     let userEditStatus: UserEditObservationStatus?
     let userEditObservedAt: Date?
     let userEditVersion: Int?
+    /// Text after replacement rules and before any LLM, translation or formatting.
+    /// `nil` when not recorded: older records, recovery saves, or rows written by a
+    /// build that predates this column.
+    let postSnippetText: String?
+    /// The rules that rewrote this record's recognised text, captured when they
+    /// fired. `nil` means unknown, which is not the same as `[]` — no rule fired.
+    let appliedSnippets: [AppliedSnippetRule]?
 
     init(
         id: String,
@@ -46,7 +53,9 @@ struct HistoryRecord: Identifiable, Hashable {
         userEditedText: String? = nil,
         userEditStatus: UserEditObservationStatus? = nil,
         userEditObservedAt: Date? = nil,
-        userEditVersion: Int? = nil
+        userEditVersion: Int? = nil,
+        postSnippetText: String? = nil,
+        appliedSnippets: [AppliedSnippetRule]? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -68,6 +77,8 @@ struct HistoryRecord: Identifiable, Hashable {
         self.userEditStatus = userEditStatus
         self.userEditObservedAt = userEditObservedAt
         self.userEditVersion = userEditVersion
+        self.postSnippetText = postSnippetText
+        self.appliedSnippets = appliedSnippets
     }
 }
 
@@ -125,96 +136,6 @@ enum DateFilter: Equatable, Hashable {
 }
 
 // MARK: - History Controls
-
-/// Presents record-action tooltips in a tiny non-activating AppKit panel.
-/// Because the panel is not a child of the ScrollView, it can extend beyond
-/// the list viewport without clipping or per-frame scroll geometry work.
-@MainActor
-private final class HistoryFloatingTooltipController {
-    static let shared = HistoryFloatingTooltipController()
-
-    private var panel: NSPanel?
-    private var activeOwner: UUID?
-
-    func show(text: String, owner: UUID) {
-        hide()
-
-        let hostingView = NSHostingView(rootView: SettingsTooltipBubble(text: text))
-        hostingView.layoutSubtreeIfNeeded()
-        var size = hostingView.fittingSize
-        size.width = max(size.width, 44)
-        size.height = 34
-        hostingView.frame = NSRect(origin: .zero, size: size)
-
-        let tooltipPanel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: size),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        tooltipPanel.backgroundColor = .clear
-        tooltipPanel.isOpaque = false
-        tooltipPanel.hasShadow = true
-        tooltipPanel.level = .floating
-        tooltipPanel.ignoresMouseEvents = true
-        tooltipPanel.collectionBehavior = [.transient, .ignoresCycle]
-        tooltipPanel.contentView = hostingView
-
-        let mouse = NSEvent.mouseLocation
-        let screenFrame = NSScreen.screens
-            .first(where: { $0.frame.contains(mouse) })?
-            .visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        var origin = NSPoint(
-            x: mouse.x - size.width / 2,
-            y: mouse.y - size.height - 18
-        )
-        origin.x = min(max(origin.x, screenFrame.minX + 8), screenFrame.maxX - size.width - 8)
-        if origin.y < screenFrame.minY + 8 {
-            origin.y = mouse.y + 18
-        }
-        origin.y = min(
-            max(origin.y, screenFrame.minY + 8),
-            screenFrame.maxY - size.height - 8
-        )
-
-        tooltipPanel.setFrameOrigin(origin)
-        tooltipPanel.orderFrontRegardless()
-        panel = tooltipPanel
-        activeOwner = owner
-    }
-
-    func hide(owner: UUID? = nil) {
-        if let owner, owner != activeOwner { return }
-        panel?.orderOut(nil)
-        panel = nil
-        activeOwner = nil
-    }
-}
-
-private struct HistoryFloatingTooltipModifier: ViewModifier {
-    let text: String
-    @State private var owner = UUID()
-
-    func body(content: Content) -> some View {
-        content
-            .onHover { hovering in
-                if hovering {
-                    HistoryFloatingTooltipController.shared.show(text: text, owner: owner)
-                } else {
-                    HistoryFloatingTooltipController.shared.hide(owner: owner)
-                }
-            }
-            .onDisappear {
-                HistoryFloatingTooltipController.shared.hide(owner: owner)
-            }
-    }
-}
-
-private extension View {
-    func historyFloatingTooltip(_ text: String) -> some View {
-        modifier(HistoryFloatingTooltipModifier(text: text))
-    }
-}
 
 private struct HistoryToolbarButton: View {
     let icon: String
@@ -297,6 +218,8 @@ struct HistoryTab: View {
 
     let isActive: Bool
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var selectedSubtab: HistorySubtab = .transcripts
     private let historyStore = HistoryStore.shared
 
     @State private var records: [HistoryRecord] = []
@@ -305,6 +228,7 @@ struct HistoryTab: View {
     @State private var isLoadingMore = false
     @State private var searchText = ""
     @State private var copiedId: String?
+    @State private var qualityScores: [String: Int] = [:]
     @State private var expandedRecordIds: Set<String> = []
     @State private var statistics: HistoryStore.Statistics?
     @State private var usageBreakdown: [HistoryStore.UsageBreakdown] = []
@@ -339,6 +263,10 @@ struct HistoryTab: View {
     /// only when accessed (toolbar buttons), not on every body re-render.
     private var visibleIds: Set<String> {
         Set(sections.flatMap { $0.records.map(\.id) })
+    }
+
+    private var showsFeedbackMetrics: Bool {
+        usageBreakdown.contains { $0.badCount > 0 }
     }
 
     /// True when every row in the current list (loaded + search filter) is selected.
@@ -414,15 +342,75 @@ struct HistoryTab: View {
             SettingsSectionHeader(
                 label: L("历史", "HISTORY"),
                 title: L("识别历史", "History"),
-                description: L("浏览和管理语音识别记录。", "Browse and manage speech recognition records.")
+                description: L("浏览和管理语音识别记录，查看语音引擎与大模型用量统计。", "Browse and manage speech recognition records, and inspect engine and LLM analytics.")
             )
 
-            // Statistics Section
-            if let stats = statistics, stats.recordCount > 0 {
-                statisticsSection(stats: stats)
-                    .padding(.bottom, TF.spacingMD)
-                    .zIndex(30)
+            HStack(spacing: 16) {
+                subtabPicker
+                Spacer(minLength: 20)
             }
+            .padding(.bottom, 8)
+
+            Text(headerDescription)
+                .font(.system(size: 11))
+                .foregroundStyle(TF.settingsTextTertiary)
+                .padding(.bottom, 18)
+
+            Group {
+                switch selectedSubtab {
+                case .transcripts:
+                    transcriptsContentView
+                case .asrEngines:
+                    ASRUsageAnalyticsView()
+                case .llmAnalytics:
+                    LLMUsageAnalyticsView()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var headerDescription: String {
+        switch selectedSubtab {
+        case .transcripts:
+            return L("浏览和管理语音识别记录。", "Browse and manage speech recognition records.")
+        case .asrEngines:
+            return L("查看各语音识别引擎的时长分布与识别质量。", "View audio duration and recognition quality across speech engines.")
+        case .llmAnalytics:
+            return L("查看全应用大模型 Token 消耗、耗时与预估成本。", "Monitor application-wide LLM token usage, latency, and estimated costs.")
+        }
+    }
+
+    private var subtabPicker: some View {
+        LiquidGlassTabPicker(
+            items: HistorySubtab.allCases,
+            selection: selectedSubtab,
+            onSelectionChange: { newSubtab in
+                if reduceMotion {
+                    selectedSubtab = newSubtab
+                } else {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 1.0)) {
+                        selectedSubtab = newSubtab
+                    }
+                }
+            }
+        ) { tab, isSelected, _ in
+            HStack(spacing: 6) {
+                Image(systemName: tab.icon)
+                    .font(.system(size: 11, weight: .medium))
+                Text(tab.displayName)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+            }
+            .foregroundStyle(isSelected ? TF.settingsText : TF.settingsTextSecondary)
+            .padding(.horizontal, 16)
+            .frame(height: 32)
+        }
+        .fixedSize()
+    }
+
+    private var transcriptsContentView: some View {
+        VStack(alignment: .leading, spacing: 0) {
 
             HStack(spacing: 8) {
                 HStack(spacing: 8) {
@@ -563,8 +551,8 @@ struct HistoryTab: View {
                                     guard !isLoadingMore else { return }
                                     Task { await loadMore() }
                                 }
-                            }
                         }
+                    }
                     .padding(.bottom, 16)
                 }
             }
@@ -605,8 +593,15 @@ struct HistoryTab: View {
                 await loadStatistics()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .historyFeedbackDidChange)) { _ in
+            guard isActive else { return }
+            Task {
+                qualityScores = await historyStore.fetchQualityScores()
+                await loadStatistics()
+            }
+        }
         .sheet(item: $correctionRecord) { record in
-            QuickCorrectionSheet(text: record.rawText)
+            QuickCorrectionSheet(text: record.rawText, provenance: CorrectionProvenance(record: record))
         }
         .alert(L("删除所选记录", "Delete selected records"), isPresented: $showBatchDeleteConfirm) {
             Button(L("取消", "Cancel"), role: .cancel) {}
@@ -706,7 +701,16 @@ struct HistoryTab: View {
         let range = dateFilter.dateRange
         let fetched = await historyStore.fetchPage(limit: Self.pageSize, from: range?.start, to: range?.end)
         records = fetched
+        qualityScores = await historyStore.fetchQualityScores()
         hasMore = fetched.count >= Self.pageSize
+    }
+
+    private func toggleBadRecord(_ recordID: String) {
+        let nextScore = (qualityScores[recordID] ?? 0) < 0 ? 0 : -1
+        Task {
+            guard await historyStore.setRecordQualityScore(recordID: recordID, score: nextScore) else { return }
+            qualityScores = await historyStore.fetchQualityScores()
+        }
     }
 
     private func loadStatistics() async {
@@ -778,7 +782,7 @@ struct HistoryTab: View {
                 } label: {
                     Text(L("应用", "Apply"))
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(TF.settingsOnStrong)
                         .padding(.horizontal, 12)
                         .frame(height: 30)
                         .background(
@@ -844,12 +848,16 @@ struct HistoryTab: View {
             Text(L("导出识别记录", "Export Records"))
                 .font(.system(size: 13, weight: .semibold))
 
-            Picker("", selection: $exportRangeAll) {
-                Text(L("全部记录", "All records")).tag(true)
-                Text(L("指定日期范围", "Date range")).tag(false)
-            }
-            .pickerStyle(.radioGroup)
-            .font(.system(size: 12))
+            SettingsInlineSegmentedPicker(
+                selection: Binding(
+                    get: { exportRangeAll ? "all" : "range" },
+                    set: { exportRangeAll = ($0 == "all") }
+                ),
+                options: [
+                    ("all", L("全部记录", "All records")),
+                    ("range", L("指定日期范围", "Date range")),
+                ]
+            )
 
             if !exportRangeAll {
                 HStack(spacing: 8) {
@@ -883,7 +891,7 @@ struct HistoryTab: View {
                 Button(action: exportCSV) {
                     Text(L("导出 CSV", "Export CSV"))
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(TF.settingsOnStrong)
                         .padding(.horizontal, 12)
                         .frame(height: 30)
                         .background(
@@ -1061,8 +1069,8 @@ struct HistoryTab: View {
                             } else {
                                 Label(L("直接转写", "Transcription"), systemImage: "waveform")
                             }
-                            if let vendor = historyASRVendorDescription(record) {
-                                Label(vendor, systemImage: "mic")
+                            if let source = historyASRDisplayDescription(record) {
+                                Label(source, systemImage: "mic")
                             }
                         }
                         .font(.system(size: 10, weight: .medium))
@@ -1103,6 +1111,8 @@ struct HistoryTab: View {
         isHovered: Bool,
         isExpanded: Bool
     ) -> some View {
+        let isMarkedBad = (qualityScores[record.id] ?? 0) < 0
+
         if isHovered || copiedId == record.id {
             HStack(spacing: 5) {
                 historyRecordAction(
@@ -1126,6 +1136,14 @@ struct HistoryTab: View {
                 }
 
                 historyRecordAction(
+                    icon: isMarkedBad ? "hand.thumbsdown.fill" : "hand.thumbsdown",
+                    tooltip: isMarkedBad ? L("取消差评标记", "Unmark as bad") : L("标记为差", "Mark as bad"),
+                    color: isMarkedBad ? TF.settingsAccentRed : TF.settingsTextSecondary
+                ) {
+                    toggleBadRecord(record.id)
+                }
+
+                historyRecordAction(
                     icon: "trash",
                     tooltip: L("删除", "Delete"),
                     color: TF.settingsAccentRed.opacity(0.8)
@@ -1142,6 +1160,29 @@ struct HistoryTab: View {
                     .fill(TF.settingsRowHover)
             )
             .transition(.opacity)
+        } else if isMarkedBad {
+            HStack(spacing: 5) {
+                Color.clear
+                    .frame(width: 26, height: 26)
+                    .allowsHitTesting(false)
+                Color.clear
+                    .frame(width: 26, height: 26)
+                    .allowsHitTesting(false)
+                Image(systemName: "hand.thumbsdown.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(TF.settingsAccentRed)
+                    .frame(width: 26, height: 26)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(TF.settingsControl)
+                    )
+                    .accessibilityLabel(L("已标记为差", "Marked as bad"))
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(TF.settingsTextTertiary.opacity(0.65))
+                    .frame(width: 26, height: 26)
+            }
+            .padding(.leading, 8)
         } else {
             Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                 .font(.system(size: 9, weight: .bold))
@@ -1225,20 +1266,21 @@ struct HistoryTab: View {
     }
 
     private func historyASRDescription(_ record: HistoryRecord) -> String? {
+        if record.asrProvider == "manual" { return L("手动输入", "Manual input") }
         let model = record.asrModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let provider = record.asrProvider?.trimmingCharacters(in: .whitespacesAndNewlines)
         let source = model?.isEmpty == false ? model : (provider?.isEmpty == false ? provider : nil)
         return historySourceDescription(source, durationSeconds: record.asrDurationSeconds)
     }
 
-    private func historyASRVendorDescription(_ record: HistoryRecord) -> String? {
+    private func historyASRDisplayDescription(_ record: HistoryRecord) -> String? {
+        if record.asrProvider == "manual" { return L("手动输入", "Manual input") }
         let model = record.asrModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let provider = record.asrProvider?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let source = model?.isEmpty == false ? model : provider
-        return source?
-            .components(separatedBy: " · ")
-            .first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let model, !model.isEmpty {
+            return model
+        }
+        return provider?.isEmpty == false ? provider : nil
     }
 
     private func historyLLMDescription(_ record: HistoryRecord) -> String? {
@@ -1409,7 +1451,6 @@ struct HistoryTab: View {
         action: @escaping () -> Void
     ) -> some View {
         Button {
-            HistoryFloatingTooltipController.shared.hide()
             action()
         } label: {
             Image(systemName: icon)
@@ -1422,7 +1463,7 @@ struct HistoryTab: View {
                 )
         }
         .buttonStyle(.plain)
-        .historyFloatingTooltip(tooltip)
+        .settingsTooltip(tooltip)
     }
 
     // MARK: - Statistics UI
@@ -1432,8 +1473,7 @@ struct HistoryTab: View {
             historyMetric(
                 icon: "clock",
                 label: L("累计时长", "Total Time"),
-                value: formatDuration(stats.totalDuration),
-                showsDetails: true
+                value: formatDuration(stats.totalDuration)
             )
 
             historyMetricDivider
@@ -1466,10 +1506,9 @@ struct HistoryTab: View {
     private func historyMetric(
         icon: String,
         label: String,
-        value: String,
-        showsDetails: Bool = false
+        value: String
     ) -> some View {
-        let content = HStack(spacing: 10) {
+        HStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(TF.settingsTextSecondary)
@@ -1480,16 +1519,10 @@ struct HistoryTab: View {
                 )
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 3) {
-                    Text(label)
-                    if showsDetails {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 7, weight: .bold))
-                    }
-                }
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(TF.settingsTextTertiary)
-                .lineLimit(1)
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(TF.settingsTextTertiary)
+                    .lineLimit(1)
 
                 Text(value)
                     .font(.system(size: 15, weight: .bold, design: .rounded))
@@ -1504,26 +1537,6 @@ struct HistoryTab: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-
-        return Group {
-            if showsDetails {
-                Button {
-                    showUsageDetails = true
-                    Task { await loadUsageBreakdown() }
-                } label: {
-                    content
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .settingsTooltip(L("查看用量详情", "View usage details"), isEnabled: !showUsageDetails)
-                .popover(isPresented: $showUsageDetails, arrowEdge: .bottom) {
-                    usageDetailsPopover
-                        .task { await loadUsageBreakdown() }
-                }
-            } else {
-                content
-            }
-        }
     }
 
     private var historyMetricDivider: some View {
@@ -1587,21 +1600,27 @@ struct HistoryTab: View {
             }
         }
         .padding(16)
-        .frame(width: 550)
+        .frame(width: showsFeedbackMetrics ? 760 : 600)
     }
 
     private var usageDetailsHeader: some View {
         HStack(spacing: 10) {
             Text(L("模型 / 引擎", "Model / Engine"))
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(width: 250, alignment: .leading)
             Text(L("近1天", "1 day"))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
             Text(L("7天", "7 days"))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
             Text(L("30天", "30 days"))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
             Text(L("全部", "All time"))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
+            if showsFeedbackMetrics {
+                Text("👎")
+                    .frame(width: 60, alignment: .trailing)
+                Text(L("差评率", "% Bad"))
+                    .frame(width: 68, alignment: .trailing)
+            }
         }
         .font(.system(size: 10, weight: .semibold))
         .foregroundStyle(TF.settingsTextTertiary)
@@ -1618,21 +1637,27 @@ struct HistoryTab: View {
                     .foregroundStyle(TF.settingsText)
                     .lineLimit(1)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(width: 250, alignment: .leading)
 
             Text(formatUsageDuration(row.lastDayDuration))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
             Text(formatUsageDuration(row.last7DaysDuration))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
             Text(formatUsageDuration(row.last30DaysDuration))
-                .frame(width: 78, alignment: .trailing)
+                .frame(width: 70, alignment: .trailing)
             VStack(alignment: .trailing, spacing: 2) {
                 Text(formatUsageDuration(row.allTimeDuration))
                 Text(L("\(row.recordCount) 条记录", "\(row.recordCount) records"))
                     .font(.system(size: 9))
                     .foregroundStyle(TF.settingsTextTertiary)
             }
-            .frame(width: 78, alignment: .trailing)
+            .frame(width: 70, alignment: .trailing)
+            if showsFeedbackMetrics {
+                Text("\(row.badCount)")
+                    .frame(width: 60, alignment: .trailing)
+                Text(formatBadPercentage(row.badPercentage))
+                    .frame(width: 68, alignment: .trailing)
+            }
         }
         .font(.system(size: 11, weight: .medium, design: .rounded))
         .foregroundStyle(TF.settingsText)
@@ -1675,6 +1700,10 @@ struct HistoryTab: View {
             return String(format: "%dm %02ds", minutes, secs)
         }
         return "\(secs)s"
+    }
+
+    private func formatBadPercentage(_ value: Double) -> String {
+        String(format: "%.1f%%", value * 100)
     }
 
     private func formatNumber(_ number: Int) -> String {

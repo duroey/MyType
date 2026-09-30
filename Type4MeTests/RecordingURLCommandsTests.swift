@@ -154,7 +154,7 @@ final class InjectionTargetPlanTests: XCTestCase {
     // time is the intended target, so paste into the current frontmost app.
     func testNilTargetInjectsIntoCurrentFrontmost() {
         XCTAssertEqual(
-            RecognitionSession.planInjectionTarget(hasCapturedTarget: false, isTerminated: false),
+            RecognitionSession.planInjectionTarget(isAutomation: true, hasCapturedTarget: false, isTerminated: false),
             .injectIntoCurrentFrontmost
         )
     }
@@ -163,7 +163,7 @@ final class InjectionTargetPlanTests: XCTestCase {
     // still resolves to the headless current-frontmost path regardless.
     func testNilTargetIgnoresTerminatedFlag() {
         XCTAssertEqual(
-            RecognitionSession.planInjectionTarget(hasCapturedTarget: false, isTerminated: true),
+            RecognitionSession.planInjectionTarget(isAutomation: true, hasCapturedTarget: false, isTerminated: true),
             .injectIntoCurrentFrontmost
         )
     }
@@ -172,7 +172,7 @@ final class InjectionTargetPlanTests: XCTestCase {
     // pasting, so uncertainty falls back to the clipboard at runtime.
     func testLiveTargetRequiresActivationConfirmation() {
         XCTAssertEqual(
-            RecognitionSession.planInjectionTarget(hasCapturedTarget: true, isTerminated: false),
+            RecognitionSession.planInjectionTarget(isAutomation: true, hasCapturedTarget: true, isTerminated: false),
             .activateAndConfirm
         )
     }
@@ -181,8 +181,23 @@ final class InjectionTargetPlanTests: XCTestCase {
     // frontmost now is a different app, so never paste — fail safe to the clipboard.
     func testTerminatedTargetFailsSafeToClipboard() {
         XCTAssertEqual(
-            RecognitionSession.planInjectionTarget(hasCapturedTarget: true, isTerminated: true),
+            RecognitionSession.planInjectionTarget(isAutomation: true, hasCapturedTarget: true, isTerminated: true),
             .failSafeClipboard
+        )
+    }
+
+    func testInteractiveInputInjectsIntoCurrentFrontmost() {
+        XCTAssertEqual(
+            RecognitionSession.planInjectionTarget(isAutomation: false, hasCapturedTarget: true, isTerminated: false),
+            .injectIntoCurrentFrontmost
+        )
+        XCTAssertEqual(
+            RecognitionSession.planInjectionTarget(isAutomation: false, hasCapturedTarget: false, isTerminated: false),
+            .injectIntoCurrentFrontmost
+        )
+        XCTAssertEqual(
+            RecognitionSession.planInjectionTarget(isAutomation: false, hasCapturedTarget: true, isTerminated: true),
+            .injectIntoCurrentFrontmost
         )
     }
 }
@@ -195,6 +210,14 @@ final class RecordingStartSourceAndGateTests: XCTestCase {
         XCTAssertEqual(RecordingStartSource.reviseHotkey.rawValue, "reviseHotkey")
         XCTAssertEqual(RecordingStartSource.reviseMenuBar.rawValue, "reviseMenuBar")
         XCTAssertEqual(RecordingStartSource.urlScheme.rawValue, "urlScheme")
+    }
+
+    func testOnlyOrdinaryManualSourcesAllowConfiguredInjectionTarget() {
+        XCTAssertTrue(RecordingStartSource.hotkey.allowsConfiguredInjectionTarget)
+        XCTAssertTrue(RecordingStartSource.menuBar.allowsConfiguredInjectionTarget)
+        XCTAssertFalse(RecordingStartSource.urlScheme.allowsConfiguredInjectionTarget)
+        XCTAssertFalse(RecordingStartSource.reviseHotkey.allowsConfiguredInjectionTarget)
+        XCTAssertFalse(RecordingStartSource.reviseMenuBar.allowsConfiguredInjectionTarget)
     }
 
     func testRecordingStartGateInvalidation() {

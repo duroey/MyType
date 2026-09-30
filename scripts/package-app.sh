@@ -29,15 +29,24 @@ esac
 APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/${APP_NAME}.app}"
 APP_EXECUTABLE="${APP_EXECUTABLE:-Type4Me}"
 APP_ICON_NAME="${APP_ICON_NAME:-AppIcon}"
-APP_VERSION="${APP_VERSION:-2.3.0}"
+APP_VERSION="${APP_VERSION:-2.10.0}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 VARIANT="${VARIANT:-cloud}"    # cloud or local
 ARCH="${ARCH:-universal}"      # arm64 or universal
 BUNDLED_CREDENTIALS_FILE="${BUNDLED_CREDENTIALS_FILE:-}"
-MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-mytype 需要访问麦克风以录制语音并将其转换为文本。}"
-SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-mytype 需要语音识别权限以将你的语音转写为文字。}"
-APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-mytype 需要辅助功能权限来注入转写文字到其他应用}"
+# Base (development region: en) usage descriptions written to Info.plist.
+# Used on English systems and as fallback for other non-localized languages.
+# Can be overridden via environment variables.
+MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-mytype needs microphone access to capture your voice for transcription.}"
+SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-mytype needs speech recognition access to transcribe your voice into text.}"
+APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-mytype needs permission to control other applications to perform automation actions.}"
+
+# Simplified Chinese (zh-Hans) usage descriptions written to zh-Hans.lproj/InfoPlist.strings.
+# Used on Chinese systems. Can be overridden via environment variables.
+ZH_HANS_MICROPHONE_USAGE_DESCRIPTION="${ZH_HANS_MICROPHONE_USAGE_DESCRIPTION:-${MICROPHONE_USAGE_DESCRIPTION_ZH_HANS:-mytype 需要访问麦克风以录制语音并将其转换为文本。}}"
+ZH_HANS_SPEECH_RECOGNITION_USAGE_DESCRIPTION="${ZH_HANS_SPEECH_RECOGNITION_USAGE_DESCRIPTION:-${SPEECH_RECOGNITION_USAGE_DESCRIPTION_ZH_HANS:-mytype 需要语音识别权限以将你的语音转写为文字。}}"
+ZH_HANS_APPLE_EVENTS_USAGE_DESCRIPTION="${ZH_HANS_APPLE_EVENTS_USAGE_DESCRIPTION:-${APPLE_EVENTS_USAGE_DESCRIPTION_ZH_HANS:-mytype 需要控制其他应用程序以执行系统自动化操作。}}"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
 
 ENTITLEMENTS="$PROJECT_DIR/entitlements.plist"
@@ -88,41 +97,51 @@ else
     CODESIGN_TIMESTAMP_ARGS=(--timestamp)
 fi
 
-if [ "$ARCH" = "arm64" ]; then
-    echo "Building arm64 release..."
-    swift build -c release --package-path "$PROJECT_DIR" --arch arm64 2>&1 | grep -E "Build complete|Build succeeded|error:|warning:" || true
-else
-    echo "Building universal release (arm64 + x86_64)..."
-    swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64 2>&1 | grep -E "Build complete|Build succeeded|error:|warning:" || true
-fi
-
-BINARY=""
-if [ "$ARCH" = "arm64" ]; then
-    # arm64 builds can leave a stale universal artifact under .build/apple.
-    for candidate in \
-        "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me" \
-        "$PROJECT_DIR/.build/release/Type4Me" \
-        "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
-    do
-        if [ -f "$candidate" ]; then
-            BINARY="$candidate"
-            break
-        fi
-    done
-else
-    for candidate in \
-        "$PROJECT_DIR/.build/apple/Products/Release/Type4Me" \
-        "$PROJECT_DIR/.build/release/Type4Me"
-    do
-        if [ -f "$candidate" ]; then
-            BINARY="$candidate"
-            break
-        fi
-    done
-fi
-
+BINARY="${BINARY:-}"
 if [ -z "$BINARY" ]; then
-    BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Type4Me' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    if [ "${SKIP_BUILD:-0}" != "1" ]; then
+        if [ "$ARCH" = "arm64" ]; then
+            echo "Building arm64 release..."
+            swift build -c release --package-path "$PROJECT_DIR" --arch arm64
+        else
+            echo "Building universal release (arm64 + x86_64)..."
+            swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64
+        fi
+    fi
+
+    if [ "$ARCH" = "arm64" ]; then
+        candidates=(
+            "$PROJECT_DIR/.build/release/Type4Me"
+            "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me"
+            "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
+        )
+    else
+        candidates=(
+            "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
+            "$PROJECT_DIR/.build/release/Type4Me"
+        )
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            archs="$(lipo -archs "$candidate" 2>/dev/null || true)"
+            if [ "$ARCH" = "universal" ]; then
+                if echo "$archs" | grep -q "arm64" && echo "$archs" | grep -q "x86_64"; then
+                    BINARY="$candidate"
+                    break
+                fi
+            else
+                if echo "$archs" | grep -q "$ARCH"; then
+                    BINARY="$candidate"
+                    break
+                fi
+            fi
+        fi
+    done
+
+    if [ -z "$BINARY" ]; then
+        BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Type4Me' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    fi
 fi
 
 if [ ! -f "$BINARY" ]; then
@@ -232,6 +251,35 @@ if [ -n "$BUNDLED_CREDENTIALS_FILE" ]; then
 else
     echo "Bundled credential bootstrap: disabled"
 fi
+
+mkdir -p "$APP_PATH/Contents/Resources/Icons"
+cp "$PROJECT_DIR/Type4Me/Resources/Icons/"*.png "$APP_PATH/Contents/Resources/Icons/" 2>/dev/null || true
+
+# Localized resources (.lproj directories).
+# Note: en.lproj is intentionally omitted because CFBundleDevelopmentRegion is "en"
+# and base Info.plist provides English strings while respecting MICROPHONE_USAGE_DESCRIPTION etc. overrides.
+# Remove existing en.lproj if present from prior builds to prevent masking Info.plist.
+rm -rf "$APP_PATH/Contents/Resources/en.lproj"
+
+for lproj_dir in "$PROJECT_DIR/Type4Me/Resources/"*.lproj; do
+    [ -d "$lproj_dir" ] || continue
+    lproj_name="$(basename "$lproj_dir")"
+    [ "$lproj_name" != "en.lproj" ] || continue
+    rm -rf "$APP_PATH/Contents/Resources/$lproj_name"
+    cp -R "$lproj_dir" "$APP_PATH/Contents/Resources/"
+done
+
+# Generate zh-Hans.lproj/InfoPlist.strings with configured/overridden usage descriptions.
+mkdir -p "$APP_PATH/Contents/Resources/zh-Hans.lproj"
+cat >"$APP_PATH/Contents/Resources/zh-Hans.lproj/InfoPlist.strings" <<EOF
+/* mytype 权限用途说明（简体中文） */
+
+"NSMicrophoneUsageDescription" = "${ZH_HANS_MICROPHONE_USAGE_DESCRIPTION}";
+
+"NSSpeechRecognitionUsageDescription" = "${ZH_HANS_SPEECH_RECOGNITION_USAGE_DESCRIPTION}";
+
+"NSAppleEventsUsageDescription" = "${ZH_HANS_APPLE_EVENTS_USAGE_DESCRIPTION}";
+EOF
 
 # --- Models and local ASR server (local variant only) ---
 if [ "$VARIANT" = "local" ]; then

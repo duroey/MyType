@@ -279,8 +279,12 @@ final class AppStateTests: XCTestCase {
         )
         XCTAssertEqual(shortBar.panelSize, NSSize(width: 196, height: 71))
         XCTAssertEqual(
-            FloatingBarPanelLayout.fallback(for: .compact).panelSize,
+            FloatingBarPanelLayout.fallback(for: .compact, showsLiveTranscript: false).panelSize,
             NSSize(width: 196, height: 40)
+        )
+        XCTAssertEqual(
+            FloatingBarPanelLayout.fallback(for: .compact, showsLiveTranscript: true).panelSize,
+            NSSize(width: 196, height: 64)
         )
 
         let fullBar = FloatingBarPanelLayout(
@@ -301,6 +305,32 @@ final class AppStateTests: XCTestCase {
             horizontalOverflow: 60
         )
         XCTAssertEqual(action.panelSize, NSSize(width: 316, height: 111))
+    }
+
+    func testFloatingPanelKeepsCapsulePositionWhenOverlayResizesPanel() {
+        let visibleFrame = NSRect(x: 100, y: 50, width: 1000, height: 800)
+        let capsuleSize = NSSize(width: TF.barWidthCompact, height: TF.barHeight)
+
+        // Hovering a control adds a tooltip whose bubble overflows the capsule by
+        // a fractional amount. The capsule is centered in the panel, so its left
+        // edge must not move as the panel grows around it.
+        let overflows: [CGFloat] = [0, 12.5, 37.25, 60, 73.9]
+        let capsuleOrigins: [CGFloat] = overflows.map { overflow in
+            let layout = FloatingBarPanelLayout(
+                contentSize: capsuleSize,
+                horizontalOverflow: overflow,
+                capsuleSize: capsuleSize
+            )
+            let size = layout.panelSize
+            XCTAssertEqual(size.width.truncatingRemainder(dividingBy: 2), 0, "panel width must stay even")
+
+            let frame = FloatingBarPanel.bottomCenteredFrame(size: size, visibleFrame: visibleFrame)
+            return frame.minX + (size.width - capsuleSize.width) / 2
+        }
+
+        for origin in capsuleOrigins {
+            XCTAssertEqual(origin, capsuleOrigins[0], accuracy: 0.001)
+        }
     }
 
     func testFloatingPanelFrameKeepsBarBottomCentered() {
@@ -737,6 +767,77 @@ final class AppStateTests: XCTestCase {
 
         XCTAssertEqual(appState.barPhase, .done)
         XCTAssertEqual(appState.feedbackMessage, InjectionOutcome.copiedToClipboard.completionMessage)
+    }
+
+    func testFinalizeWithLLMFailureShowsWarningAndFallbackMessage() {
+        let appState = AppState()
+        appState.barPhase = .processing
+
+        appState.finalize(text: "原始识别文本", outcome: .inserted, llmFailed: true)
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackKind, .warning)
+        XCTAssertEqual(appState.feedbackMessage, L("处理失败，已输出原文", "Processing failed; raw text output"))
+        XCTAssertEqual(appState.transcriptionText, "原始识别文本")
+    }
+
+    func testFinalizeWithLLMFailureAndClipboardRetentionShowsClipboardWarning() {
+        let appState = AppState()
+        appState.barPhase = .processing
+
+        appState.finalize(text: "原始识别文本", outcome: .copiedToClipboard, llmFailed: true)
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackKind, .warning)
+        XCTAssertEqual(appState.feedbackMessage, L("处理失败，原文已保留至剪贴板", "Processing failed; raw text copied to clipboard"))
+    }
+
+    func testFinalizeWithLLMFailureAndPasteAttemptedShowsPasteAttemptedWarning() {
+        let appState = AppState()
+        appState.barPhase = .processing
+
+        appState.finalize(text: "原始识别文本", outcome: .pasteAttemptedClipboardRetained, llmFailed: true)
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackKind, .warning)
+        XCTAssertEqual(
+            appState.feedbackMessage,
+            L("处理失败，已尝试输入，原文已保留至剪贴板", "Processing failed; paste attempted, raw text kept in clipboard")
+        )
+    }
+
+
+    func testFinalizeWithLLMFailureAndNotInsertedShowsNoDestinationWarning() {
+        let appState = AppState()
+        appState.barPhase = .processing
+
+        appState.finalize(text: "原始识别文本", outcome: .notInserted, llmFailed: true)
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackKind, .warning)
+        XCTAssertEqual(appState.feedbackMessage, L("处理失败，未找到输入位置", "Processing failed; no editable field found"))
+    }
+
+    func testFinalizeWithLLMFailureAndDiscardedShowsCancelledMessage() {
+        let appState = AppState()
+        appState.barPhase = .processing
+
+        appState.finalize(text: "原始识别文本", outcome: .discarded, llmFailed: true)
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackKind, .warning)
+        XCTAssertEqual(appState.feedbackMessage, InjectionOutcome.discarded.completionMessage)
+    }
+    func testFinalizeSuccessResetsFeedbackKindToStandard() {
+        let appState = AppState()
+        appState.barPhase = .processing
+        appState.feedbackKind = .warning
+
+        appState.finalize(text: "处理后的文本", outcome: .inserted, llmFailed: false)
+
+        XCTAssertEqual(appState.barPhase, .done)
+        XCTAssertEqual(appState.feedbackKind, .standard)
+        XCTAssertEqual(appState.feedbackMessage, InjectionOutcome.inserted.completionMessage)
     }
 
     func testLocalASREngineSelectionNeverDisablesBothEngines() {

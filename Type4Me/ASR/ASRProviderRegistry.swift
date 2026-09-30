@@ -79,6 +79,14 @@ enum ASRProviderRegistry {
             .volcano: ProviderEntry(
                 configType: VolcanoASRConfig.self,
                 createClient: { VolcASRClient() },
+                capabilities: .streaming(),
+                validateCredentials: { config, options in
+                    try await VolcASRClient.validateCredentials(config: config, options: options)
+                }
+            ),
+            .stepfun: ProviderEntry(
+                configType: StepFunASRConfig.self,
+                createClient: { StepFunASRClient() },
                 capabilities: .streaming()
             ),
             .stepfunBatch: ProviderEntry(
@@ -117,6 +125,11 @@ enum ASRProviderRegistry {
                 createClient: { ElevenLabsASRClient() },
                 capabilities: .streaming()
             ),
+            .gemini: ProviderEntry(
+                configType: GeminiASRConfig.self,
+                createClient: { GeminiASRClient() },
+                capabilities: .streaming()
+            ),
             .grok: ProviderEntry(
                 configType: GrokASRConfig.self,
                 createClient: { GrokASRClient() },
@@ -125,6 +138,11 @@ enum ASRProviderRegistry {
             .soniox: ProviderEntry(
                 configType: SonioxASRConfig.self,
                 createClient: { SonioxASRClient() },
+                capabilities: .streaming()
+            ),
+            .metaMuse: ProviderEntry(
+                configType: MetaMuseASRConfig.self,
+                createClient: { MetaMuseASRClient() },
                 capabilities: .streaming()
             ),
             .bailian: ProviderEntry(

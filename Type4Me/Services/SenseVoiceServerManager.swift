@@ -23,7 +23,8 @@ actor SenseVoiceServerManager {
     /// Write effective hotwords (builtin + user) to hotwords.txt for Qwen3 server.
     nonisolated static func syncHotwordsFile() {
         let words = HotwordStorage.loadEffective()
-        let dir = AppIdentity.appSupportDirectory()
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent(AppDataLocation.profileDirectoryName)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("hotwords.txt")
         let content = words.joined(separator: "\n")
@@ -286,7 +287,9 @@ actor SenseVoiceServerManager {
     // MARK: - PID File Management
 
     private static var pidFileURL: URL {
-        AppIdentity.appSupportDirectory().appendingPathComponent("server-pids.txt")
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return dir.appendingPathComponent(AppDataLocation.runtimeDirectoryName, isDirectory: true)
+            .appendingPathComponent("server-pids.txt")
     }
 
     /// Save current managed PIDs to disk so we can clean up after a crash.
@@ -388,7 +391,9 @@ actor SenseVoiceServerManager {
         logger.info("Qwen3-ASR model: \(modelPath)")
 
         // Hotwords file
-        let hotwordsPath = AppIdentity.appSupportDirectory()
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let hotwordsPath = appSupport
+            .appendingPathComponent(AppDataLocation.profileDirectoryName)
             .appendingPathComponent("hotwords.txt")
         let hotwordsFile = FileManager.default.fileExists(atPath: hotwordsPath.path) ? hotwordsPath.path : ""
 
@@ -413,7 +418,9 @@ actor SenseVoiceServerManager {
             return b.path
         }
         // 2. App Support (user-downloaded)
-        let userModel = AppIdentity.appSupportDirectory()
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let userModel = appSupport
+            .appendingPathComponent(AppDataLocation.profileDirectoryName)
             .appendingPathComponent("Models/Qwen3-ASR")
         if FileManager.default.fileExists(atPath: userModel.path) {
             return userModel.path

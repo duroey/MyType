@@ -49,7 +49,7 @@ struct Type4MeApp: App {
 
         Window(L("MyType 授权引导", "MyType Permissions"), id: "permission-guide") {
             PermissionGuideView(model: appDelegate.permissionGuideModel)
-                .frame(minWidth: 520, idealWidth: 560, minHeight: 460, idealHeight: 480)
+                .frame(minWidth: 600, idealWidth: 600, minHeight: 560, idealHeight: 600)
         }
         .windowResizability(.contentSize)
         .defaultPosition(.center)
@@ -168,6 +168,10 @@ enum RecordingStartSource: String {
     case reviseHotkey
     case reviseMenuBar
     case urlScheme
+
+    var allowsConfiguredInjectionTarget: Bool {
+        self == .hotkey || self == .menuBar
+    }
 }
 
 // MARK: - App Delegate
@@ -182,6 +186,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Computed dynamically per recording based on audio device topology.
     private var floatingBarController: FloatingBarController?
     private var focusWakeupController: FocusWakeupController?
+    private var manualInputController: ManualInputController?
+    private var manualInputStartTask: Task<Void, Never>?
+    private var manualInputGeneration = 0
+    private var isEditingManualInput = false
     let askAnythingStore = AskAnythingStore()
     /// Creates the shared Ask Anything coordinator with its recording runtime attached.
     lazy var askAnythingCoordinator: AskAnythingCoordinator = {
@@ -222,9 +230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// recording the user triggered via Stream Deck / Shortcuts / etc.
     private var suppressSetupWizardForHeadlessLaunch = false
     private var recognitionEventTask: Task<Void, Never>?
+    private var backupSchedulerTask: Task<Void, Never>?
     private var recognitionEventContinuation: AsyncStream<RecognitionEventBridgeItem>.Continuation?
     private var pendingRecordingStartTask: Task<Void, Never>?
     private var inputDeviceChangeObservers: [NSObjectProtocol] = []
+
     private var effectiveInputDevice: AudioInputDevice?
     private var hasEstablishedInputDeviceBaseline = false
     lazy var menuBarControlCenterModel = MenuBarControlCenterModel(appState: appState)
@@ -274,6 +284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CJKSpacingMode.migrateIfNeeded()
         ClipboardOutputPolicy.migrateIfNeeded()
         RecordingVisualStyle.migrateLegacyPreferenceIfNeeded()
+        // Obsolete: speculative LLM was removed; older installs may still hold the override.
+        UserDefaults.standard.removeObject(forKey: "tf_enableSpeculativeLLM")
 
         // Sync hotwords to Volcengine cloud table (async, non-blocking)
         VolcHotwordSyncManager.syncIfNeeded()
@@ -293,7 +305,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let session = self.session
 
         // 历史记录字数迁移（用 session 自带的 historyStore，迁移后 UI 能刷新）
-        Task { await session.historyStore.migrateCharacterCounts() }
+        Task { [weak self] in
+            await session.historyStore.migrateCharacterCounts()
+            // Every synchronous migration above has already run, and this is the
+            // only one that writes history.db. Starting backups only now keeps the
+            // launch snapshot a copy of the data the app will actually run on.
+            self?.startDataBackupScheduler()
+        }
         Task { await askAnythingCoordinator.restoreAfterLaunch() }
         let appState = self.appState
         let focusWakeupController = FocusWakeupController(appState: appState, session: session)
@@ -316,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SoundFeedback.warmUp()
         AudioInputDeviceMonitor.shared.start()
         observeEffectiveInputDeviceChanges()
+
         AudioKeepAliveManager.syncState()
 
         // Pre-warm audio subsystem and ASR connection so the first recording starts instantly
@@ -382,7 +401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             // BT wake-up preamble is baked into the sound buffer itself.
                             SoundFeedback.playStart()
                             // Lower volume after start sound finishes playing
-                            let targetVolumePercent = UserDefaults.standard.integer(forKey: "tf_volumeReduction")
+                            let targetVolumePercent = SystemVolumeManager.configuredReductionPercent()
                             if targetVolumePercent >= 0 {
                                 let delayMs = SoundFeedback.startSoundDurationMs()
                                 if delayMs > 0 {
@@ -442,8 +461,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                         self.hotkeyManager.isProcessing = false
                         self.hotkeyManager.resetActiveState()
-                    case .finalized(let text, let injection):
-                        appState.finalize(text: text, outcome: injection)
+                    case .finalized(let text, let injection, let llmFailed):
+                        appState.finalize(text: text, outcome: injection, llmFailed: llmFailed)
                         if injection == .inserted,
                            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             self.cmuxDefaultReplyController.markFocusedSurfaceUserInput()
@@ -538,6 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Start periodic update checking
         UpdateChecker.shared.startPeriodicChecking(appState: appState)
+        LLMPricingSyncService.shared.start()
         appUpdater.checkPostUpdateStatus()
 
         // Reconcile current mode against the active provider before hotkeys are registered.
@@ -552,6 +572,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { [weak self] in
                 self?.refreshModeAvailability()
             }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .manualInputSettingsDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshModeAvailability() }
         }
 
         NotificationCenter.default.addObserver(
@@ -661,6 +687,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        permissionGuideModel.hotkeyProbe = { [weak self] in
+            self?.hotkeyManager.start() == true
+        }
+
+        hotkeyManager.onAccessibilityRevoked = { [weak self] in
+            MainActor.assumeIsolated {
+                self?.handleAccessibilityRevoked()
+            }
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.startHotkeyWithRetry()
@@ -694,13 +729,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `application(open:)` sets `suppressSetupWizardForHeadlessLaunch` so the
         // wizard doesn't steal focus over the headless recording.
         if needsSetup {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 MainActor.assumeIsolated {
                     if self?.suppressSetupWizardForHeadlessLaunch == true {
                         DebugFileLogger.log("setup wizard suppressed: headless URL launch")
                         return
                     }
-                    _ = NSApp.sendAction(Selector(("showSetupWindow:")), to: nil, from: nil)
+                    self?.presentSetupWizard()
                 }
             }
         }
@@ -928,6 +963,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self?.microphoneSelectionGeneration &+= 1
                         self?.autoFocusConnectionOwner = nil
                     }
+                    AudioKeepAliveManager.syncMicState()
                     self?.updateEffectiveInputDevice(notify: true)
                 }
             }
@@ -1038,6 +1074,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func selectLLMProviderFromMenu(_ provider: LLMProvider) {
+        guard menuBarRuntimeSettingsAreEditable,
+              ModelSettingsHelpers.hasConfiguredCredentials(for: provider)
+        else { return }
+        guard provider != KeychainService.selectedLLMProvider else { return }
+        KeychainService.selectedLLMProvider = provider
+    }
+
     func setTranslationTargetFromMenu(_ language: TranslationLanguage) {
         guard menuBarRuntimeSettingsAreEditable,
               let index = appState.availableModes.firstIndex(
@@ -1111,7 +1155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 recordSelectionAskRecordingDidEnd(.finish)
                 hotkeyManager.isProcessing = false
             }
-        case .finalized(let text, let injection):
+        case .finalized(let text, let injection, _):
             if injection == .inserted,
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 cmuxDefaultReplyController.markFocusedSurfaceUserInput()
@@ -1295,6 +1339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quietWakeup: Bool = false,
         externalAudioInput: Bool = false
     ) -> Bool {
+        guard !isEditingManualInput else { return false }
         switch appState.barPhase {
         case .hidden, .focusWaiting, .done, .error:
             break
@@ -1306,6 +1351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let selectedProvider = KeychainService.selectedASRProvider
         let resolvedMode = ASRProviderRegistry.resolvedMode(for: mode, provider: selectedProvider)
         let effectiveMode = appState.availableModes.first(where: { $0.id == resolvedMode.id }) ?? resolvedMode
+        let isAutomation = (source == .urlScheme)
         if effectiveMode.executionKind == .selectionAsk {
             askAnythingCoordinator.prepareForExternalNewQuestion()
         }
@@ -1391,6 +1437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self.session.startRecording(
                 mode: effectiveMode,
                 requestedAt: recordingRequestedAt,
+                isAutomation: isAutomation,
                 autoStopOnSilence: autoStopOnSilence,
                 initialAudioChunks: initialAudioChunks,
                 autoStopThresholdOverride: autoStopThresholdOverride,
@@ -1555,13 +1602,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectionAskController?.recordingDidEnd(action)
     }
 
+    private func toggleManualInput() {
+        if isEditingManualInput {
+            cancelManualInput()
+            return
+        }
+        let modes = appState.availableModes.filter(\.supportsManualInput)
+        guard !modes.isEmpty, [.hidden, .done, .error].contains(appState.barPhase) else {
+            hotkeyManager.resetActiveState()
+            return
+        }
+        isEditingManualInput = true
+        // Typed input owns the pipeline like a manual recording, so Focus must not
+        // arm its RMS gate against the editor's own text field.
+        focusWakeupController?.pauseForManualRecording()
+        manualInputGeneration &+= 1
+        let generation = manualInputGeneration
+        registerHotkeys(for: KeychainService.selectedASRProvider)
+        floatingBarController?.setManualInputEditing(true)
+        appState.startRecording(showsPanel: false)
+        manualInputStartTask = Task { [weak self] in
+            guard let self else { return }
+            let idle = await self.session.awaitIdle()
+            guard !Task.isCancelled, self.manualInputGeneration == generation else { return }
+            guard idle else {
+                self.cancelManualInput()
+                return
+            }
+            let ready = await self.session.startManualInput(modes: modes)
+            guard !Task.isCancelled, self.manualInputGeneration == generation else { return }
+            guard ready else {
+                self.cancelManualInput()
+                return
+            }
+            self.appState.markRecordingReady()
+            let controller = ManualInputController(modes: modes,
+                onSubmit: { [weak self] mode in self?.submitManualInput(mode: mode) },
+                onCancel: { [weak self] in self?.cancelManualInput() })
+            self.manualInputController = controller
+            controller.show()
+            self.manualInputStartTask = nil
+        }
+    }
+
+    private func submitManualInput(mode: ProcessingMode) {
+        guard isEditingManualInput, mode.supportsManualInput,
+              let text = manualInputController?.submittedText() else { return }
+        manualInputController?.close()
+        manualInputController = nil
+        isEditingManualInput = false
+        appState.selectModeForRecording(mode)
+        registerHotkeys(for: KeychainService.selectedASRProvider)
+        appState.appendSegment(text, isConfirmed: true)
+        floatingBarController?.setManualInputEditing(false)
+        appState.stopRecording()
+        hotkeyManager.resetActiveState()
+        hotkeyManager.isProcessing = true
+        Task { await session.submitManualInput(text, mode: mode) }
+    }
+
+    private func cancelManualInput() {
+        guard isEditingManualInput else { return }
+        manualInputGeneration &+= 1
+        let generation = manualInputGeneration
+        let startTask = manualInputStartTask
+        startTask?.cancel()
+        manualInputStartTask = nil
+        manualInputController?.close()
+        manualInputController = nil
+        // Keep the session reserved until startup and cancellation have both drained.
+        Task {
+            await startTask?.value
+            await session.cancelRecording()
+            guard manualInputGeneration == generation else { return }
+            isEditingManualInput = false
+            registerHotkeys(for: KeychainService.selectedASRProvider)
+            appState.cancel()
+            focusWakeupController?.sessionDidFinish()
+            floatingBarController?.setManualInputEditing(false)
+            hotkeyManager.resetActiveState()
+        }
+    }
+
     private func registerHotkeys(for provider: ASRProvider) {
         let availableModes = appState.availableModes
-        let modes = ASRProviderRegistry.supportedModes(from: availableModes, for: provider)
+        let modes = isEditingManualInput
+            ? (manualInputController?.draft.modes ?? availableModes.filter(\.supportsManualInput))
+            : ASRProviderRegistry.supportedModes(from: availableModes, for: provider)
         var bindings: [ModeBinding] = modes.flatMap { mode -> [ModeBinding] in
             let capturedMode = mode
             let onStart: @Sendable () -> Void = { [weak self] in
                 guard let self else { return }
+                if MainActor.assumeIsolated({ self.isEditingManualInput }) {
+                    MainActor.assumeIsolated { self.hotkeyManager.resetActiveState() }
+                    return
+                }
 
                 if capturedMode.executionKind == .selectionAsk,
                    MainActor.assumeIsolated({ self.selectionAskController?.isVisible == true }) {
@@ -1600,6 +1735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if phase == .recording || phase == .preparing {
                     NSLog("[Type4Me] >>> HOTKEY: toggle desync – onStart while recording, redirecting to STOP (phase=%@)", String(describing: phase))
                     DebugFileLogger.log("hotkey toggle desync: onStart while recording, redirecting to stop phase=\(phase)")
+
                     MainActor.assumeIsolated {
                         if phase == .preparing {
                             self.cancelCurrentRecordingStartAttempt()
@@ -1612,7 +1748,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if phase == .preparing {
                         Task { await self.session.cancelRecording() }
                     } else {
-                        Task { await self.session.stopRecording() }
+                        Task {
+                            await self.session.stopRecording()
+                        }
                     }
                     return
                 }
@@ -1668,6 +1806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     Task { _ = await self.session.handleRecoveryHotkeyPress() }
                     return
                 }
+
                 MainActor.assumeIsolated {
                     if phase == .preparing {
                         self.cancelCurrentRecordingStartAttempt()
@@ -1679,7 +1818,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if phase == .preparing {
                     Task { await self.session.cancelRecording() }
                 } else {
-                    Task { await self.session.stopRecording() }
+                    Task {
+                        await self.session.stopRecording()
+                    }
                 }
             }
             let onAbort: @Sendable () -> Void = { [weak self] in
@@ -1735,7 +1876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let reviseSettings = ReviseSettingsStore.shared.load()
-        if reviseSettings.enabled && ReviseSettingsStore.isRuntimeEnabled,
+        if !isEditingManualInput, reviseSettings.enabled && ReviseSettingsStore.isRuntimeEnabled,
            let hk = reviseSettings.hotkey {
             let reviseOnStart: @Sendable () -> Void = { [weak self] in
                 guard let self else { return }
@@ -1785,6 +1926,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             bindings.append(reviseBinding)
         }
 
+        if let key = ManualInputSettings.load(modes: availableModes),
+           ManualInputSettings.conflict(keyCode: key.keyCode, modifiers: key.modifiers, modes: availableModes) == nil {
+            let toggle: @Sendable () -> Void = { [weak self] in
+                MainActor.assumeIsolated { self?.toggleManualInput() }
+            }
+            bindings.append(ModeBinding(
+                bindingId: key.id, owner: .manualInput, keyCode: CGKeyCode(key.keyCode),
+                modifiers: CGEventFlags(rawValue: key.modifiers ?? 0), style: .toggle,
+                onStart: toggle, onStop: toggle,
+                onAbort: { [weak self] in MainActor.assumeIsolated { self?.cancelManualInput() } }))
+        }
+        hotkeyManager.onManualModePress = { [weak self] id in
+            MainActor.assumeIsolated {
+                guard let self, self.isEditingManualInput else { return false }
+                if let mode = self.manualInputController?.draft.modes.first(where: { $0.id == id }) {
+                    self.submitManualInput(mode: mode)
+                }
+                return true
+            }
+        }
+        hotkeyManager.passesEscapeToInputMethod = { [weak self] in
+            MainActor.assumeIsolated { self?.manualInputController?.hasMarkedText == true }
+        }
         hotkeyManager.registerBindings(bindings)
 
         hotkeyManager.onKeyboardEvent = { [weak self] type, event in
@@ -1848,6 +2012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DebugFileLogger.log(
                 "hotkey cross-mode finish start=\(startingMode.name) end=\(newMode.name) process=\(processingMode.name)"
             )
+
             MainActor.assumeIsolated {
                 if allowsModeSwitch {
                     self.appState.currentMode = processingMode
@@ -1879,6 +2044,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // v2.3 cancellation policy (ASR/history may finish without injection).
         hotkeyManager.onESCAbort = { [weak self] in
             guard let self else { return false }
+            if self.isEditingManualInput {
+                self.cancelManualInput()
+                return true
+            }
             if MainActor.assumeIsolated({
                 self.askAnythingCoordinator.isRecordingFollowUp
             }) {
@@ -2032,6 +2201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self.session.startRecording(
                 mode: effectiveMode,
                 requestedAt: recordingRequestedAt,
+                isAutomation: false,
                 selectionAskRequestContext: requestContext
             )
             self.finishRecordingStartAttempt(token: startToken)
@@ -2119,7 +2289,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func performStandardRecordingAction(_ action: RecordingControlAction) {
+    private func performStandardRecordingAction(
+        _ action: RecordingControlAction
+    ) {
+        if isEditingManualInput {
+            switch action {
+            case .finish: manualInputController?.show()
+            case .cancel: cancelManualInput()
+            }
+            return
+        }
         let phase = appState.barPhase
         guard phase == .preparing || phase == .recording else { return }
 
@@ -2140,7 +2319,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { await session.cancelRecording() }
             } else {
                 appState.stopRecording()
-                Task { await session.stopRecording() }
+                Task {
+                    await session.stopRecording()
+                }
             }
         case .cancel:
             if appState.activityKind == .revise {
@@ -2171,13 +2352,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var retryTimer: Timer?
     private var hotkeyRetryCount = 0
 
+    private func handleAccessibilityRevoked() {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        hotkeyRetryCount = 0
+        hotkeyManager.stop()
+
+        DebugFileLogger.log("hotkey accessibility revoked; tap torn down")
+
+        let showWizard: Bool = {
+            #if HAS_CLOUD_SUBSCRIPTION
+            return !appState.hasCompletedSetup || appState.appEdition == nil
+            #else
+            return !appState.hasCompletedSetup
+            #endif
+        }()
+        if !showWizard {
+            presentPermissionGuide()
+        }
+
+        retryTimer = Timer.scheduledTimer(
+            timeInterval: 2.0,
+            target: self,
+            selector: #selector(handleHotkeyRetry(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+    }
+
     private func startHotkeyWithRetry() {
+        retryTimer?.invalidate()
+        retryTimer = nil
+
         let success = hotkeyManager.start()
         NSLog("[Type4Me] Hotkey setup: %@", success ? "OK" : "FAILED (need Accessibility permission)")
 
         if success {
-            retryTimer?.invalidate()
-            retryTimer = nil
             hotkeyRetryCount = 0
             return
         }
@@ -2197,7 +2407,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         hotkeyRetryCount = 0
-        retryTimer?.invalidate()
         retryTimer = Timer.scheduledTimer(
             timeInterval: 2.0,
             target: self,
@@ -2209,23 +2418,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc
     private func handleHotkeyRetry(_ timer: Timer) {
-        if PermissionManager.hasAccessibilityPermission {
-            let ok = hotkeyManager.start()
-            hotkeyRetryCount += 1
-            NSLog("[Type4Me] Hotkey retry #%d: %@", hotkeyRetryCount, ok ? "OK" : "still failing")
-            if ok {
-                timer.invalidate()
-                retryTimer = nil
-                hotkeyRetryCount = 0
-            } else if hotkeyRetryCount >= 5 {
-                // Permission granted but event tap still fails (macOS caches denial at kernel level).
-                // Suggest restart.
-                timer.invalidate()
-                retryTimer = nil
-                hotkeyRetryCount = 0
-                NSLog("[Type4Me] Accessibility granted but hotkey tap failed after retries. Suggesting restart.")
-                showRestartAlert()
-            }
+        guard PermissionManager.hasAccessibilityPermission else {
+            return
+        }
+        let ok = hotkeyManager.start()
+        hotkeyRetryCount += 1
+        NSLog("[Type4Me] Hotkey retry #%d: %@", hotkeyRetryCount, ok ? "OK" : "still failing")
+        if ok {
+            timer.invalidate()
+            retryTimer = nil
+            hotkeyRetryCount = 0
+        } else if hotkeyRetryCount >= 5 {
+            // Permission granted but event tap still fails (macOS caches denial at kernel level).
+            // Suggest restart.
+            timer.invalidate()
+            retryTimer = nil
+            hotkeyRetryCount = 0
+            NSLog("[Type4Me] Accessibility granted but hotkey tap failed after retries. Suggesting restart.")
+            showRestartAlert()
         }
     }
 
@@ -2347,6 +2557,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Stored by MenuBarContent so AppDelegate can open the setup wizard window.
+    static var openSetupAction: (() -> Void)?
+
     /// Stored by MenuBarContent so AppDelegate can open the settings window.
     static var openSettingsAction: (() -> Void)?
 
@@ -2356,6 +2569,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// before the first MenuBarExtra render), calls are retried on the next
     /// runloop.
     static var openPermissionGuideAction: (() -> Void)?
+
+    /// Static convenience to open the setup wizard.
+    static func presentSetupWizard() {
+        if let action = openSetupAction {
+            action()
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Static convenience to open the settings window.
+    static func presentSettings() {
+        if let action = openSettingsAction {
+            action()
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Static convenience to open the permission guide window.
+    static func presentPermissionGuide() {
+        if let action = openPermissionGuideAction {
+            action()
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Present the setup wizard window, activating the app and retrying
+    /// until the SwiftUI scene registers its open action.
+    func presentSetupWizard(remainingAttempts: Int = 25) {
+        if let action = Self.openSetupAction {
+            action()
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        guard remainingAttempts > 0 else {
+            NSLog("[Type4Me] Failed to present setup wizard: open action not registered after retries")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.presentSetupWizard(remainingAttempts: remainingAttempts - 1)
+        }
+    }
 
     /// Present the permission guide window, activating the app and retrying
     /// until the SwiftUI scene registers its open action.
@@ -2369,7 +2626,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.presentPermissionGuide()
         }
     }
-
     /// Present the settings window from anywhere (URL command, Dock reopen,
     /// etc.). Uses the standard SwiftUI settings-open selector so it works
     /// even before the MenuBarExtra scene has registered `openSettingsAction`,
@@ -2431,13 +2687,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     #endif
 
+    /// Checks at launch, then keeps re-checking for as long as the app runs. A
+    /// menu bar app can go weeks without a relaunch, and a launch-only check would
+    /// leave a single snapshot from the day it started.
+    private func startDataBackupScheduler() {
+        backupSchedulerTask?.cancel()
+        // Off the main actor: copying the databases should never block the UI.
+        backupSchedulerTask = Task.detached(priority: .utility) {
+            await DataBackupScheduler.run()
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        hotkeyManager.stop()
         inputDeviceChangeObservers.forEach(NotificationCenter.default.removeObserver)
         inputDeviceChangeObservers.removeAll()
+
         recognitionEventContinuation?.finish()
         recognitionEventTask?.cancel()
         focusWakeupController?.stop()
         codexSessionIndexWatcher.stop()
+        backupSchedulerTask?.cancel()
         SystemVolumeManager.restore()
         // Synchronous kill: don't rely on async Task, app exits immediately after this returns
         SenseVoiceServerManager.killAllServerProcesses()
@@ -2538,7 +2808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestURLRecordingStop() {
-        recordingControlCoordinator.perform(.finish)
+        performStandardRecordingAction(.finish)
     }
 
     private func handleVocabularyURL(_ url: URL, acceptedSchemes: Set<String>) {

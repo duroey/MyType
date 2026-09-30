@@ -4,9 +4,9 @@ import AppKit
 // MARK: - Shared Style
 
 private enum SettingsFieldStyle {
-    static let textColor = NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1)
-    static let placeholderColor = NSColor(red: 0.42, green: 0.42, blue: 0.42, alpha: 1)
-    static let cursorColor = NSColor(red: 0.25, green: 0.25, blue: 0.25, alpha: 1)
+    static let textColor = NSColor(TF.settingsFieldText)
+    static let placeholderColor = NSColor(TF.settingsFieldPlaceholder)
+    static let cursorColor = NSColor(TF.settingsFieldCursor)
 
     /// Configure a bare NSTextField: transparent, no border, just text editing.
     static func applyCommon(to field: NSTextField, placeholder: String) {
@@ -44,6 +44,14 @@ private enum SettingsFieldStyle {
 // MARK: - NSTextField subclass (cursor color + no intrinsic width)
 
 private class SettingsNSTextField: NSTextField {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if let editor = currentEditor() as? NSTextView {
+            editor.textColor = SettingsFieldStyle.textColor
+            editor.insertionPointColor = SettingsFieldStyle.cursorColor
+        }
+    }
+
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: super.intrinsicContentSize.height)
     }
@@ -67,6 +75,14 @@ private class SettingsNSTextField: NSTextField {
 }
 
 private class SettingsNSSecureTextField: NSSecureTextField {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if let editor = currentEditor() as? NSTextView {
+            editor.textColor = SettingsFieldStyle.textColor
+            editor.insertionPointColor = SettingsFieldStyle.cursorColor
+        }
+    }
+
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: super.intrinsicContentSize.height)
     }
@@ -107,6 +123,7 @@ struct FixedWidthTextField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSTextField, context: Context) {
+        SettingsFieldStyle.applyCommon(to: nsView, placeholder: placeholder)
         if nsView.stringValue != text { nsView.stringValue = text }
     }
 
@@ -214,6 +231,7 @@ struct FixedWidthSecureField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSSecureTextField, context: Context) {
+        SettingsFieldStyle.applyCommon(to: nsView, placeholder: placeholder)
         if nsView.stringValue != text { nsView.stringValue = text }
     }
 

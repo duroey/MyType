@@ -2,7 +2,7 @@ import SwiftUI
 
 // MARK: - Navigation Item
 
-enum SettingsTab: String, CaseIterable, Identifiable {
+enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case general
     case askAnything
     case models
@@ -89,30 +89,25 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 @Observable
 final class AppNavigationModel {
     var selectedTab: SettingsTab = .general
+    var pendingModelCategory: ModelCategory?
     var pendingAskAnythingSessionID: UUID?
+    var pendingModeSelectionID: UUID?
 }
 
 // MARK: - Settings View
 
 struct SettingsView: View {
 
-    private enum PendingTransition {
-        case navigate(SettingsTab, afterCommit: (() -> Void)? = nil)
-        case closeWindow
-    }
 
     @Environment(AppState.self) private var appState
     @Environment(AppNavigationModel.self) private var navigationModel
     @State private var hoveredTab: SettingsTab?
-    @State private var hoveredSettingsTab: SettingsTab?
     @State private var draftCoordinator = SettingsDraftCoordinator()
     @State private var windowBox = WeakSettingsWindowBox()
-    @State private var pendingTransition: PendingTransition?
     @State private var isContentMounted = false
     @State private var bypassNextCloseGuard = false
+    @AppStorage(SettingsTheme.storageKey) private var settingsTheme = SettingsTheme.defaultValue.rawValue
     @AppStorage("tf_language") private var language = AppLanguage.systemDefault
-    @AppStorage(DebugSettingsAvailability.defaultsKey)
-    private var debugPanelEnabled = DebugSettingsAvailability.defaultEnabled
     #if HAS_CLOUD_SUBSCRIPTION
     @State private var showDeviceConflict = false
     @AppStorage("tf_app_edition") private var editionRaw: String?
@@ -149,46 +144,21 @@ struct SettingsView: View {
         }
         .id(language)
         .frame(minWidth: 900, minHeight: 600)
+        .settingsTooltipHost(.settings)
         .background(SettingsWindowConfigurator(
             windowBox: windowBox,
+            theme: SettingsTheme.resolve(settingsTheme),
             onVisibilityChanged: { isVisible in
                 isContentMounted = isVisible
             },
             onShouldClose: shouldCloseWindow
         ))
-        .preferredColorScheme(.light)
-        .alert(
-            L("未保存的更改", "Unsaved Changes"),
-            isPresented: Binding(
-                get: { pendingTransition != nil },
-                set: { if !$0 { pendingTransition = nil } }
-            )
-        ) {
-            Button(L("保存", "Save")) {
-                guard draftCoordinator.saveAll() else {
-                    let transition = pendingTransition
-                    pendingTransition = nil
-                    DispatchQueue.main.async { pendingTransition = transition }
-                    return
-                }
-                commitPendingTransition()
-            }
-            Button(L("放弃更改", "Discard"), role: .destructive) {
-                draftCoordinator.discardAll()
-                commitPendingTransition()
-            }
-            Button(L("取消", "Cancel"), role: .cancel) {
-                pendingTransition = nil
-            }
-        } message: {
-            Text(L("当前页面有未保存的更改。离开前要保存吗？",
-                   "This page has unsaved changes. Save before leaving?"))
-        }
+        .preferredColorScheme(SettingsTheme.resolve(settingsTheme).colorScheme)
         .onAppear {
             if VocabularyNavigationCenter.shared.hasPendingSettingsNavigation {
-                requestNavigation(to: .vocabulary) {
+                requestNavigation(to: .vocabulary, afterCommit: {
                     VocabularyNavigationCenter.shared.consumeSettingsNavigation()
-                }
+                })
             }
         }
         #if HAS_CLOUD_SUBSCRIPTION
@@ -217,26 +187,20 @@ struct SettingsView: View {
         }
         #endif
         .onReceive(NotificationCenter.default.publisher(for: .navigateToMode)) { note in
-            requestNavigation(to: .modes) {
-                if let modeId = note.object as? UUID {
-                    NotificationCenter.default.post(name: .selectMode, object: modeId)
-                }
-            }
+            let modeId = note.object as? UUID
+            requestNavigation(to: .modes, beforeCommit: {
+                navigationModel.pendingModeSelectionID = modeId
+            })
         }
         .onReceive(NotificationCenter.default.publisher(for: .navigateToHistory)) { _ in
             requestNavigation(to: .history)
         }
         .onReceive(NotificationCenter.default.publisher(for: .navigateToVocabulary)) { note in
-            requestNavigation(to: .vocabulary) {
+            requestNavigation(to: .vocabulary, afterCommit: {
                 if note.object is VocabularyNavigationRequest {
                     VocabularyNavigationCenter.shared.consumeSettingsNavigation()
                 }
-            }
-        }
-        .onChange(of: debugPanelEnabled) { _, isEnabled in
-            if !isEnabled && selectedTab == .debug {
-                requestNavigation(to: .preferences)
-            }
+            })
         }
     }
 
@@ -270,10 +234,10 @@ struct SettingsView: View {
 
             Spacer()
 
-            if debugPanelEnabled {
+            #if TYPE4ME_DEV_BUILD
                 navItem(.debug)
                     .padding(.horizontal, 10)
-            }
+            #endif
             #if HAS_CLOUD_SUBSCRIPTION
             if edition == .member {
                 navItem(.account)
@@ -313,7 +277,16 @@ struct SettingsView: View {
                 Text(tab.displayName)
                     .font(.system(size: 14, weight: isActive ? .semibold : .medium))
                     .foregroundStyle(TF.settingsText)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 Spacer()
+                if tab == .preferences {
+                    Text(AppBuildInfo.current.compactLabel)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(TF.settingsTextTertiary)
+                        .lineLimit(1)
+                }
                 if showBadge {
                     Circle()
                         .fill(.red)
@@ -333,7 +306,7 @@ struct SettingsView: View {
                     )
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SidebarNavButtonStyle())
         .onHover { isHovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 hoveredTab = isHovering ? tab : nil
@@ -353,27 +326,11 @@ struct SettingsView: View {
     }
 
     private var settingsSectionPicker: some View {
-        HStack(spacing: 2) {
-            ForEach(settingsSubtabs) { tab in
-                settingsSectionButton(tab)
-            }
-        }
-        .padding(4)
-        .background(
-            Capsule()
-                .fill(TF.settingsControl)
-        )
-        .fixedSize()
-        .padding(.bottom, 24)
-    }
-
-    private func settingsSectionButton(_ tab: SettingsTab) -> some View {
-        let isSelected = selectedTab == tab
-        let isHovered = hoveredSettingsTab == tab
-
-        return Button {
-            requestNavigation(to: tab)
-        } label: {
+        LiquidGlassTabPicker(
+            items: settingsSubtabs,
+            selection: selectedTab,
+            onSelectionChange: { requestNavigation(to: $0) }
+        ) { tab, isSelected, _ in
             HStack(spacing: 6) {
                 Image(systemName: tab.icon)
                     .font(.system(size: 10, weight: .semibold))
@@ -388,32 +345,9 @@ struct SettingsView: View {
             .foregroundStyle(isSelected ? TF.settingsText : TF.settingsTextSecondary)
             .padding(.horizontal, 16)
             .frame(height: 32)
-            .background(
-                Capsule().fill(
-                    isSelected
-                        ? Color.white
-                        : (isHovered
-                           ? TF.settingsControlHover
-                           : Color.clear)
-                )
-            )
-            .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
-        // Keep the selection-pill animation local to this control. Wrapping
-        // the navigation mutation in `withAnimation` animated the whole
-        // settings page replacement, including its otherwise unchanged header.
-        .animation(.easeInOut(duration: 0.16), value: isSelected)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.12)) {
-                hoveredSettingsTab = hovering ? tab : nil
-            }
-            if hovering {
-                NSCursor.pointingHand.set()
-            } else {
-                NSCursor.arrow.set()
-            }
-        }
+        .fixedSize()
+        .padding(.bottom, 24)
     }
 
     private var settingsHubHeader: some View {
@@ -431,17 +365,18 @@ struct SettingsView: View {
     private var content: some View {
         switch selectedTab {
         case .general:
-            ZStack {
+            ZStack(alignment: .bottomTrailing) {
                 HomeDottedWaveBackground()
                 tabPage {
                     HomeDashboardView(isActive: selectedTab == .general) { modeId in
-                        requestNavigation(to: .modes) {
-                            if let modeId {
-                                NotificationCenter.default.post(name: .selectMode, object: modeId)
-                            }
-                        }
+                        requestNavigation(to: .modes, beforeCommit: {
+                            navigationModel.pendingModeSelectionID = modeId
+                        })
                     }
                 }
+                FloatingModelAlertCards()
+                    .padding(.trailing, 28)
+                    .padding(.bottom, 24)
             }
         case .askAnything:
             fixedPage {
@@ -454,11 +389,11 @@ struct SettingsView: View {
         case .preferences, .appearance, .models, .modes, .about:
             settingsHubPage
         case .debug:
-            if debugPanelEnabled {
-                tabPage { DebugSettingsTab() }
-            } else {
-                settingsHubPage
-            }
+            #if TYPE4ME_DEV_BUILD
+            tabPage { DebugSettingsTab() }
+            #else
+            settingsHubPage
+            #endif
             #if HAS_CLOUD_SUBSCRIPTION
         case .account:
             tabPage { AccountTab() }
@@ -490,16 +425,16 @@ struct SettingsView: View {
         case .models:
             #if HAS_CLOUD_SUBSCRIPTION
             if edition != .member {
-                settingsScrollableContent {
-                    ModelSettingsTab(showsHeader: false, draftCoordinator: draftCoordinator)
-                }
+                ModelSettingsTab(showsHeader: false, draftCoordinator: draftCoordinator)
+                    .padding(.horizontal, 38)
+                    .padding(.bottom, 34)
             } else {
                 settingsScrollableContent { GeneralSettingsTab(showsHeader: false) }
             }
             #else
-            settingsScrollableContent {
-                ModelSettingsTab(showsHeader: false, draftCoordinator: draftCoordinator)
-            }
+            ModelSettingsTab(showsHeader: false, draftCoordinator: draftCoordinator)
+                .padding(.horizontal, 38)
+                .padding(.bottom, 34)
             #endif
         case .modes:
             ModesSettingsTab(showsHeader: false, draftCoordinator: draftCoordinator)
@@ -553,20 +488,31 @@ struct SettingsView: View {
 
     private func requestNavigation(
         to tab: SettingsTab,
+        beforeCommit: (() -> Void)? = nil,
         afterCommit: (() -> Void)? = nil
     ) {
         guard tab != selectedTab else {
+            beforeCommit?()
             afterCommit?()
             return
         }
         guard draftCoordinator.hasUnsavedChanges else {
-            commitNavigation(to: tab, afterCommit: afterCommit)
+            commitNavigation(to: tab, beforeCommit: beforeCommit, afterCommit: afterCommit)
             return
         }
-        pendingTransition = .navigate(tab, afterCommit: afterCommit)
+        draftCoordinator.confirmUnsavedChanges(on: windowBox.window) { result in
+            if result != .cancelled {
+                commitNavigation(to: tab, beforeCommit: beforeCommit, afterCommit: afterCommit)
+            }
+        }
     }
 
-    private func commitNavigation(to tab: SettingsTab, afterCommit: (() -> Void)?) {
+    private func commitNavigation(
+        to tab: SettingsTab,
+        beforeCommit: (() -> Void)?,
+        afterCommit: (() -> Void)?
+    ) {
+        beforeCommit?()
         selectedTab = tab
         if tab == .about {
             UpdateChecker.shared.markAsSeen(appState: appState)
@@ -586,21 +532,14 @@ struct SettingsView: View {
             isContentMounted = false
             return true
         }
-        pendingTransition = .closeWindow
-        return false
-    }
-
-    private func commitPendingTransition() {
-        guard let transition = pendingTransition else { return }
-        pendingTransition = nil
-        switch transition {
-        case .navigate(let tab, let afterCommit):
-            commitNavigation(to: tab, afterCommit: afterCommit)
-        case .closeWindow:
-            bypassNextCloseGuard = true
-            isContentMounted = false
-            windowBox.window?.performClose(nil)
+        draftCoordinator.confirmUnsavedChanges(on: windowBox.window) { [weak windowBox] result in
+            if result != .cancelled {
+                bypassNextCloseGuard = true
+                isContentMounted = false
+                windowBox?.window?.performClose(nil)
+            }
         }
+        return false
     }
 }
 
@@ -611,6 +550,7 @@ struct SettingsView: View {
 /// the native zoom button preserves macOS's hover tiling/full-screen menu.
 private struct SettingsWindowConfigurator: NSViewRepresentable {
     let windowBox: WeakSettingsWindowBox
+    let theme: SettingsTheme
     let onVisibilityChanged: @MainActor (Bool) -> Void
     let onShouldClose: @MainActor () -> Bool
 
@@ -643,12 +583,10 @@ private struct SettingsWindowConfigurator: NSViewRepresentable {
             guard let window = view.window else { return }
             coordinator.attach(to: window)
             window.isOpaque = true
-            window.backgroundColor = NSColor(
-                srgbRed: 1,
-                green: 1,
-                blue: 1,
-                alpha: 1
-            )
+            // Scope AppKit fields, title bar and attached sheets to this window.
+            // nil removes the override so system changes remain live.
+            window.appearance = theme.appearance
+            window.backgroundColor = NSColor(TF.settingsWindowBackground)
             window.titlebarAppearsTransparent = true
             // Only the native (transparent) title bar strip should move the window;
             // dragging elsewhere is reserved for in-content interactions like
@@ -945,7 +883,15 @@ struct SettingsRow: View {
 struct SettingsDivider: View {
     var body: some View {
         Rectangle()
-            .fill(Color.black.opacity(0.045))
+            .fill(TF.settingsInk.opacity(0.045))
             .frame(height: 1)
+    }
+}
+
+private struct SidebarNavButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+            .animation(.spring(response: 0.16, dampingFraction: 0.8), value: configuration.isPressed)
     }
 }

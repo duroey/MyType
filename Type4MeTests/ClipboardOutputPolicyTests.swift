@@ -55,21 +55,9 @@ final class ClipboardOutputPolicyTests: XCTestCase {
         }
     }
 
-    func testRestoringClipboardDoesNotReportClipboardFallback() {
-        XCTAssertEqual(
-            TextInjectionEngine.finalizeOutcome(
-                .copiedToClipboard,
-                retention: .restoreOriginal
-            ),
-            .notInserted
-        )
-        XCTAssertEqual(
-            TextInjectionEngine.finalizeOutcome(
-                .copiedToClipboard,
-                retention: .retainResult
-            ),
-            .copiedToClipboard
-        )
+    func testRestorePolicyDeterminesClipboardRestoration() {
+        XCTAssertTrue(TextInjectionEngine.shouldRestoreClipboard(retention: .restoreOriginal))
+        XCTAssertFalse(TextInjectionEngine.shouldRestoreClipboard(retention: .retainResult))
     }
 
     func testLegacyAlwaysCopyMigratesToAlwaysCopy() {
@@ -104,6 +92,34 @@ final class ClipboardOutputPolicyTests: XCTestCase {
         XCTAssertEqual(
             defaults.string(forKey: ClipboardOutputPolicy.storageKey),
             ClipboardOutputPolicy.cancelProcessed.rawValue
+        )
+    }
+
+    func testCancellationRetentionModeAndPolicyMapping() {
+        XCTAssertEqual(ClipboardOutputPolicy.alwaysCopy.cancellationMode, .processed)
+        XCTAssertEqual(ClipboardOutputPolicy.cancelProcessed.cancellationMode, .processed)
+        XCTAssertEqual(ClipboardOutputPolicy.cancelRawTranscript.cancellationMode, .raw)
+        XCTAssertEqual(ClipboardOutputPolicy.neverCopy.cancellationMode, .none)
+
+        XCTAssertEqual(
+            ClipboardOutputPolicy.policy(retainsNormal: true, cancellationMode: .processed),
+            .alwaysCopy
+        )
+        XCTAssertEqual(
+            ClipboardOutputPolicy.policy(retainsNormal: true, cancellationMode: .raw),
+            .alwaysCopy
+        )
+        XCTAssertEqual(
+            ClipboardOutputPolicy.policy(retainsNormal: false, cancellationMode: .processed),
+            .cancelProcessed
+        )
+        XCTAssertEqual(
+            ClipboardOutputPolicy.policy(retainsNormal: false, cancellationMode: .raw),
+            .cancelRawTranscript
+        )
+        XCTAssertEqual(
+            ClipboardOutputPolicy.policy(retainsNormal: false, cancellationMode: .none),
+            .neverCopy
         )
     }
 }

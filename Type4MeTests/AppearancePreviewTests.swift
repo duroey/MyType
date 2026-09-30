@@ -4,35 +4,62 @@ import XCTest
 @MainActor
 final class AppearancePreviewTests: XCTestCase {
 
-    // MARK: - FloatingBarPresentation Override & Fallback Tests
+    func testRecordingTheme_allCases() {
+        XCTAssertEqual(RecordingTheme.allCases.count, 2)
+        XCTAssertEqual(RecordingTheme.dark.rawValue, "dark")
+        XCTAssertEqual(RecordingTheme.light.rawValue, "light")
+        XCTAssertEqual(RecordingTheme.storageKey, "tf_recordingTheme")
+        XCTAssertEqual(RecordingTheme.defaultValue, .dark)
+
+        XCTAssertEqual(RecordingTheme.dark.displayName, L("暗色", "Dark"))
+        XCTAssertEqual(RecordingTheme.light.displayName, L("明亮", "Light"))
+    }
+
+    func testRecordingIndicatorStyle_allCases() {
+        XCTAssertEqual(RecordingIndicatorStyle.allCases.count, 2)
+        XCTAssertEqual(RecordingIndicatorStyle.regular.displayName, L("常规", "Regular"))
+        XCTAssertEqual(RecordingIndicatorStyle.compact.displayName, L("紧凑", "Compact"))
+    }
 
     func testFloatingBarPresentationInit() {
         let presentation = FloatingBarPresentation(
+            theme: .light,
             indicatorStyle: .regular,
             visualStyle: .voiceWave,
             showsLiveTranscript: false,
             enablesHoverTranscriptPreview: false,
             showsTooltips: false,
-            showsCancelButton: false
+            showsCancelButton: false,
+            showsModeName: true,
+            showsProviderName: true,
+            showsModelName: true
         )
 
+        XCTAssertEqual(presentation.theme, .light)
         XCTAssertEqual(presentation.indicatorStyle, .regular)
         XCTAssertEqual(presentation.visualStyle, .voiceWave)
         XCTAssertFalse(presentation.showsLiveTranscript)
         XCTAssertFalse(presentation.enablesHoverTranscriptPreview)
         XCTAssertFalse(presentation.showsTooltips)
         XCTAssertFalse(presentation.showsCancelButton)
+        XCTAssertTrue(presentation.showsModeName)
+        XCTAssertTrue(presentation.showsProviderName)
+        XCTAssertTrue(presentation.showsModelName)
         XCTAssertTrue(presentation.showsRecordingIndicator)
     }
 
     func testFloatingBarPresentation_defaults() {
         let presentation = FloatingBarPresentation()
+        XCTAssertEqual(presentation.theme, .dark)
         XCTAssertEqual(presentation.indicatorStyle, .regular)
         XCTAssertEqual(presentation.visualStyle, .siri)
         XCTAssertTrue(presentation.showsLiveTranscript)
         XCTAssertTrue(presentation.enablesHoverTranscriptPreview)
         XCTAssertTrue(presentation.showsTooltips)
         XCTAssertTrue(presentation.showsCancelButton)
+        XCTAssertTrue(presentation.showsModeName)
+        XCTAssertFalse(presentation.showsProviderName)
+        XCTAssertFalse(presentation.showsModelName)
         XCTAssertTrue(presentation.showsRecordingIndicator)
     }
 
@@ -43,11 +70,56 @@ final class AppearancePreviewTests: XCTestCase {
         XCTAssertTrue(AppearancePreferenceDefaults.showCancelButtonDefault)
     }
 
+    // MARK: - Optional Record Button
+
+    func testShowFinishButtonPreferenceDefaults() {
+        XCTAssertEqual(AppearancePreferenceDefaults.showFinishButtonKey, "tf_showFinishButton")
+        // Existing users must keep the control until they opt out.
+        XCTAssertTrue(AppearancePreferenceDefaults.showFinishButtonDefault)
+        XCTAssertTrue(FloatingBarPresentation().showsFinishButton)
+    }
+
+    func testFinishAndCancelButtonsHideIndependently() {
+        var presentation = FloatingBarPresentation()
+        presentation.showsFinishButton = false
+        XCTAssertFalse(presentation.showsFinishButton)
+        XCTAssertTrue(presentation.showsCancelButton)
+    }
+
+    /// The compact capsule is balanced only when the lanes on its two edges
+    /// match. With exactly one control visible the waveform sits off-centre —
+    /// which is the reason hiding the stop button exists, rather than saving
+    /// space. Regular is unaffected: its finish control is the metering orb and
+    /// is never hidden.
+    func testCompactWaveformIsCentredOnlyWhenBothEdgesMatch() {
+        func waveformCentreOffset(showsFinish: Bool, showsCancel: Bool) -> CGFloat {
+            let leading = showsFinish ? TF.compactIndicatorControlWidth : TF.recordingEdgeInset
+            let trailing = showsCancel ? TF.compactIndicatorControlWidth : TF.recordingEdgeInset
+            let waveform = TF.compactIndicatorWidth - leading - trailing
+            return (leading + waveform / 2) - TF.compactIndicatorWidth / 2
+        }
+
+        XCTAssertEqual(waveformCentreOffset(showsFinish: true, showsCancel: true), 0)
+        XCTAssertEqual(waveformCentreOffset(showsFinish: false, showsCancel: false), 0)
+
+        // Exactly one control skews the waveform by half the difference between
+        // a control lane and a bare edge inset.
+        let skew = (TF.compactIndicatorControlWidth - TF.recordingEdgeInset) / 2
+        XCTAssertEqual(waveformCentreOffset(showsFinish: true, showsCancel: false), skew)
+        XCTAssertEqual(waveformCentreOffset(showsFinish: false, showsCancel: true), -skew)
+        XCTAssertEqual(skew, 11)
+    }
+
+    func testRecordingMetadataDisplayPreferenceDefaults() {
+        XCTAssertTrue(RecordingMetadataDisplayPreference.showModeNameDefault)
+        XCTAssertFalse(RecordingMetadataDisplayPreference.showProviderNameDefault)
+        XCTAssertFalse(RecordingMetadataDisplayPreference.showModelNameDefault)
+    }
+
     func testRecordingChromeWidthDesignTokens() {
-        // Dual-button chrome: Finish(45) + Cancel(35) + LeadingInset(5) + TrailingInset(10) + Gap*2(16) + Safety(16) = 127
-        XCTAssertEqual(TF.recordingChromeWidth, 127)
-        // Single-button chrome: Finish(45) + LeadingInset(5) + TrailingInset(10) + Gap(8) + Safety(16) = 84
-        XCTAssertEqual(TF.recordingSingleButtonChromeWidth, 84)
+        // Fixed control chrome; the view adds the inset for its trailing boundary.
+        XCTAssertEqual(TF.recordingChromeWidth, 111)
+        XCTAssertEqual(TF.recordingSingleButtonChromeWidth, 68)
         // Difference is exactly one cancel control size (35) plus one control gap (8)
         XCTAssertEqual(
             TF.recordingChromeWidth - TF.recordingSingleButtonChromeWidth,
@@ -248,6 +320,91 @@ final class AppearancePreviewTests: XCTestCase {
         demoState.stop()
     }
 
+    // MARK: - Compact Live Transcript Tests
+
+    func testCompactTranscriptOffset() {
+        // Text fits comfortably inside viewport: no offset (leading aligned)
+        XCTAssertEqual(compactTranscriptOffset(textWidth: 0, viewportWidth: 164), 0)
+        XCTAssertEqual(compactTranscriptOffset(textWidth: 80, viewportWidth: 164), 0)
+        // Exactly at viewport boundary: no offset
+        XCTAssertEqual(compactTranscriptOffset(textWidth: 164, viewportWidth: 164), 0)
+        // Text overflows viewport: negative offset aligns text tail to right edge
+        XCTAssertEqual(compactTranscriptOffset(textWidth: 190, viewportWidth: 164), -26)
+        XCTAssertEqual(compactTranscriptOffset(textWidth: 300, viewportWidth: 164), -136)
+    }
+
+    func testCompactLiveTranscriptDesignTokens() {
+        XCTAssertEqual(TF.compactIndicatorWidth, 180)
+        XCTAssertEqual(TF.compactIndicatorHeight, 24)
+        XCTAssertEqual(TF.compactTranscriptLaneHeight, 24)
+        XCTAssertEqual(TF.compactTranscriptExpandedHeight, 48)
+        XCTAssertEqual(TF.compactTranscriptFontSize, 12)
+        XCTAssertEqual(TF.compactTranscriptCornerRadius, 10)
+        XCTAssertEqual(TF.compactTranscriptHorizontalInset, 8)
+        XCTAssertEqual(TF.compactTranscriptLeadingFadeWidth, 10)
+
+        // Viewport width arithmetic contract
+        let viewportWidth = TF.compactIndicatorWidth - TF.compactTranscriptHorizontalInset * 2
+        XCTAssertEqual(viewportWidth, 164)
+
+        // Height arithmetic contract
+        XCTAssertEqual(
+            TF.compactTranscriptLaneHeight + TF.compactIndicatorHeight,
+            TF.compactTranscriptExpandedHeight
+        )
+    }
+
+    func testFloatingBarPresentation_compactLiveTranscriptSupport() {
+        let compactLiveOn = FloatingBarPresentation(
+            indicatorStyle: .compact,
+            showsLiveTranscript: true
+        )
+        XCTAssertEqual(compactLiveOn.indicatorStyle, .compact)
+        XCTAssertTrue(compactLiveOn.showsLiveTranscript)
+
+        let compactLiveOff = FloatingBarPresentation(
+            indicatorStyle: .compact,
+            showsLiveTranscript: false
+        )
+        XCTAssertEqual(compactLiveOff.indicatorStyle, .compact)
+        XCTAssertFalse(compactLiveOff.showsLiveTranscript)
+    }
+
+    func testFloatingBarPresentation_switchingStylesPreservesCorrectPreferences() {
+        var presentation = FloatingBarPresentation(
+            indicatorStyle: .compact,
+            showsLiveTranscript: true
+        )
+        XCTAssertEqual(presentation.indicatorStyle, .compact)
+        XCTAssertTrue(presentation.showsLiveTranscript)
+
+        // Switch to regular
+        presentation.indicatorStyle = .regular
+        XCTAssertEqual(presentation.indicatorStyle, .regular)
+        XCTAssertTrue(presentation.showsLiveTranscript)
+
+        // Switch live transcript off
+        presentation.showsLiveTranscript = false
+        XCTAssertFalse(presentation.showsLiveTranscript)
+    }
+
+    func testFloatingBarPanelLayout_fallbackWithLiveTranscript() {
+        let compactLiveOn = FloatingBarPanelLayout.fallback(for: .compact, showsLiveTranscript: true)
+        XCTAssertEqual(compactLiveOn.contentSize, NSSize(width: TF.barWidthCompact, height: TF.compactTranscriptExpandedHeight))
+        XCTAssertEqual(compactLiveOn.capsuleSize, NSSize(width: TF.barWidthCompact, height: TF.compactTranscriptExpandedHeight))
+        XCTAssertEqual(compactLiveOn.panelSize, NSSize(width: 196, height: 64))
+
+        let compactLiveOff = FloatingBarPanelLayout.fallback(for: .compact, showsLiveTranscript: false)
+        XCTAssertEqual(compactLiveOff.contentSize, NSSize(width: TF.barWidthCompact, height: TF.compactIndicatorHeight))
+        XCTAssertEqual(compactLiveOff.capsuleSize, NSSize(width: TF.barWidthCompact, height: TF.compactIndicatorHeight))
+        XCTAssertEqual(compactLiveOff.panelSize, NSSize(width: 196, height: 40))
+
+        let regular = FloatingBarPanelLayout.fallback(for: .regular)
+        XCTAssertEqual(regular.contentSize, NSSize(width: TF.barWidthCompact, height: TF.barHeight))
+        XCTAssertEqual(regular.capsuleSize, NSSize(width: TF.barWidthCompact, height: TF.barHeight))
+        XCTAssertEqual(regular.panelSize, NSSize(width: 196, height: 71))
+    }
+
     // MARK: - SettingsTab Appearance Tests
 
     func testSettingsTab_appearanceProperties() {
@@ -257,5 +414,17 @@ final class AppearancePreviewTests: XCTestCase {
         XCTAssertFalse(tab.displayName.isEmpty)
         XCTAssertFalse(tab.subtitle.isEmpty)
         XCTAssertTrue(SettingsTab.allCases.contains(.appearance))
+    }
+
+    // MARK: - Recording Glass Contrast
+
+    /// Native Liquid Glass samples the host application's backdrop, so a light
+    /// capsule over a dark page renders dark while its near-black foreground
+    /// colours stay put. Both themes must therefore carry a contrast floor.
+    func testGlassContrastFloors_areSetForBothThemes() {
+        XCTAssertGreaterThan(TF.glassLightContrastFloor, 0.5)
+        XCTAssertLessThan(TF.glassLightContrastFloor, 1.0)
+        XCTAssertGreaterThan(TF.glassDarkContrastFloor, 0.5)
+        XCTAssertLessThan(TF.glassDarkContrastFloor, 1.0)
     }
 }

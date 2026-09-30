@@ -10,6 +10,7 @@ enum AudioKeepAliveManager {
     private static let queue = DispatchQueue(label: "com.mytype.keepalive.mic", qos: .background)
 
     nonisolated(unsafe) private static var micSession: AVCaptureSession?
+    nonisolated(unsafe) private static var micDeviceUID: String?
 
     // MARK: - Public
 
@@ -47,21 +48,27 @@ enum AudioKeepAliveManager {
             micKeepAliveEnabled: micKeepAliveEnabled,
             focusWakeupEnabled: focusWakeupEnabled
         )
+        let targetDevice = enabled ? AudioInputDevicePreferenceStore.cachedKeepAliveInputDevice() : nil
         queue.async {
-            if enabled { startMic() } else { stopMic() }
+            if let targetDevice {
+                startMic(deviceUID: targetDevice.uid)
+            } else {
+                stopMic()
+            }
         }
     }
 
     // MARK: - Microphone
 
-    private static func startMic() {
-        guard micSession == nil else { return }
+    private static func startMic(deviceUID: String) {
+        if micSession != nil, micDeviceUID == deviceUID { return }
+        stopMic()
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             logger.warning("Mic keep-alive skipped: no permission")
             return
         }
-        guard let device = AVCaptureDevice.default(for: .audio) else {
-            logger.warning("Mic keep-alive skipped: no input device")
+        guard let device = AVCaptureDevice(uniqueID: deviceUID) else {
+            logger.warning("Mic keep-alive skipped: selected input device is unavailable")
             return
         }
 
@@ -78,7 +85,8 @@ enum AudioKeepAliveManager {
 
             session.startRunning()
             micSession = session
-            logger.info("Mic keep-alive started")
+            micDeviceUID = deviceUID
+            logger.info("Mic keep-alive started for selected Bluetooth input")
         } catch {
             logger.error("Mic keep-alive failed: \(error.localizedDescription)")
         }
@@ -88,6 +96,7 @@ enum AudioKeepAliveManager {
         guard let session = micSession else { return }
         session.stopRunning()
         micSession = nil
+        micDeviceUID = nil
         logger.info("Mic keep-alive stopped")
     }
 }

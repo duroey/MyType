@@ -160,9 +160,23 @@ actor VolcASRClient: SpeechRecognizer {
         if let existing = _events {
             return existing
         }
+        return installFreshEventStream()
+    }
+
+    /// Bumped every time the stream is replaced. A handle taken at one
+    /// generation stops receiving once a newer one exists, which is why
+    /// `connect` must run before the caller reads `events`.
+    private(set) var eventStreamGeneration = 0
+
+    /// Replaces the event stream and returns the new one. `connect` calls this
+    /// so each session starts clean; anything already holding the old handle is
+    /// left on a stream that will never receive again.
+    @discardableResult
+    func installFreshEventStream() -> AsyncStream<RecognitionEvent> {
         let (stream, continuation) = AsyncStream<RecognitionEvent>.makeStream()
         self.eventContinuation = continuation
         self._events = stream
+        self.eventStreamGeneration += 1
         return stream
     }
 
@@ -174,9 +188,7 @@ actor VolcASRClient: SpeechRecognizer {
         }
 
         // Ensure fresh event stream
-        let (stream, continuation) = AsyncStream<RecognitionEvent>.makeStream()
-        self.eventContinuation = continuation
-        self._events = stream
+        installFreshEventStream()
 
         let connectId = UUID().uuidString
         let isCloudProxy = options.cloudProxyURL != nil
@@ -202,6 +214,12 @@ actor VolcASRClient: SpeechRecognizer {
 
         // Send full_client_request (no compression, plain JSON)
         let payload = VolcProtocol.buildClientRequest(uid: volcConfig.uid, options: options)
+        let hasBoostingTable = !(options.boostingTableID ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let inlineHotwordCount = hasBoostingTable ? 0 : VolcProtocol.inlineHotwords(options.hotwords).count
+        DebugFileLogger.log(
+            "volc hotwords field=\(hasBoostingTable ? "corpus.boosting_table_id" : "corpus.context") inline=\(inlineHotwordCount) configured=\(options.hotwords.count)"
+        )
 
         let header = VolcHeader(
             messageType: .fullClientRequest,
@@ -242,6 +260,71 @@ actor VolcASRClient: SpeechRecognizer {
 
         // Start receive loop
         startReceiveLoop()
+    }
+
+    /// How long a credential test stays on the line waiting for the server's
+    /// verdict on the init request.
+    private static let credentialProbeWindow = Duration.seconds(2)
+
+    /// 0.2s of 16 kHz mono 16-bit silence — the same amount that made the server
+    /// return the quota verdict in issue #290. The init request alone was never
+    /// shown to be enough to make it decide.
+    private static let credentialProbeSilenceBytes = 6400
+
+    /// Opening the socket only proves the endpoint and handshake are healthy.
+    /// Volcengine reports quota, billing and rate-limit problems in a frame it
+    /// sends after the init request, so a test that connects and immediately
+    /// disconnects reports "Connected" for an account that cannot transcribe a
+    /// single word (issue #290). This stays connected long enough to hear that
+    /// verdict, and treats silence as success.
+    static func validateCredentials(
+        config: any ASRProviderConfig,
+        options: ASRRequestOptions
+    ) async throws {
+        let client = VolcASRClient()
+        try await client.connect(config: config, options: options)
+        // Read the stream only after connecting. `connect` installs a fresh
+        // continuation, so a handle taken before it is one the receive loop has
+        // already replaced — the verdict would be delivered to a stream nobody
+        // is reading and the probe would time out reporting success. Events the
+        // server sends before iteration begins are buffered by the stream, so
+        // reading late loses nothing.
+        let events = await client.events
+
+        // Give the server something to judge. #290's quota error arrived only
+        // after audio was sent, so an init-only probe may never draw a verdict.
+        try? await client.sendAudio(Data(count: Self.credentialProbeSilenceBytes))
+
+        let serverError = await firstServerError(in: events, within: Self.credentialProbeWindow)
+        await client.disconnect()
+        if let serverError { throw serverError }
+    }
+
+    /// Returns the first `.error` the stream produces, or nil if the stream ends
+    /// or the window elapses first.
+    ///
+    /// Silence is treated as success: the server says nothing when the request
+    /// is accepted, so waiting longer would only slow down a healthy test.
+    static func firstServerError(
+        in events: AsyncStream<RecognitionEvent>,
+        within window: Duration
+    ) async -> Error? {
+        await withTaskGroup(of: Error?.self) { group in
+            group.addTask {
+                for await event in events {
+                    if case .error(let error) = event { return error }
+                    if case .completed = event { return nil }
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(for: window)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 
     /// When WebSocket handshake is rejected, make a plain HTTPS request to get the actual error body.
@@ -400,17 +483,35 @@ actor VolcASRClient: SpeechRecognizer {
 
             // Server error (0xF): could be a real error or just
             // bigmodel_async's "session complete" signal.
+            //
+            // Whether the server is reporting a problem has nothing to do with
+            // how much audio we happened to send, so the two are told apart by
+            // what the frame actually carries. Gating on `audioPacketCount`
+            // turned every mid-session error into a silent stop (issue #290:
+            // an exhausted quota looked exactly like a normal short recording).
             if msgType == 0x0F {
-                if audioPacketCount == 0 {
-                    // No audio was sent yet — this is a real setup/auth error.
-                    do {
-                        _ = try VolcProtocol.decodeServerResponse(data)
-                    } catch {
-                        NSLog("[ASR] Server error: %@", String(describing: error))
-                        emitEvent(.error(error))
-                    }
+                let extracted = VolcProtocol.extractServerError(data)
+                if extracted.code != nil || extracted.message != nil {
+                    let error = VolcProtocolError.serverError(
+                        code: extracted.code,
+                        message: extracted.message
+                    )
+                    NSLog(
+                        "[ASR] Server error after %d audio packets: %@",
+                        audioPacketCount,
+                        String(describing: error)
+                    )
+                    emitEvent(.error(error))
                 } else {
+                    // Nothing readable in the frame, so this is taken as the
+                    // async session-complete signal. Record it: if a report of
+                    // a hidden error ever survives this change, the bytes here
+                    // are what identify the real layout.
                     NSLog("[ASR] Session ended by server after %d audio packets", audioPacketCount)
+                    DebugFileLogger.log(
+                        "Volc 0x0F frame with no readable error, \(data.count)B: "
+                            + data.prefix(64).map { String(format: "%02x", $0) }.joined()
+                    )
                 }
                 emitEvent(.completed)
                 // The server has already ended the logical session. A graceful

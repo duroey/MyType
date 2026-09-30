@@ -47,7 +47,9 @@ final class PermissionDragPanel: NSPanel {
 private struct PermissionDragOverlayView: View {
 
     let appName: String
-    let permissionName: String
+    @AppStorage(SettingsTheme.storageKey) private var settingsTheme = SettingsTheme.defaultValue.rawValue
+    @AppStorage("tf_language") private var language = AppLanguage.systemDefault
+    private var permissionName: String { L("辅助功能", "Accessibility") }
     let iconImage: NSImage
 
     /// Outer padding reserved for the drop shadow. Must be matched by the
@@ -59,11 +61,11 @@ private struct PermissionDragOverlayView: View {
             // Match Settings window cream background; soft shadow clipped to
             // the shape so nothing spills past the rounded corners.
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(TF.settingsBg)
-                .shadow(color: .black.opacity(0.18), radius: 22, x: 0, y: 10)
+                .fill(TF.settingsWindowBackground)
+                .shadow(color: .black.opacity(0.10), radius: 14, x: 0, y: 5)
                 .overlay(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(TF.settingsCardAlt, lineWidth: 1)
+                        .strokeBorder(TF.settingsBorder, lineWidth: 0.5)
                 )
 
             VStack(alignment: .leading, spacing: 10) {
@@ -72,7 +74,7 @@ private struct PermissionDragOverlayView: View {
                 HStack(alignment: .center, spacing: 10) {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 20, weight: .heavy))
-                        .foregroundStyle(TF.settingsAccentAmber)
+                        .foregroundStyle(TF.settingsTextSecondary)
 
                     instructionText
                         .font(.system(size: 12))
@@ -90,7 +92,8 @@ private struct PermissionDragOverlayView: View {
             .padding(.vertical, 12)
         }
         .padding(Self.shadowInset)
-        .preferredColorScheme(.light)
+        .preferredColorScheme(SettingsTheme.resolve(settingsTheme).colorScheme)
+        .id(language)
     }
 
     /// Builds "拖 mytype 到上方列表以允许辅助功能" with the app and permission
@@ -100,6 +103,7 @@ private struct PermissionDragOverlayView: View {
         + Text(appName).fontWeight(.semibold)
         + Text(L(" 到上方列表以允许", " to the list above to allow "))
         + Text(permissionName).fontWeight(.semibold)
+        + Text(L("，并开启开关", ", then turn it on"))
     }
 
     private var dragChip: some View {
@@ -119,13 +123,14 @@ private struct PermissionDragOverlayView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(TF.settingsCardAlt)
+                .fill(TF.settingsControl)
         )
         // Attaching `onDrag` here makes the whole chip a drag source — the
         // explicit "grab-me" surface Codex relies on. The pasteboard writes
         // the live `mytype.app` bundle URL so the target (System Settings
         // Accessibility list) gets a real file-URL drop, which TCC treats
         // the same as the "+" button's file-picker result.
+        .accessibilityLabel(L("拖动 mytype 到辅助功能列表", "Drag mytype into the Accessibility list"))
         .onDrag {
             let provider = NSItemProvider()
             let url = Bundle.main.bundleURL as NSURL
@@ -156,22 +161,20 @@ final class PermissionDragOverlayController {
     private var panel: PermissionDragPanel?
     private var followTimer: Timer?
     private var permissionPollTimer: Timer?
+    private var timeoutTimer: Timer?
     private var onGranted: (() -> Void)?
-
     /// Show the overlay pinned to the System Settings window.
     ///
     /// - Parameters:
     ///   - appName: Name shown in the instruction and on the drag chip.
-    ///   - permissionName: Name of the permission being requested, used to
-    ///     complete the "Drag X to list above to allow Y" sentence.
     ///   - onGranted: Called once `AXIsProcessTrusted()` flips to true.
-    func show(appName: String, permissionName: String, onGranted: @escaping () -> Void) {
+    func show(appName: String, onGranted: @escaping () -> Void) {
         dismiss()
         self.onGranted = onGranted
 
         // Outer panel size includes transparent margin reserved for the drop
         // shadow; the opaque card is `contentSize` inside that margin.
-        let contentSize = NSSize(width: 340, height: 120)
+        let contentSize = NSSize(width: 380, height: 140)
         let inset = PermissionDragOverlayView.shadowInset
         let panelSize = NSSize(
             width: contentSize.width + inset * 2,
@@ -181,7 +184,6 @@ final class PermissionDragOverlayController {
 
         let rootView = PermissionDragOverlayView(
             appName: appName,
-            permissionName: permissionName,
             iconImage: iconImage
         )
         let hosting = NSHostingView(rootView: rootView)
@@ -207,7 +209,9 @@ final class PermissionDragOverlayController {
         // is actively dragging the System Settings window, macOS puts the
         // main runloop into `.eventTracking` mode, and a default-mode timer
         // would pause exactly when we need it most. `.common` fires in both.
-        let followInterval: TimeInterval = 1.0 / 60.0
+        // Follow System Settings window motion at a throttled ~10Hz (100ms) interval
+        // to avoid saturating WindowServer IPC with high-frequency CGWindowList queries.
+        let followInterval: TimeInterval = 0.1
         let follow = Timer(timeInterval: followInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.reposition()
@@ -222,6 +226,13 @@ final class PermissionDragOverlayController {
                 self?.checkGranted()
             }
         }
+
+        // Auto-dismiss safety watchdog after 60 seconds of inactivity
+        timeoutTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.dismiss()
+            }
+        }
     }
 
     func dismiss() {
@@ -229,6 +240,8 @@ final class PermissionDragOverlayController {
         followTimer = nil
         permissionPollTimer?.invalidate()
         permissionPollTimer = nil
+        timeoutTimer?.invalidate()
+        timeoutTimer = nil
         panel?.orderOut(nil)
         panel = nil
         onGranted = nil

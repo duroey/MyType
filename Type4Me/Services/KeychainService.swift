@@ -19,15 +19,42 @@ enum KeychainService {
             credentialsURL: nil,
             usesKeychain: true
         )
+
+        /// Default for XCTest runs that do not request their own isolated namespace.
+        /// `credentialsURL` stays nil so it resolves inside the test profile directory.
+        static let xctestDefault = StorageConfiguration(
+            scalarService: "com.mytype.tests.scalar",
+            groupedService: "com.mytype.tests.grouped",
+            legacyScalarService: "com.mytype.tests.legacy.scalar",
+            legacyGroupedService: "com.mytype.tests.legacy.grouped",
+            credentialsURL: nil,
+            usesKeychain: false
+        )
     }
 
     private static let lock = NSLock()
     private static var cachedCredentials: [String: Any]?
 
+    #if DEBUG
+    private static let runningUnderXCTest: Bool = {
+        let process = ProcessInfo.processInfo
+        let processName = process.processName.lowercased()
+        return process.environment["XCTestConfigurationFilePath"] != nil
+            || processName == "xctest"
+            || processName.hasSuffix("packagetests")
+            || (CommandLine.arguments.first?.contains(".xctest") == true)
+    }()
+    #else
+    /// Release builds contain no XCTest routing and always use production storage.
+    private static let runningUnderXCTest = false
+    #endif
+
     private static var testingStorageConfiguration: StorageConfiguration?
 
+    /// Explicit per-test isolation wins; any other XCTest run falls back to a
+    /// file-backed namespace so a test can never reach production credentials.
     private static var activeStorageConfiguration: StorageConfiguration {
-        testingStorageConfiguration ?? .production
+        testingStorageConfiguration ?? (runningUnderXCTest ? .xctestDefault : .production)
     }
 
     private static var keychainScalarService: String {
@@ -57,7 +84,7 @@ enum KeychainService {
 
     /// Indicates whether credential operations are redirected away from production storage.
     static var isUsingTestStorage: Bool {
-        testingStorageConfiguration != nil
+        testingStorageConfiguration != nil || runningUnderXCTest
     }
 
     /// Redirects credential reads and writes to an isolated namespace for tests.
@@ -160,6 +187,7 @@ enum KeychainService {
             UserDefaults.standard.set(newValue.rawValue, forKey: selectedProviderKey)
             guard previous != newValue else { return }
             NotificationCenter.default.post(name: .asrProviderDidChange, object: newValue)
+            NotificationCenter.default.post(name: .credentialsDidChange, object: nil)
         }
     }
 
@@ -189,22 +217,28 @@ enum KeychainService {
 
     static func saveASRCredentials(for provider: ASRProvider, values: [String: String]) throws {
         lock.lock()
-        defer { lock.unlock() }
-        var dict = _loadAllUnlocked()
-        let storageKey = asrStorageKey(for: provider)
-        let split = splitCredentials(values, using: ASRProviderRegistry.configType(for: provider)?.credentialFields ?? [])
-        if split.secure.isEmpty {
-            try deleteSecureValueCheckingKeychain(service: keychainGroupedService, account: storageKey)
-        } else {
-            try saveSecureValues(split.secure, account: storageKey)
+        do {
+            var dict = _loadAllUnlocked()
+            let storageKey = asrStorageKey(for: provider)
+            let split = splitCredentials(values, using: ASRProviderRegistry.configType(for: provider)?.credentialFields ?? [])
+            if split.secure.isEmpty {
+                try deleteSecureValueCheckingKeychain(service: keychainGroupedService, account: storageKey)
+            } else {
+                try saveSecureValues(split.secure, account: storageKey)
+            }
+            if split.plaintext.isEmpty {
+                dict.removeValue(forKey: storageKey)
+            } else {
+                dict[storageKey] = split.plaintext
+            }
+            try saveAll(dict)
+            cachedCredentials = dict
+            lock.unlock()
+        } catch {
+            lock.unlock()
+            throw error
         }
-        if split.plaintext.isEmpty {
-            dict.removeValue(forKey: storageKey)
-        } else {
-            dict[storageKey] = split.plaintext
-        }
-        try saveAll(dict)
-        cachedCredentials = dict
+        NotificationCenter.default.post(name: .credentialsDidChange, object: nil)
     }
 
     static func loadASRCredentials(for provider: ASRProvider) -> [String: String]? {
@@ -318,7 +352,10 @@ enum KeychainService {
             return provider
         }
         set {
+            let previous = selectedLLMProvider
             UserDefaults.standard.set(newValue.rawValue, forKey: selectedLLMProviderKey)
+            guard previous != newValue else { return }
+            NotificationCenter.default.post(name: .credentialsDidChange, object: nil)
         }
     }
 
@@ -330,22 +367,28 @@ enum KeychainService {
 
     static func saveLLMCredentials(for provider: LLMProvider, values: [String: String]) throws {
         lock.lock()
-        defer { lock.unlock() }
-        var dict = _loadAllUnlocked()
-        let storageKey = llmStorageKey(for: provider)
-        let split = splitCredentials(values, using: LLMProviderRegistry.configType(for: provider)?.credentialFields ?? [])
-        if split.secure.isEmpty {
-            try deleteSecureValueCheckingKeychain(service: keychainGroupedService, account: storageKey)
-        } else {
-            try saveSecureValues(split.secure, account: storageKey)
+        do {
+            var dict = _loadAllUnlocked()
+            let storageKey = llmStorageKey(for: provider)
+            let split = splitCredentials(values, using: LLMProviderRegistry.configType(for: provider)?.credentialFields ?? [])
+            if split.secure.isEmpty {
+                try deleteSecureValueCheckingKeychain(service: keychainGroupedService, account: storageKey)
+            } else {
+                try saveSecureValues(split.secure, account: storageKey)
+            }
+            if split.plaintext.isEmpty {
+                dict.removeValue(forKey: storageKey)
+            } else {
+                dict[storageKey] = split.plaintext
+            }
+            try saveAll(dict)
+            cachedCredentials = dict
+            lock.unlock()
+        } catch {
+            lock.unlock()
+            throw error
         }
-        if split.plaintext.isEmpty {
-            dict.removeValue(forKey: storageKey)
-        } else {
-            dict[storageKey] = split.plaintext
-        }
-        try saveAll(dict)
-        cachedCredentials = dict
+        NotificationCenter.default.post(name: .credentialsDidChange, object: nil)
     }
 
     static func loadLLMCredentials(for provider: LLMProvider) -> [String: String]? {
@@ -388,10 +431,14 @@ enum KeychainService {
     }
 
     static func loadLLMProviderConfig(for provider: LLMProvider) -> (any LLMProviderConfig)? {
-        guard let values = loadLLMCredentials(for: provider),
-              let configType = LLMProviderRegistry.configType(for: provider)
-        else { return nil }
-        return configType.init(credentials: values)
+        guard let configType = LLMProviderRegistry.configType(for: provider) else { return nil }
+        if let values = loadLLMCredentials(for: provider) {
+            return configType.init(credentials: values)
+        }
+        if provider == .codexCLI {
+            return configType.init(credentials: ["model": "gpt-5.6-luna"])
+        }
+        return nil
     }
 
     /// Load config for the currently selected LLM provider.
@@ -1055,7 +1102,7 @@ enum KeychainService {
         let fm = FileManager.default
         let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let oldDir = appSupport.appendingPathComponent("TypeFlow", isDirectory: true)
-        let newDir = AppIdentity.appSupportDirectory()
+        let newDir = appSupport.appendingPathComponent(AppDataLocation.profileDirectoryName, isDirectory: true)
 
         // Old directory must exist and contain real data (credentials.json is the marker)
         guard fm.fileExists(atPath: oldDir.appendingPathComponent("credentials.json").path) else { return }

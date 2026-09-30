@@ -10,15 +10,21 @@ actor DoubaoChatClient: LLMClient {
 
     init(
         provider: LLMProvider = .doubao,
-        bypassProxy: Bool = ProxyBypassMode.current.bypassLLM
+        bypassProxy: Bool = ProxyBypassMode.current.bypassLLM,
+        customSession: URLSession? = nil
     ) {
         self.provider = provider
-        let resources = LLMURLSessionFactory.make(
-            providerID: provider.rawValue,
-            bypassProxy: bypassProxy
-        )
-        session = resources.session
-        metricsDelegate = resources.metricsDelegate
+        if let customSession {
+            session = customSession
+            metricsDelegate = LLMURLSessionMetricsDelegate(providerID: provider.rawValue)
+        } else {
+            let resources = LLMURLSessionFactory.make(
+                providerID: provider.rawValue,
+                bypassProxy: bypassProxy
+            )
+            session = resources.session
+            metricsDelegate = resources.metricsDelegate
+        }
     }
 
     /// Pre-establish TCP+TLS connection so the first real request skips handshake.
@@ -37,10 +43,35 @@ actor DoubaoChatClient: LLMClient {
 
     /// Process text through Doubao ARK API (OpenAI-compatible streaming).
     /// Returns the full LLM response as a single string.
-    func process(text: String, prompt: String, config: LLMConfig) async throws -> String {
+    func process(
+        text: String,
+        prompt: String,
+        config: LLMConfig,
+        inputBoundary: LLMInputBoundary
+    ) async throws -> String {
+        try await process(
+            text: text,
+            prompt: prompt,
+            config: config,
+            inputBoundary: inputBoundary,
+            invocationContext: nil
+        )
+    }
+
+    func process(
+        text: String,
+        prompt: String,
+        config: LLMConfig,
+        inputBoundary: LLMInputBoundary,
+        invocationContext: LLMInvocationContext?
+    ) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return text }
-        let finalPrompt = prompt.replacingOccurrences(of: "{text}", with: trimmedText)
+        let preparedPrompt = LLMPreparedPrompt.make(
+            text: trimmedText,
+            prompt: prompt,
+            inputBoundary: inputBoundary
+        )
 
         guard let url = URL(string: "\(config.baseURL)/chat/completions") else {
             throw LLMError.invalidURL
@@ -56,8 +87,9 @@ actor DoubaoChatClient: LLMClient {
         let disableField = disableThinking ? provider.thinkingDisableField(for: config.model) : nil
         let body = ChatRequest(
             model: config.model,
-            messages: [ChatMessage(role: "user", content: finalPrompt)],
+            messages: chatMessages(for: preparedPrompt),
             stream: true,
+            stream_options: StreamOptions(include_usage: true),
             thinking: disableField == .thinking ? ThinkingConfig(type: "disabled") : nil,
             enable_thinking: disableField == .enableThinking ? false : nil,
             reasoning: disableField == .reasoning ? ReasoningConfig(effort: "none") : nil,
@@ -68,8 +100,7 @@ actor DoubaoChatClient: LLMClient {
         request.httpBody = try JSONEncoder().encode(body)
 
         logger.info("LLM request: \(text.count) chars, endpoint=\(config.model), stream=true")
-
-        let result = try await streamChat(request: request, model: config.model)
+        let result = try await streamChat(request: request, model: config.model, sourceText: text, invocationContext: invocationContext)
 
         logger.info("LLM result: \(result.count) chars")
         return result.strippingThinkTags()
@@ -79,11 +110,34 @@ actor DoubaoChatClient: LLMClient {
         text: String,
         prompt: String,
         config: LLMConfig,
+        inputBoundary: LLMInputBoundary,
+        onDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
+        try await processStreaming(
+            text: text,
+            prompt: prompt,
+            config: config,
+            inputBoundary: inputBoundary,
+            invocationContext: nil,
+            onDelta: onDelta
+        )
+    }
+
+    func processStreaming(
+        text: String,
+        prompt: String,
+        config: LLMConfig,
+        inputBoundary: LLMInputBoundary,
+        invocationContext: LLMInvocationContext?,
         onDelta: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return text }
-        let finalPrompt = prompt.replacingOccurrences(of: "{text}", with: trimmedText)
+        let preparedPrompt = LLMPreparedPrompt.make(
+            text: trimmedText,
+            prompt: prompt,
+            inputBoundary: inputBoundary
+        )
 
         guard let url = URL(string: "\(config.baseURL)/chat/completions") else {
             throw LLMError.invalidURL
@@ -99,8 +153,9 @@ actor DoubaoChatClient: LLMClient {
         let disableField = disableThinking ? provider.thinkingDisableField : nil
         let body = ChatRequest(
             model: config.model,
-            messages: [ChatMessage(role: "user", content: finalPrompt)],
+            messages: chatMessages(for: preparedPrompt),
             stream: true,
+            stream_options: StreamOptions(include_usage: true),
             thinking: disableField == .thinking ? ThinkingConfig(type: "disabled") : nil,
             enable_thinking: disableField == .enableThinking ? false : nil,
             reasoning: disableField == .reasoning ? ReasoningConfig(effort: "none") : nil,
@@ -111,25 +166,63 @@ actor DoubaoChatClient: LLMClient {
         request.httpBody = try JSONEncoder().encode(body)
 
         logger.info("LLM streaming request: \(text.count) chars, endpoint=\(config.model)")
-        let result = try await streamChat(request: request, model: config.model, onDelta: onDelta)
-        logger.info("LLM streaming result: \(result.count) chars")
+        let result = try await streamChat(request: request, model: config.model, sourceText: text, invocationContext: invocationContext, onDelta: onDelta)
         return result.strippingThinkTags()
     }
 
-    // MARK: - Streaming (SSE)
+    private func chatMessages(for prompt: LLMPreparedPrompt) -> [ChatMessage] {
+        var messages: [ChatMessage] = []
+        if let system = prompt.system {
+            messages.append(ChatMessage(role: "system", content: system))
+        }
+        messages.append(ChatMessage(role: "user", content: prompt.user))
+        return messages
+    }
 
+    // MARK: - Streaming (SSE)
     private func streamChat(
         request: URLRequest,
         model: String,
+        sourceText: String,
+        invocationContext: LLMInvocationContext? = nil,
         onDelta: (@Sendable (String) async -> Void)? = nil
     ) async throws -> String {
         let requestStart = ContinuousClock.now
         DebugFileLogger.log("llm: request started model=\(model)")
-        let (bytes, response) = try await session.bytes(for: request)
+
+        var recordedOutcome = false
+        func recordOutcome(status: String, completionText: String, metrics: LLMExecutionMetrics?) {
+            guard !recordedOutcome else { return }
+            recordedOutcome = true
+            let durationSec = Double((ContinuousClock.now - requestStart).components.seconds) +
+                              Double((ContinuousClock.now - requestStart).components.attoseconds) / 1e18
+            LLMUsageRecorder.record(
+                featureSource: invocationContext?.featureSource ?? .dictationPolish,
+                provider: provider.rawValue,
+                model: model,
+                promptText: sourceText,
+                completionText: completionText,
+                durationSeconds: durationSec,
+                metrics: metrics,
+                status: status,
+                modeName: invocationContext?.modeName
+            )
+        }
+
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch {
+            recordOutcome(status: "error", completionText: "", metrics: nil)
+            throw error
+        }
+
         guard let http = response as? HTTPURLResponse else {
+            recordOutcome(status: "error", completionText: "", metrics: nil)
             throw LLMError.requestFailed(0)
         }
         guard http.statusCode == 200 else {
+            recordOutcome(status: "error", completionText: "", metrics: nil)
             logger.error("LLM HTTP \(http.statusCode)")
             DebugFileLogger.log("LLM[\(model)]: HTTP \(http.statusCode)")
             throw LLMError.requestFailed(http.statusCode)
@@ -139,38 +232,78 @@ actor DoubaoChatClient: LLMClient {
         var lineCount = 0
         var loggedFirstEvent = false
         var loggedFirstToken = false
-        for try await line in bytes.lines {
-            lineCount += 1
-            guard line.hasPrefix("data: ") else { continue }
-            if !loggedFirstEvent {
-                loggedFirstEvent = true
-                DebugFileLogger.log("llm: first SSE event +\(ContinuousClock.now - requestStart) model=\(model)")
+        var promptTokens: Int?
+        var completionTokens: Int?
+        var receivedDone = false
+        do {
+            for try await line in bytes.lines {
+                lineCount += 1
+                guard line.hasPrefix("data: ") else { continue }
+                if !loggedFirstEvent {
+                    loggedFirstEvent = true
+                    DebugFileLogger.log("llm: first SSE event +\(ContinuousClock.now - requestStart) model=\(model)")
+                }
+                let payload = String(line.dropFirst(6))
+                if payload == "[DONE]" {
+                    receivedDone = true
+                    break
+                }
+                guard let data = payload.data(using: .utf8) else { continue }
+
+                if let chunk = try? JSONDecoder().decode(ChatStreamChunk.self, from: data) {
+                    if let usage = chunk.usage {
+                        promptTokens = usage.prompt_tokens
+                        completionTokens = usage.completion_tokens
+                    }
+                    if let content = chunk.choices.first?.delta.content {
+                        if !loggedFirstToken, !content.isEmpty {
+                            loggedFirstToken = true
+                            DebugFileLogger.log("llm: first content token +\(ContinuousClock.now - requestStart) model=\(model)")
+                        }
+                        result += content
+                        if !content.isEmpty {
+                            await onDelta?(content)
+                        }
+                    }
+                }
             }
-            let payload = String(line.dropFirst(6))
-            if payload == "[DONE]" { break }
-            guard let data = payload.data(using: .utf8),
-                  let chunk = try? JSONDecoder().decode(ChatStreamChunk.self, from: data),
-                  let content = chunk.choices.first?.delta.content
-            else { continue }
-            if !loggedFirstToken, !content.isEmpty {
-                loggedFirstToken = true
-                DebugFileLogger.log("llm: first content token +\(ContinuousClock.now - requestStart) model=\(model)")
+            guard receivedDone else {
+                DebugFileLogger.log("LLM[\(model)]: stream closed without [DONE] marker (lines=\(lineCount), chars=\(result.count))")
+                throw LLMError.streamIncomplete(L("未收到结束标记 [DONE]", "missing [DONE] terminal marker"))
             }
-            result += content
-            if !content.isEmpty {
-                await onDelta?(content)
+            if result.isEmpty && lineCount > 0 {
+                DebugFileLogger.log("LLM[\(model)]: \(lineCount) lines but 0 content chars")
+                throw LLMError.emptyResponse(L("流式响应没有文本", "stream contained no text"))
             }
+            if result.isEmpty {
+                DebugFileLogger.log("LLM[\(model)]: 0 lines received (connection closed immediately)")
+                throw LLMError.emptyResponse(nil)
+            }
+        } catch {
+            let durationSec = Double((ContinuousClock.now - requestStart).components.seconds) +
+                              Double((ContinuousClock.now - requestStart).components.attoseconds) / 1e18
+            let metrics = LLMExecutionMetrics(
+                promptTokens: promptTokens,
+                completionTokens: completionTokens,
+                durationSeconds: durationSec,
+                isEstimated: promptTokens == nil || completionTokens == nil
+            )
+            recordOutcome(status: "error", completionText: result, metrics: metrics)
+            throw error
         }
 
-        if result.isEmpty && lineCount > 0 {
-            DebugFileLogger.log("LLM[\(model)]: \(lineCount) lines but 0 content chars")
-            throw LLMError.emptyResponse(L("流式响应没有文本", "stream contained no text"))
-        }
-        if result.isEmpty {
-            DebugFileLogger.log("LLM[\(model)]: 0 lines received (connection closed immediately)")
-            throw LLMError.emptyResponse(nil)
-        }
-        DebugFileLogger.log("llm: completed +\(ContinuousClock.now - requestStart) chars=\(result.count) model=\(model)")
+        let durationSec = Double((ContinuousClock.now - requestStart).components.seconds) +
+                          Double((ContinuousClock.now - requestStart).components.attoseconds) / 1e18
+        DebugFileLogger.log("llm: completed +\(ContinuousClock.now - requestStart) chars=\(result.count) model=\(model) promptTokens=\(promptTokens ?? -1) compTokens=\(completionTokens ?? -1)")
+
+        let metrics = LLMExecutionMetrics(
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            durationSeconds: durationSec,
+            isEstimated: promptTokens == nil || completionTokens == nil
+        )
+        recordOutcome(status: "success", completionText: result, metrics: metrics)
+
         return result
     }
 
@@ -211,12 +344,41 @@ struct ChatRequest: Encodable, Sendable {
     let model: String
     let messages: [ChatMessage]
     let stream: Bool
+    let stream_options: StreamOptions?
     let thinking: ThinkingConfig?
     let enable_thinking: Bool?
     let reasoning: ReasoningConfig?
     let reasoning_effort: String?
     let think: Bool?
     let reasoning_split: Bool?
+
+    init(
+        model: String,
+        messages: [ChatMessage],
+        stream: Bool,
+        stream_options: StreamOptions? = nil,
+        thinking: ThinkingConfig? = nil,
+        enable_thinking: Bool? = nil,
+        reasoning: ReasoningConfig? = nil,
+        reasoning_effort: String? = nil,
+        think: Bool? = nil,
+        reasoning_split: Bool? = nil
+    ) {
+        self.model = model
+        self.messages = messages
+        self.stream = stream
+        self.stream_options = stream_options
+        self.thinking = thinking
+        self.enable_thinking = enable_thinking
+        self.reasoning = reasoning
+        self.reasoning_effort = reasoning_effort
+        self.think = think
+        self.reasoning_split = reasoning_split
+    }
+}
+
+struct StreamOptions: Encodable, Sendable {
+    let include_usage: Bool
 }
 
 struct ChatMessage: Codable, Sendable, Equatable {
@@ -240,8 +402,14 @@ struct CompletionMessage: Decodable, Sendable {
 // Streaming response (SSE chunks)
 struct ChatStreamChunk: Decodable, Sendable {
     let choices: [ChunkChoice]
+    let usage: ChunkUsage?
 }
 
+struct ChunkUsage: Decodable, Sendable {
+    let prompt_tokens: Int?
+    let completion_tokens: Int?
+    let total_tokens: Int?
+}
 struct ChunkChoice: Decodable, Sendable {
     let delta: ChunkDelta
 }
@@ -254,7 +422,7 @@ enum LLMError: Error, LocalizedError {
     case invalidURL
     case requestFailed(Int)
     case emptyResponse(String?)
-
+    case streamIncomplete(String?)
     var errorDescription: String? {
         switch self {
         case .invalidURL:
@@ -271,6 +439,11 @@ enum LLMError: Error, LocalizedError {
                 return L("LLM 未返回内容: \(raw)", "LLM returned no content: \(raw)")
             }
             return L("LLM 未返回内容", "LLM returned no content")
+        case .streamIncomplete(let detail):
+            if let detail {
+                return L("流式连接中断: \(detail)", "Stream connection interrupted: \(detail)")
+            }
+            return L("流式连接异常中断", "Stream connection interrupted prematurely")
         }
     }
 }

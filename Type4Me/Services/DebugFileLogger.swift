@@ -6,7 +6,9 @@ enum DebugFileLogger {
     private static let maximumLogSize = 256 * 1024
 
     static var logURL: URL {
-        AppIdentity.appSupportDirectory().appendingPathComponent("debug.log")
+        let dir = AppDataLocation.runtimeDirectory
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("debug.log")
     }
 
     private static var previousLogURL: URL {

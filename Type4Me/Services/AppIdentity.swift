@@ -8,16 +8,13 @@ enum AppIdentity {
 
     /// Returns the current app support directory, creating it if needed.
     ///
+    /// Delegates to `AppDataLocation` so fork code and upstream code resolve the
+    /// same profile directory (and the same isolated directory under tests).
+    ///
     /// Returns:
     ///   The `~/Library/Application Support/mytype` directory URL.
     static func appSupportDirectory() -> URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
-        let dir = appSupport.appendingPathComponent(supportDirectoryName, isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        AppDataLocation.profileDirectory
     }
 
     /// Migrates files from old app support directories into the mytype directory.
@@ -28,6 +25,9 @@ enum AppIdentity {
         let fm = FileManager.default
         let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let target = appSupportDirectory()
+        // Only the real profile receives legacy data; an isolated test profile must
+        // never be seeded with the user's files.
+        guard target.lastPathComponent == supportDirectoryName else { return }
 
         for name in legacySupportDirectoryNames {
             let source = appSupport.appendingPathComponent(name, isDirectory: true)

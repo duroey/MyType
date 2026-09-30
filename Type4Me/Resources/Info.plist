@@ -24,6 +24,8 @@
     <string>mytype needs microphone access to capture your voice for transcription.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>mytype needs speech recognition access to transcribe your voice into text.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>mytype needs permission to control other applications to perform automation actions.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2024 mytype. All rights reserved.</string>
     <key>NSAppTransportSecurity</key>

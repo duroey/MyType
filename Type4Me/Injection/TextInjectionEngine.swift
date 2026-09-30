@@ -1,40 +1,74 @@
-import AppKit
-import ApplicationServices
-import Carbon.HIToolbox
+import Cocoa
+import Foundation
 
 final class TextInjectionEngine: @unchecked Sendable {
+
+    /// Per-process randomized marker tagged onto synthetic events (e.g. Cmd+V)
+    /// so HotkeyManager recognizes them as internal and avoids re-triggering hotkeys.
+    private static let syntheticInputEventMarker = Int64.random(in: 1...Int64.max)
+
+    static func markAsSyntheticInput(_ event: CGEvent) {
+        event.setIntegerValueField(
+            .eventSourceUserData,
+            value: syntheticInputEventMarker
+        )
+    }
+
+    static func isSyntheticInput(_ event: CGEvent) -> Bool {
+        event.getIntegerValueField(.eventSourceUserData) == syntheticInputEventMarker
+    }
 
     enum ClipboardRetention: Sendable, Equatable {
         /// Keep the dictated result in the system clipboard after the paste attempt.
         case retainResult
         /// Restore the clipboard captured before the paste attempt, including
-        /// when no editable target was found.
+        /// when injection falls safe to a plain copy.
         case restoreOriginal
     }
-
-    private struct FocusedElementSnapshot {
-        let element: AXUIElement?
-        let processIdentifier: pid_t?
-        let bundleIdentifier: String?
-        let role: String?
-        let subrole: String?
-        let value: String?
-        let placeholder: String?
-        let accessibilityDescription: String?
-        let selectedRange: NSRange?
-        let isEditable: Bool
-        /// true when AX successfully found a focused UI element; false when
-        /// no element was found (e.g. desktop, no focused window).
-        let hasFocusedElement: Bool
-    }
-
     typealias ClipboardSnapshot = Type4Me.ClipboardSnapshot
 
-    // MARK: - Public
+    enum DeliveryTarget: Equatable {
+        case app(NSRunningApplication)
+        case fallbackToClipboard
+    }
 
-    /// Whether a normal paste attempt retains its result or restores the
+    static func resolveDeliveryTarget(
+        frontmost: NSRunningApplication?,
+        selfBundleIdentifier: String? = Bundle.main.bundleIdentifier
+    ) -> DeliveryTarget {
+        guard let frontmost,
+              frontmost.bundleIdentifier != selfBundleIdentifier,
+              !frontmost.isTerminated
+        else {
+            return .fallbackToClipboard
+        }
+        return .app(frontmost)
+    }
+
+
+    struct FocusedElementSnapshot {
+        var element: AXUIElement? = nil
+        var processIdentifier: pid_t? = nil
+        var bundleIdentifier: String? = nil
+        var role: String? = nil
+        var subrole: String? = nil
+        var value: String? = nil
+        var placeholder: String? = nil
+        var accessibilityDescription: String? = nil
+        var selectedRange: NSRange? = nil
+        var isEditable: Bool = false
+        var hasFocusedElement: Bool = false
+    }
+
+    private struct PendingClipboardRestore {
+        let snapshot: ClipboardSnapshot
+        let changeCount: Int
+    }
+
+    /// Whether this engine should retain the dictated result or restore the
     /// clipboard that existed before injection.
     var clipboardRetention: ClipboardRetention = .restoreOriginal
+    private var pendingClipboardRestore: PendingClipboardRestore?
 
     /// Inject text into the currently focused input field.
     /// Returns the outcome as soon as the paste is dispatched.
@@ -50,7 +84,8 @@ final class TextInjectionEngine: @unchecked Sendable {
         _ text: String,
         sourceText: String,
         sourceRecordID: String,
-        modeID: UUID
+        modeID: UUID,
+        shouldCaptureApp: @Sendable (String?) -> Bool
     ) -> TrackedInjectionResult {
         guard !text.isEmpty else {
             return TrackedInjectionResult(outcome: .inserted, observationContext: nil)
@@ -61,7 +96,8 @@ final class TextInjectionEngine: @unchecked Sendable {
                 sourceText: sourceText,
                 sourceRecordID: sourceRecordID,
                 modeID: modeID
-            )
+            ),
+            authorizeCapture: shouldCaptureApp
         )
     }
 
@@ -71,8 +107,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         guard let pending = pendingClipboardRestore else { return }
         pendingClipboardRestore = nil
         // Electron apps (VS Code, Slack, Notion, Feishu) may need 200-500ms
-        // to read the clipboard after Cmd+V. 150ms (post-paste 100 + this 50)
-        // was too fast. Bumped to 300ms here for ~400ms total.
+        // to read the clipboard after Cmd+V.
         usleep(300_000)
         pending.snapshot.restore(expectedChangeCount: pending.changeCount)
     }
@@ -87,50 +122,48 @@ final class TextInjectionEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Clipboard injection
-
-    private struct PendingClipboardRestore {
-        let snapshot: ClipboardSnapshot
-        let changeCount: Int
-    }
-
-    private var pendingClipboardRestore: PendingClipboardRestore?
-
     private func injectViaClipboard(
         _ text: String,
-        trackingMetadata: (sourceText: String, sourceRecordID: String, modeID: UUID)?
+        trackingMetadata: (sourceText: String, sourceRecordID: String, modeID: UUID)?,
+        authorizeCapture: (String?) -> Bool = { _ in false }
     ) -> TrackedInjectionResult {
-        let shouldRestoreClipboard = clipboardRetention == .restoreOriginal
+        let shouldRestoreClipboard = Self.shouldRestoreClipboard(retention: clipboardRetention)
         let savedClipboard = shouldRestoreClipboard ? ClipboardSnapshot.capture() : nil
 
-        // If Type4Me is frontmost, yield focus so the target application receives paste
-        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier {
-            DispatchQueue.main.sync {
-                NSApp.hide(nil)
-            }
-            usleep(50_000)
+        let deliveryTarget = Self.resolveDeliveryTarget(
+            frontmost: NSWorkspace.shared.frontmostApplication
+        )
+        guard case .app = deliveryTarget else {
+            // Delivery fallback: no valid external target application. Always preserve the
+            // dictated text in the system clipboard so the user's speech is never lost.
+            copyToClipboard(text, transient: false)
+            pendingClipboardRestore = nil
+            DebugFileLogger.log("injection fallback: no valid external target app; copied to clipboard")
+            return TrackedInjectionResult(outcome: .copiedToClipboard, observationContext: nil)
         }
 
-        // Snapshot focused element BEFORE paste for outcome detection
-        let before = captureFocusedElementSnapshot()
+        let before = trackingMetadata != nil
+            ? captureFocusedElementSnapshot(isPrePaste: true, authorize: authorizeCapture)
+            : nil
 
         copyToClipboard(text, transient: shouldRestoreClipboard)
         let postWriteChangeCount = NSPasteboard.general.changeCount
         usleep(50_000)
-        simulatePaste()
+
+        guard simulatePaste() else {
+            // Delivery fallback: paste event creation failed. Always preserve text in the clipboard.
+            copyToClipboard(text, transient: false)
+            pendingClipboardRestore = nil
+            DebugFileLogger.log("injection fallback: paste event creation failed; copied to clipboard")
+            return TrackedInjectionResult(outcome: .copiedToClipboard, observationContext: nil)
+        }
         usleep(100_000)
 
-        // Snapshot AFTER paste and compare to detect if text landed
-        let after = captureFocusedElementSnapshot()
-        let detectedOutcome = inferInjectionOutcome(before: before, after: after, pastedText: text)
-        let outcome = Self.finalizeOutcome(
-            detectedOutcome,
-            retention: clipboardRetention
-        )
+        let after = trackingMetadata != nil
+            ? captureFocusedElementSnapshot(isPrePaste: false, authorize: authorizeCapture)
+            : nil
+        let outcome: InjectionOutcome = .inserted
 
-        // Defer restoration so the target app has time to consume Cmd+V.
-        // Keep it pending for every result so a failed paste cannot leak text
-        // into the clipboard under a restoring policy.
         if let savedClipboard {
             pendingClipboardRestore = PendingClipboardRestore(
                 snapshot: savedClipboard, changeCount: postWriteChangeCount
@@ -153,55 +186,64 @@ final class TextInjectionEngine: @unchecked Sendable {
         return TrackedInjectionResult(outcome: outcome, observationContext: context)
     }
 
-    /// A restore policy cannot truthfully report a clipboard fallback: its
-    /// temporary pasteboard contents are restored after the paste attempt.
-    static func finalizeOutcome(
-        _ detectedOutcome: InjectionOutcome,
-        retention: ClipboardRetention
-    ) -> InjectionOutcome {
-        if detectedOutcome == .copiedToClipboard, retention == .restoreOriginal {
-            return .notInserted
-        }
-        return detectedOutcome
+    static func shouldRestoreClipboard(retention: ClipboardRetention) -> Bool {
+        retention == .restoreOriginal
     }
 
-    private func simulatePaste() {
+
+    private func simulatePaste() -> Bool {
         let vKeyCode: CGKeyCode = 9 // 'v'
 
         guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: false)
-        else { return }
+        else { return false }
 
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
+        Self.markAsSyntheticInput(keyDown)
+        Self.markAsSyntheticInput(keyUp)
 
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
+        return true
     }
 
-    /// Set kAXEnhancedUserInterface on the frontmost app's focused window.
-    /// This makes Electron/Chromium apps expose their full AX tree.
     private func enableEnhancedAX(for app: NSRunningApplication) {
+        guard AXIsProcessTrusted(), !app.isTerminated else { return }
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, 0.3)
-        var windowValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        AXUIElementSetMessagingTimeout(appElement, 0.05)
+        _ = AXUIElementSetAttributeValue(
             appElement,
-            kAXFocusedWindowAttribute as CFString,
-            &windowValue
-        ) == .success, let windowValue else { return }
-        let window = unsafeDowncast(windowValue, to: AXUIElement.self)
-        AXUIElementSetAttributeValue(
-            window,
             "AXEnhancedUserInterface" as CFString,
             true as CFTypeRef
         )
     }
 
-    private func captureFocusedElementSnapshot() -> FocusedElementSnapshot? {
+    private func captureFocusedElementSnapshot(
+        isPrePaste: Bool,
+        authorize: (String?) -> Bool
+    ) -> FocusedElementSnapshot? {
         let frontmostApp = NSWorkspace.shared.frontmostApplication
         let frontmostBundleID = frontmostApp?.bundleIdentifier
+        return Self.authorizedSnapshot(
+            bundleIdentifier: frontmostBundleID,
+            authorize: authorize
+        ) {
+            focusedElementSnapshot(
+                frontmostApp: frontmostApp,
+                frontmostBundleID: frontmostBundleID,
+                isPrePaste: isPrePaste,
+                authorize: authorize
+            )
+        }
+    }
 
+    private func focusedElementSnapshot(
+        frontmostApp: NSRunningApplication?,
+        frontmostBundleID: String?,
+        isPrePaste: Bool,
+        authorize: (String?) -> Bool
+    ) -> FocusedElementSnapshot? {
         guard AXIsProcessTrusted() else {
             return FocusedElementSnapshot(
                 element: nil,
@@ -219,7 +261,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         }
 
         let systemWide = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(systemWide, 0.5)
+        AXUIElementSetMessagingTimeout(systemWide, isPrePaste ? 0.05 : 0.25)
         var focusedValue: CFTypeRef?
         var status = AXUIElementCopyAttributeValue(
             systemWide,
@@ -227,7 +269,30 @@ final class TextInjectionEngine: @unchecked Sendable {
             &focusedValue
         )
 
-        // AX blind (common with Electron apps). Enable enhanced AX and retry.
+        // Pre-paste snapshot is on the critical path: keep it strictly bounded and fast.
+        // If system-wide query fails initially, allow a fast enhanced-AX retry without sleeping,
+        // but never perform 30ms sleep or window tree traversal before Cmd+V is dispatched.
+        if isPrePaste {
+            if status == .success, let focusedValue {
+                let element = unsafeDowncast(focusedValue, to: AXUIElement.self)
+                return snapshotFromElement(element, authorize: authorize, timeout: 0.05)
+            }
+            if let frontmostApp {
+                enableEnhancedAX(for: frontmostApp)
+                status = AXUIElementCopyAttributeValue(
+                    systemWide,
+                    kAXFocusedUIElementAttribute as CFString,
+                    &focusedValue
+                )
+                if status == .success, let focusedValue {
+                    let element = unsafeDowncast(focusedValue, to: AXUIElement.self)
+                    return snapshotFromElement(element, authorize: authorize, timeout: 0.05)
+                }
+            }
+            return nil
+        }
+
+        // Post-paste snapshot is off the critical path: allow enhanced AX retry and tree traversal.
         if status != .success || focusedValue == nil, let frontmostApp {
             enableEnhancedAX(for: frontmostApp)
             usleep(30_000) // 30ms for Chromium to build AX tree
@@ -242,7 +307,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         // to find an editable element. Common for WeChat, Feishu, etc.
         if status != .success || focusedValue == nil, let frontmostApp {
             if let found = findEditableElementInApp(frontmostApp) {
-                return snapshotFromElement(found, bundleIdentifier: frontmostBundleID)
+                return snapshotFromElement(found, authorize: authorize, timeout: 0.25)
             }
             return FocusedElementSnapshot(
                 element: nil,
@@ -260,49 +325,65 @@ final class TextInjectionEngine: @unchecked Sendable {
         }
 
         let element = unsafeDowncast(focusedValue!, to: AXUIElement.self)
-        return snapshotFromElement(element, bundleIdentifier: frontmostBundleID)
+        return snapshotFromElement(element, authorize: authorize, timeout: 0.25)
     }
 
-    private func snapshotFromElement(_ element: AXUIElement, bundleIdentifier: String?) -> FocusedElementSnapshot {
-        AXUIElementSetMessagingTimeout(element, 0.5)
-        let role = copyStringAttribute(kAXRoleAttribute as CFString, from: element)
-        let subrole = copyStringAttribute(kAXSubroleAttribute as CFString, from: element)
-        let value = copyStringAttribute(kAXValueAttribute as CFString, from: element)
-        let placeholder = copyStringAttribute(kAXPlaceholderValueAttribute as CFString, from: element)
-        let accessibilityDescription = copyStringAttribute(kAXDescriptionAttribute as CFString, from: element)
-        let selectedRange = copyRangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: element)
+    private func snapshotFromElement(
+        _ element: AXUIElement,
+        authorize: (String?) -> Bool,
+        timeout: Float = 0.05
+    ) -> FocusedElementSnapshot? {
+        AXUIElementSetMessagingTimeout(element, timeout)
+
         var processIdentifier: pid_t = 0
         let pidStatus = AXUIElementGetPid(element, &processIdentifier)
-        let isEditable =
-            isAttributeSettable(kAXSelectedTextRangeAttribute as CFString, on: element)
-            || isAttributeSettable(kAXValueAttribute as CFString, on: element)
-            || [
-            kAXTextFieldRole as String,
-            kAXTextAreaRole as String,
-            kAXComboBoxRole as String,
-            "AXSearchField",
-        ].contains(role)
-
-        return FocusedElementSnapshot(
-            element: element,
-            processIdentifier: pidStatus == .success ? processIdentifier : nil,
-            bundleIdentifier: bundleIdentifier,
-            role: role,
-            subrole: subrole,
-            value: value,
-            placeholder: placeholder,
-            accessibilityDescription: accessibilityDescription,
-            selectedRange: selectedRange,
-            isEditable: isEditable,
-            hasFocusedElement: true
+        let actualBundleID = Self.resolveElementBundleIdentifier(
+            pidStatus: pidStatus,
+            pid: processIdentifier
         )
+        return Self.authorizedSnapshot(
+            bundleIdentifier: actualBundleID,
+            authorize: authorize
+        ) {
+            let role = copyStringAttribute(kAXRoleAttribute as CFString, from: element)
+            let subrole = copyStringAttribute(kAXSubroleAttribute as CFString, from: element)
+            let value = Self.trackedValue(role: role, subrole: subrole) {
+                copyStringAttribute(kAXValueAttribute as CFString, from: element)
+            }
+            let placeholder = copyStringAttribute(kAXPlaceholderValueAttribute as CFString, from: element)
+            let accessibilityDescription = copyStringAttribute(kAXDescriptionAttribute as CFString, from: element)
+            let selectedRange = copyRangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: element)
+            let isEditable =
+                isAttributeSettable(kAXSelectedTextRangeAttribute as CFString, on: element)
+                || isAttributeSettable(kAXValueAttribute as CFString, on: element)
+                || [
+                kAXTextFieldRole as String,
+                kAXTextAreaRole as String,
+                kAXComboBoxRole as String,
+                "AXSearchField",
+            ].contains(role)
+
+            return FocusedElementSnapshot(
+                element: element,
+                processIdentifier: pidStatus == .success ? processIdentifier : nil,
+                bundleIdentifier: actualBundleID,
+                role: role,
+                subrole: subrole,
+                value: value,
+                placeholder: placeholder,
+                accessibilityDescription: accessibilityDescription,
+                selectedRange: selectedRange,
+                isEditable: isEditable,
+                hasFocusedElement: true
+            )
+        }
     }
 
     /// Traverse the app's focused window tree to find the first editable element.
     /// Used as fallback when system-wide kAXFocusedUIElementAttribute fails.
     private func findEditableElementInApp(_ app: NSRunningApplication) -> AXUIElement? {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, 0.5)
+        AXUIElementSetMessagingTimeout(appElement, 0.05)
 
         var windowValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -399,7 +480,7 @@ final class TextInjectionEngine: @unchecked Sendable {
               let bundleIdentifier = after.bundleIdentifier,
               let beforeValue = before.value,
               let afterValue = after.value,
-              !isSecureTextRole(role: after.role, subrole: after.subrole),
+              !Self.isSecureTextRole(role: after.role, subrole: after.subrole),
               let insertedRange = inferInsertedRange(
                   beforeValue: beforeValue,
                   afterValue: afterValue,
@@ -429,7 +510,44 @@ final class TextInjectionEngine: @unchecked Sendable {
         )
     }
 
-    private func isSecureTextRole(role: String?, subrole: String?) -> Bool {
+    /// Resolve the bundle identifier of the application owning the AX element.
+    /// Fails closed (returns `nil`) if the PID cannot be retrieved or the owning
+    /// application bundle identifier cannot be resolved, avoiding fail-open
+    /// access to an element from an unknown or excluded process.
+    static func resolveElementBundleIdentifier(
+        pidStatus: AXError,
+        pid: pid_t,
+        appLookup: (pid_t) -> String? = { pid in
+            NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        }
+    ) -> String? {
+        guard pidStatus == .success else { return nil }
+        return appLookup(pid)
+    }
+
+    /// Gate every focused-element read on the app that actually holds focus
+    /// right now. Fails closed (returns `nil` without invoking `read`) when
+    /// the app identity is unknown or empty, or when no tracking consumer is
+    /// allowed to observe that app's text.
+    static func authorizedSnapshot(
+        bundleIdentifier: String?,
+        authorize: (String?) -> Bool,
+        read: () -> FocusedElementSnapshot?
+    ) -> FocusedElementSnapshot? {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty, authorize(bundleIdentifier) else { return nil }
+        return read()
+    }
+
+    static func trackedValue(
+        role: String?,
+        subrole: String?,
+        read: () -> String?
+    ) -> String? {
+        guard !isSecureTextRole(role: role, subrole: subrole) else { return nil }
+        return read()
+    }
+
+    private static func isSecureTextRole(role: String?, subrole: String?) -> Bool {
         [role, subrole]
             .compactMap { $0?.lowercased() }
             .contains { $0.contains("secure") || $0.contains("password") }
@@ -476,44 +594,4 @@ final class TextInjectionEngine: @unchecked Sendable {
         guard changedAfter == pastedText else { return nil }
         return NSRange(location: prefixLength, length: pastedLength)
     }
-
-    private func inferInjectionOutcome(
-        before: FocusedElementSnapshot?,
-        after: FocusedElementSnapshot?,
-        pastedText: String
-    ) -> InjectionOutcome {
-        DebugFileLogger.log("injection detect: before=\(before.map { "bundle=\($0.bundleIdentifier ?? "nil") role=\($0.role ?? "nil") editable=\($0.isEditable) hasFocus=\($0.hasFocusedElement) valueLength=\($0.value?.count ?? -1)" } ?? "nil")")
-        DebugFileLogger.log("injection detect: after=\(after.map { "bundle=\($0.bundleIdentifier ?? "nil") role=\($0.role ?? "nil") editable=\($0.isEditable) hasFocus=\($0.hasFocusedElement) valueLength=\($0.value?.count ?? -1)" } ?? "nil")")
-
-        guard let before, let after else {
-            return .inserted
-        }
-
-        // No frontmost app → nothing to paste into (e.g. desktop)
-        if before.bundleIdentifier == nil && after.bundleIdentifier == nil {
-            return .copiedToClipboard
-        }
-
-        // AX completely blind (WeChat, Feishu, etc.): if we have a frontmost
-        // app but can't see the focused element, assume Cmd+V worked.
-        // Desktop/no-app cases are already handled above (bundleIdentifier == nil).
-        if !before.hasFocusedElement || !after.hasFocusedElement {
-            return .inserted
-        }
-
-        // Value changed → paste definitely worked (strongest signal)
-        if let beforeValue = before.value, let afterValue = after.value, beforeValue != afterValue {
-            return .inserted
-        }
-
-        // Either snapshot says editable → trust it
-        if before.isEditable || after.isEditable {
-            return .inserted
-        }
-
-        // Not editable and value didn't change → paste had nowhere to go
-        return .copiedToClipboard
-    }
-
-
 }

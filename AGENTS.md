@@ -4,7 +4,7 @@
 
 macOS menu bar voice input tool with dual-engine local ASR, multi-provider cloud ASR, and LLM post-processing.
 Local ASR: SenseVoice via native sherpa-onnx (streaming) + Qwen3-ASR (final calibration, Python WebSocket service managed by `SenseVoiceServerManager`).
-Cloud ASR: 12 providers implemented (Volcano, StepFun batch, MiMo batch, OpenAI, Deepgram, Cartesia, AssemblyAI, ElevenLabs, Grok, Soniox, Bailian, Baidu), plus Apple Speech.
+Cloud ASR: 15 providers implemented (Volcano, StepFun streaming, StepFun batch, MiMo batch, OpenAI, Deepgram, Cartesia, AssemblyAI, ElevenLabs, Gemini, Grok, Soniox, Bailian, Baidu, Meta Muse), plus Apple Speech.
 Swift Package Manager project, no Xcode project file. Optional `sherpa-onnx.xcframework` enables local SenseVoice, Silero VAD, and punctuation restoration.
 
 ## Branch Naming and Lifecycle
@@ -80,9 +80,12 @@ bash scripts/build-sherpa.sh
 swift build -c release
 ```
 
-The built binary is at `.build/release/Type4Me`. For normal Dev App builds,
-signing, installation, and launch, use `scripts/dev-run.sh`. For non-Dev app
-packaging, see `scripts/deploy.sh`.
+The built binary is at `.build/release/Type4Me`.
+
+- “本地部署”“装一下”“给我体验”等请求默认授权按正式应用流程打包，备份后替换 `/Applications/Type4Me.app`。保留 `com.type4me.app`、登录钥匙串中的 Developer ID Application 签名（Team `T98LK79X2K`）及 designated requirement，完成构建、签名与安装完整性检查后交给用户体验。仅在用户明确要求 Dev 版时使用独立 Dev app。
+- 本地 UI 迭代的测试和实际体验默认交给用户。除非用户明确要求，不自行运行测试套件、操作界面测试、切换设置或启动录音；仅完成必要的编译、签名、备份和安装完整性检查。用户提供的截图和体验反馈是下一轮调整依据。
+- Use `$type4me-deploy` and the current production packaging flow; default to `pure` + universal. Explicit Dev-only requests use `scripts/dev-run.sh`.
+- Local deployment does not authorize GitHub publication or the archived `official` subscription variant.
 
 ## Build Variants
 
@@ -148,10 +151,10 @@ All subscription/cloud-proxy code lives in `Type4Me/CloudSubscription/`. Main co
 
 Multi-provider ASR support via `ASRProvider` enum + `ASRProviderConfig` protocol + `ASRProviderRegistry`.
 
-- `ASRProvider` enum: 21 standard cases (`sherpa`, `apple`, international and China cloud providers, and `custom`), plus conditional `cloud` when `HAS_CLOUD_SUBSCRIPTION` is enabled.
-- Each provider has its own Config type (e.g., `SherpaASRConfig`, `VolcanoASRConfig`) defining `credentialFields` for dynamic UI rendering
+- `ASRProvider` enum: 24 standard cases (`sherpa`, `apple`, international and China cloud providers, and `custom`), plus conditional `cloud` when `HAS_CLOUD_SUBSCRIPTION` is enabled.
+- Each provider has its own Config type (e.g., `SherpaASRConfig`, `VolcanoASRConfig`, `MetaMuseASRConfig`) defining `credentialFields` for dynamic UI rendering
 - `ASRProviderRegistry`: maps provider to config type + client factory; `capabilities` indicates availability and streaming support
-- **Fully implemented**: Apple Speech (streaming); Volcano, Deepgram, Cartesia, AssemblyAI, ElevenLabs, Grok, Soniox, Bailian, and Baidu (streaming); StepFun, MiMo, and OpenAI (batch); and Sherpa/SenseVoice when `HAS_SHERPA_ONNX` is enabled.
+- **Fully implemented**: Apple Speech (streaming); Volcano, StepFun, Deepgram, Cartesia, AssemblyAI, ElevenLabs, Gemini, Grok, Soniox, Bailian, Baidu, and Meta Muse (streaming); StepFun, MiMo, and OpenAI (batch); and Sherpa/SenseVoice when `HAS_SHERPA_ONNX` is enabled.
 - **Config only (no client)**: azure, google, aws, aliyun, tencent, iflytek, custom
 
 ### Adding a New Provider
@@ -235,6 +238,11 @@ API keys and other secure values are stored in Keychain, not in this file.
 | `Type4Me/ASR/VolcASRClient.swift` | Cloud streaming ASR (Volcano, WebSocket) |
 | `Type4Me/ASR/DeepgramASRClient.swift` | Cloud streaming ASR (Deepgram, WebSocket) |
 | `Type4Me/ASR/ElevenLabsASRClient.swift` | Cloud streaming ASR (ElevenLabs Scribe v2, WebSocket) |
+| `Type4Me/ASR/StepFunASRClient.swift` | Cloud streaming ASR (StepFun, WebSocket) |
+| `Type4Me/Protocol/StepFunASRProtocol.swift` | StepFun realtime wire format and response parsing |
+| `Type4Me/ASR/GeminiASRClient.swift` | Cloud streaming ASR (Gemini Live API, model selectable) |
+| `Type4Me/Protocol/GeminiTranscribeProtocol.swift` | Gemini Live wire format: setup/audio messages, response parsing |
+| `Type4Me/ASR/GeminiConnectionGate.swift` | Gemini connection gate, close tracker, WebSocket delegate |
 | `Type4Me/ASR/OpenAIASRClient.swift` | Cloud batch ASR (OpenAI, REST) |
 | `Type4Me/ASR/MiMoASRClient.swift` | Cloud batch ASR (Xiaomi MiMo, REST/SSE) |
 | `Type4Me/ASR/SherpaPunctuationProcessor.swift` | Optional punctuation restoration (SherpaOnnx) |
@@ -251,7 +259,7 @@ API keys and other secure values are stored in Keychain, not in this file.
 | `Type4Me/Database/HistoryStore.swift` | Persistent transcription and processing history |
 | `Type4MeIntelliSenseCore/` | Intelli Sense context, guard, and preference-learning core |
 | `Type4MeReviseCore/` | Voice Revise tracking, slot targeting, and replacement core |
-| `Type4Me/LLM/LLMProvider.swift` | 14 LLM providers, including Codex CLI and local Ollama |
+| `Type4Me/LLM/LLMProvider.swift` | 15 LLM providers, including Xiaomi MiMo, Codex CLI, and local Ollama |
 | `Type4Me/LLM/LLMProviderRegistry.swift` | LLM provider → config + client factory |
 | `Type4Me/Session/SoundFeedback.swift` | Start/stop/error sounds, multiple sound styles |
 | `qwen3-asr-server/server.py` | Qwen3-ASR calibration engine (MLX/Metal, Apple Silicon) |

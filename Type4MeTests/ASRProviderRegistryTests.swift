@@ -4,7 +4,7 @@ import XCTest
 final class ASRProviderRegistryTests: XCTestCase {
 
     func testAvailableProvidersSupportDirectMode() {
-        for provider in [ASRProvider.volcano, .stepfunBatch, .mimo, .baidu, .bailian, .deepgram, .assemblyai, .soniox, .openai] {
+        for provider in [ASRProvider.volcano, .stepfun, .stepfunBatch, .mimo, .baidu, .bailian, .deepgram, .gemini, .assemblyai, .soniox, .metaMuse, .openai] {
             XCTAssertTrue(ASRProviderRegistry.supports(.direct, for: provider))
         }
     }
@@ -38,22 +38,50 @@ final class ASRProviderRegistryTests: XCTestCase {
     }
 
     func testSettingsCredentialValidationAcceptsVolcanoApiKeyOnly() {
-        XCTAssertTrue(ASRSettingsCard.hasValidASRCredentials(
+        XCTAssertTrue(ASRProviderDetailView.hasValidASRCredentials(
             provider: .volcano,
             values: ["apiKey": "new-console-api-key"]
         ))
     }
 
     func testSettingsCredentialValidationAcceptsVolcanoLegacyPair() {
-        XCTAssertTrue(ASRSettingsCard.hasValidASRCredentials(
+        XCTAssertTrue(ASRProviderDetailView.hasValidASRCredentials(
             provider: .volcano,
             values: ["appKey": "app-id", "accessKey": "access-token"]
         ))
     }
 
     func testSettingsCredentialValidationRejectsEmptyVolcanoCredentials() {
-        XCTAssertFalse(ASRSettingsCard.hasValidASRCredentials(provider: .volcano, values: [:]))
+        XCTAssertFalse(ASRProviderDetailView.hasValidASRCredentials(provider: .volcano, values: [:]))
     }
+
+    func testRegistry_exposesGeminiProviderConfiguration() {
+        let entry = ASRProviderRegistry.entry(for: .gemini)
+        XCTAssertNotNil(entry)
+        XCTAssertTrue(entry?.isAvailable ?? false)
+        XCTAssertTrue(ASRProviderRegistry.configType(for: .gemini) == GeminiASRConfig.self)
+        XCTAssertNotNil(ASRProviderRegistry.createClient(for: .gemini))
+
+        let caps = ASRProviderRegistry.capabilities(for: .gemini)
+        XCTAssertTrue(caps.isAvailable)
+        XCTAssertTrue(caps.isStreaming)
+        XCTAssertTrue(caps.supportsRealtimeRecognition)
+        XCTAssertEqual(caps.audioInput, .pcmData)
+    }
+    func testRegistry_exposesMetaMuseProviderConfiguration() {
+        let entry = ASRProviderRegistry.entry(for: .metaMuse)
+        XCTAssertNotNil(entry)
+        XCTAssertTrue(entry?.isAvailable ?? false)
+        XCTAssertTrue(ASRProviderRegistry.configType(for: .metaMuse) == MetaMuseASRConfig.self)
+        XCTAssertNotNil(ASRProviderRegistry.createClient(for: .metaMuse))
+
+        let caps = ASRProviderRegistry.capabilities(for: .metaMuse)
+        XCTAssertTrue(caps.isAvailable)
+        XCTAssertTrue(caps.isStreaming)
+        XCTAssertTrue(caps.supportsRealtimeRecognition)
+        XCTAssertEqual(caps.audioInput, .pcmData)
+    }
+
 
     func testRegistry_exposesMiMoProviderConfiguration() {
         let entry = ASRProviderRegistry.entry(for: .mimo)
@@ -81,7 +109,7 @@ final class ASRProviderRegistryTests: XCTestCase {
         // Realtime streaming providers
         for realtime in [
             ASRProvider.apple, .volcano, .deepgram, .cartesia,
-            .assemblyai, .elevenlabs, .grok, .soniox, .bailian, .baidu
+            .assemblyai, .elevenlabs, .gemini, .grok, .soniox, .metaMuse, .stepfun, .bailian, .baidu
         ] {
             let caps = ASRProviderRegistry.capabilities(for: realtime)
             XCTAssertTrue(caps.isAvailable)
@@ -91,6 +119,7 @@ final class ASRProviderRegistryTests: XCTestCase {
     }
 
     func testProviderDisplayNames_areCleanWithoutBatchSuffix() {
+        XCTAssertEqual(ASRProvider.stepfun.displayName, L("阶跃星辰", "StepFun"))
         XCTAssertEqual(ASRProvider.stepfunBatch.displayName, L("阶跃星辰", "StepFun"))
         XCTAssertEqual(ASRProvider.mimo.displayName, L("小米 MiMo", "Xiaomi MiMo"))
         XCTAssertEqual(ASRProvider.openai.displayName, "OpenAI")

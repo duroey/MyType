@@ -55,35 +55,81 @@ enum TF {
     /// Recording indicator palette from the floating-bar design specification.
     static let floatingBackground = Color(red: 17 / 255, green: 18 / 255, blue: 20 / 255) // #111214
     static let floatingBorder = Color(red: 38 / 255, green: 39 / 255, blue: 41 / 255) // #262729
+    static let floatingBackgroundLight = Color(red: 246 / 255, green: 246 / 255, blue: 248 / 255)
+    static let floatingBorderLight = Color(red: 218 / 255, green: 218 / 255, blue: 222 / 255)
+    /// Contrast floor beneath dark Liquid Glass so the bar stays legible over
+    /// bright background content. Native glass alone is too transparent there.
+    ///
+    /// Do not move this above the glass or into `Glass.tint`: a scrim on top
+    /// makes the un-sampled first frames flash harder, and a tint inside the
+    /// glass style cannot hold the theme either.
+    static let glassDarkContrastFloor: Double = 0.52
+    /// Contrast floor beneath light Liquid Glass, mirroring
+    /// `glassDarkContrastFloor`. Native glass samples whatever sits behind the
+    /// panel, so over a dark host page (a dark-mode web app, a full-screen
+    /// editor) the light capsule renders dark while its near-black foreground
+    /// colours stay put and vanish. The floor keeps legibility independent of
+    /// the host application's background.
+    ///
+    /// The same placement rule as the dark floor applies: keep it beneath the
+    /// glass rather than above it or inside `Glass.tint`.
+    static let glassLightContrastFloor: Double = 0.68
+    /// A translucent highlight that takes on the material beneath it instead of reading as a flat white rule.
+    /// Only used by the macOS 14/15 fallback; native Liquid Glass draws its own rim.
+    static let recordingGlassRim = LinearGradient(
+        colors: [
+            .white.opacity(0.80),
+            .white.opacity(0.48),
+            .white.opacity(0.30),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+    /// A translucent highlight for the light frosted glass theme.
+    /// Only used by the macOS 14/15 fallback; native Liquid Glass draws its own rim.
+    static let recordingLightGlassRim = LinearGradient(
+        colors: [
+            .white.opacity(0.95),
+            .white.opacity(0.60),
+            Color.black.opacity(0.12),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+    )
     static let floatingControl = Color(red: 51 / 255, green: 51 / 255, blue: 51 / 255)
     static let floatingControlLight = Color(red: 251 / 255, green: 251 / 255, blue: 251 / 255)
     static let floatingText = Color.white
+    static let floatingTextLight = Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255)
+    static let floatingTextSecondaryLight = Color(red: 90 / 255, green: 90 / 255, blue: 95 / 255)
 
     // MARK: Settings Palette
 
-    // The settings window deliberately uses a quiet, neutral palette.  It keeps
-    // the sidebar visually separate without drawing a hard divider through the
-    // window, and lets the content read as a clean white canvas.
-    static let settingsBg = Color(red: 0.965, green: 0.965, blue: 0.965)
-    static let settingsCard = Color.white
-    static let settingsCardAlt = Color(red: 0.935, green: 0.935, blue: 0.935)
-    static let settingsWindowBackground = Color.white
-    static let settingsSidebar = Color(red: 0.975, green: 0.975, blue: 0.975)
-    static let settingsSidebarActive = Color(red: 0.895, green: 0.895, blue: 0.895)
-    static let settingsSidebarHover = Color(red: 0.935, green: 0.935, blue: 0.935)
-    /// Default, hover, and row-hover fills shared by settings controls.
-    static let settingsControl = Color(red: 241 / 255, green: 241 / 255, blue: 241 / 255)
-    static let settingsControlHover = Color(red: 232 / 255, green: 232 / 255, blue: 232 / 255)
-    static let settingsRowHover = Color(red: 248 / 255, green: 248 / 255, blue: 248 / 255)
-    static let settingsBorder = Color.black.opacity(0.075)
-    static let settingsNavActive = Color(red: 0.10, green: 0.10, blue: 0.10)
-    static let settingsText = Color(red: 0.075, green: 0.075, blue: 0.075)
-    static let settingsTextSecondary = Color(red: 0.30, green: 0.30, blue: 0.30)
-    static let settingsTextTertiary = Color(red: 0.48, green: 0.48, blue: 0.48)
-    static let settingsAccentGreen = Color(red: 0.30, green: 0.62, blue: 0.35)
-    static let settingsAccentAmber = Color(red: 0.78, green: 0.55, blue: 0.15)
-    static let settingsAccentRed = Color(red: 0.80, green: 0.28, blue: 0.22)
-    static let settingsAccentBlue = Color(red: 0.15, green: 0.36, blue: 0.94)
+    // Light values intentionally match the pre-dark-mode palette, including alpha.
+    // Neutral overlays retain their original per-control opacity and compositing.
+    static let settingsInk = adaptiveColor(light: (0, 0, 0), dark: (1, 1, 1))
+    static let settingsFieldText = adaptiveColor(light: (0.10, 0.10, 0.10), dark: (0.94, 0.94, 0.94))
+    static let settingsFieldPlaceholder = adaptiveColor(light: (0.42, 0.42, 0.42), dark: (0.67, 0.67, 0.67))
+    static let settingsFieldCursor = adaptiveColor(light: (0.25, 0.25, 0.25), dark: (0.94, 0.94, 0.94))
+    static let settingsBg = adaptiveColor(light: (0.965, 0.965, 0.965), dark: (0.10, 0.10, 0.10))
+    static let settingsCard = adaptiveColor(light: (1, 1, 1), dark: (0.16, 0.16, 0.16))
+    static let settingsCardAlt = adaptiveColor(light: (0.935, 0.935, 0.935), dark: (0.20, 0.20, 0.20))
+    static let settingsWindowBackground = adaptiveColor(light: (1, 1, 1), dark: (0.12, 0.12, 0.12))
+    static let settingsSidebar = adaptiveColor(light: (0.975, 0.975, 0.975), dark: (0.145, 0.145, 0.145))
+    static let settingsSidebarActive = adaptiveColor(light: (0.895, 0.895, 0.895), dark: (0.27, 0.27, 0.27))
+    static let settingsSidebarHover = adaptiveColor(light: (0.935, 0.935, 0.935), dark: (0.22, 0.22, 0.22))
+    static let settingsControl = adaptiveColor(light: (241 / 255, 241 / 255, 241 / 255), dark: (0.20, 0.20, 0.20))
+    static let settingsControlHover = adaptiveColor(light: (232 / 255, 232 / 255, 232 / 255), dark: (0.26, 0.26, 0.26))
+    static let settingsRowHover = adaptiveColor(light: (248 / 255, 248 / 255, 248 / 255), dark: (0.19, 0.19, 0.19))
+    static let settingsBorder = settingsInk.opacity(0.075)
+    static let settingsNavActive = adaptiveColor(light: (0.10, 0.10, 0.10), dark: (0.92, 0.92, 0.92))
+    static let settingsText = adaptiveColor(light: (0.075, 0.075, 0.075), dark: (0.94, 0.94, 0.94))
+    static let settingsTextSecondary = adaptiveColor(light: (0.30, 0.30, 0.30), dark: (0.78, 0.78, 0.78))
+    static let settingsTextTertiary = adaptiveColor(light: (0.48, 0.48, 0.48), dark: (0.67, 0.67, 0.67))
+    static let settingsOnStrong = adaptiveColor(light: (1, 1, 1), dark: (0.08, 0.08, 0.08))
+    static let settingsAccentGreen = adaptiveColor(light: (0.30, 0.62, 0.35), dark: (0.46, 0.82, 0.51))
+    static let settingsAccentAmber = adaptiveColor(light: (0.78, 0.55, 0.15), dark: (0.94, 0.72, 0.32))
+    static let settingsAccentRed = adaptiveColor(light: (0.80, 0.28, 0.22), dark: (1.0, 0.55, 0.49))
+    static let settingsAccentBlue = adaptiveColor(light: (0.15, 0.36, 0.94), dark: (0.52, 0.72, 1.0))
 
     // MARK: Spacing
 
@@ -114,6 +160,8 @@ enum TF {
     static let recordingTrailingInset: CGFloat = 10
     static let recordingEdgeInset: CGFloat = recordingTrailingInset
     static let recordingControlGap: CGFloat = 8
+    static let recordingTextEdgeInset: CGFloat = 8
+    static let recordingTextEdgeFadeWidth: CGFloat = 14
     static let recordingTooltipGap: CGFloat = 5
     static let recordingTooltipMaxWidth: CGFloat = 180
     static let recordingCapsuleSpringResponse = 0.3
@@ -126,17 +174,17 @@ enum TF {
         0,
         recordingTooltipMaxWidth / 2 - recordingLeadingInset - recordingFinishControlSize / 2
     )
+    // Fixed control chrome. FloatingBarView adds the text inset for the
+    // actual trailing boundary: the visible cancel circle or the capsule edge.
     static let recordingChromeWidth: CGFloat = recordingFinishControlSize
         + recordingCancelControlSize
         + recordingLeadingInset
         + recordingTrailingInset
         + recordingControlGap * 2
-        + 16
     static let recordingSingleButtonChromeWidth: CGFloat = recordingFinishControlSize
         + recordingLeadingInset
         + recordingTrailingInset
         + recordingControlGap
-        + 16
 
     // MARK: Transcript Popup (hover preview above bar)
 
@@ -149,7 +197,16 @@ enum TF {
 
     static let compactIndicatorWidth: CGFloat = barWidthCompact
     static let compactIndicatorHeight: CGFloat = 24
+    static let compactTranscriptLaneHeight: CGFloat = 24
+    static let compactTranscriptExpandedHeight: CGFloat = 48
+    static let compactTranscriptFontSize: CGFloat = 12
+    static let compactTranscriptCornerRadius: CGFloat = 10
+    static let compactTranscriptHorizontalInset: CGFloat = 8
+    static let compactTranscriptLeadingFadeWidth: CGFloat = 10
     static let compactIndicatorControlVisualSize: CGFloat = 15
+    /// Width of a compact control's tap lane. The capsule is balanced only when
+    /// the lanes on both edges match, so hiding one control skews the waveform.
+    static let compactIndicatorControlWidth: CGFloat = 32
     static let compactIndicatorWaveBarWidth: CGFloat = 2
     static let compactIndicatorWaveMinHeight: CGFloat = 2
     static let compactIndicatorWaveMaxHeight: CGFloat = 18
@@ -157,6 +214,10 @@ enum TF {
 
     static let compactIndicatorActive = floatingControlLight
     static let compactIndicatorInactive = recordingTooltipBadge
+    /// Quiescent waveform dots on the light capsule. Kept heavier than the
+    /// original 0.18 so the idle track still reads against a glass surface that
+    /// the host page's backdrop has darkened.
+    static let compactIndicatorInactiveLight = Color.black.opacity(0.28)
 
     // MARK: Animation
 

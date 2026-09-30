@@ -35,6 +35,56 @@ final class BindingCounters: @unchecked Sendable {
 /// standalone modifier hotkey state machine lifecycle (Issue #243 / MSOR-7).
 final class HotkeyStateMachineTests: XCTestCase {
 
+    func testManualComposerConsumesModePressWithoutStartingVoiceOrHoldTimer() {
+        for style in [ProcessingMode.HotkeyStyle.hold, .toggle] {
+            let manager = makeManager()
+            let counters = BindingCounters()
+            let modeID = UUID()
+            let binding = style == .hold
+                ? makeHoldBinding(modeId: modeID, counters: counters)
+                : makeToggleBinding(modeId: modeID, counters: counters)
+            var submittedModes: [UUID] = []
+            manager.onManualModePress = { submittedModes.append($0); return true }
+            manager.registerBindings([binding])
+            manager.simulateBindingEvent(binding, pressed: true)
+            manager.simulateBindingEvent(binding, pressed: false)
+            XCTAssertEqual(submittedModes, [modeID])
+            XCTAssertEqual(counters.startCount, 0)
+            XCTAssertEqual(counters.stopCount, 0)
+            XCTAssertFalse(manager.isActiveRecordingBinding(binding.bindingId))
+            XCTAssertFalse(manager.isHoldActive(for: binding.bindingId))
+            XCTAssertFalse(manager.hasPendingSafetyTimer(for: binding.bindingId))
+
+            // Closing the composer restores the ordinary voice route.
+            manager.onManualModePress = { _ in false }
+            manager.simulateBindingEvent(binding, pressed: true)
+            XCTAssertEqual(counters.startCount, 1)
+            manager.simulateStopActiveRecording()
+        }
+    }
+
+    func testManualModePressDoesNotStopLauncherOwnedSession() {
+        let manager = makeManager()
+        let voice = BindingCounters()
+        let launcher = BindingCounters()
+        let global = ModeBinding(bindingId: UUID(), owner: .manualInput,
+                                 keyCode: 49, modifiers: [.maskControl, .maskAlternate], style: .toggle,
+                                 onStart: { launcher.recordStart() },
+                                 onStop: { launcher.recordStop() }, onAbort: {})
+        let mode = makeHoldBinding(counters: voice)
+        manager.registerBindings([global, mode])
+        manager.simulateBindingEvent(global, pressed: true)
+        manager.onManualModePress = { _ in true }
+        manager.simulateBindingEvent(mode, pressed: true)
+        manager.simulateBindingEvent(mode, pressed: false)
+        XCTAssertEqual(launcher.startCount, 1)
+        XCTAssertEqual(launcher.stopCount, 0)
+        XCTAssertTrue(manager.isActiveRecordingBinding(global.bindingId))
+        XCTAssertEqual(voice.startCount, 0)
+        XCTAssertEqual(voice.stopCount, 0)
+        manager.resetActiveState()
+    }
+
     // MARK: - Fixtures
 
     private func makeManager() -> HotkeyManager {
@@ -43,11 +93,10 @@ final class HotkeyStateMachineTests: XCTestCase {
         return manager
     }
 
-    func testKeyboardHotkeysPreferHIDTapBeforeSessionFallback() {
+    func testKeyboardHotkeysPreferSessionTap() {
         XCTAssertEqual(
             HotkeyManager.tapLocationPriority.map(\.rawValue),
             [
-                CGEventTapLocation.cghidEventTap.rawValue,
                 CGEventTapLocation.cgSessionEventTap.rawValue,
             ]
         )
@@ -482,26 +531,30 @@ final class HotkeyStateMachineTests: XCTestCase {
         // 1. Left Command tap (toggle on)
         _ = manager.simulateModifierFlags(.maskCommand, rawFlags: leftCmdRaw, keyCode: 55)
         XCTAssertEqual(leftCounters.startCount, 0)
-        _ = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 55)
+        let swallowedLeftStart = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 55)
+        XCTAssertTrue(swallowedLeftStart, "A modifier release that dispatches a hotkey must be swallowed")
         XCTAssertEqual(leftCounters.startCount, 1)
         XCTAssertTrue(manager.isActiveRecordingBinding(leftCmdBinding.bindingId))
 
         // 2. Left Command tap (toggle off)
         _ = manager.simulateModifierFlags(.maskCommand, rawFlags: leftCmdRaw, keyCode: 55)
-        _ = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 55)
+        let swallowedLeftStop = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 55)
+        XCTAssertTrue(swallowedLeftStop, "The stop release must not reach the target application")
         XCTAssertEqual(leftCounters.stopCount, 1)
         XCTAssertFalse(manager.isActiveRecordingBinding(leftCmdBinding.bindingId))
 
         // 3. Right Command tap (toggle on)
         _ = manager.simulateModifierFlags(.maskCommand, rawFlags: rightCmdRaw, keyCode: 54)
         XCTAssertEqual(rightCounters.startCount, 0)
-        _ = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 54)
+        let swallowedRightStart = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 54)
+        XCTAssertTrue(swallowedRightStart)
         XCTAssertEqual(rightCounters.startCount, 1)
         XCTAssertTrue(manager.isActiveRecordingBinding(rightCmdBinding.bindingId))
 
         // 4. Right Command tap (toggle off)
         _ = manager.simulateModifierFlags(.maskCommand, rawFlags: rightCmdRaw, keyCode: 54)
-        _ = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 54)
+        let swallowedRightStop = manager.simulateModifierFlags([], rawFlags: 0, keyCode: 54)
+        XCTAssertTrue(swallowedRightStop)
         XCTAssertEqual(rightCounters.stopCount, 1)
         XCTAssertFalse(manager.isActiveRecordingBinding(rightCmdBinding.bindingId))
     }
@@ -1160,5 +1213,122 @@ final class HotkeyStateMachineTests: XCTestCase {
         XCTAssertEqual(gate.pendingToken, 8)
         gate.cancel(token: 8)
         XCTAssertFalse(gate.isSuppressingEvents)
+    }
+
+    // MARK: - Event Tap Recovery Policy & Lifecycle Tests
+
+    func testEventTapRecoveryActionPolicy() {
+        XCTAssertEqual(
+            HotkeyManager.recoveryAction(for: .tapDisabledByUserInput, isAccessibilityTrusted: false),
+            .revoke
+        )
+        XCTAssertEqual(
+            HotkeyManager.recoveryAction(for: .tapDisabledByTimeout, isAccessibilityTrusted: false),
+            .revoke
+        )
+        XCTAssertEqual(
+            HotkeyManager.recoveryAction(for: .tapDisabledByUserInput, isAccessibilityTrusted: true),
+            .reenable
+        )
+        XCTAssertEqual(
+            HotkeyManager.recoveryAction(for: .tapDisabledByTimeout, isAccessibilityTrusted: true),
+            .reenable
+        )
+        XCTAssertEqual(
+            HotkeyManager.recoveryAction(for: .keyDown, isAccessibilityTrusted: false),
+            .passThrough
+        )
+        XCTAssertEqual(
+            HotkeyManager.recoveryAction(for: .keyDown, isAccessibilityTrusted: true),
+            .passThrough
+        )
+    }
+
+    func testRepeatedStopLeavesStoppedStateWithoutRevocationCallback() {
+        let manager = makeManager()
+        var revocationCount = 0
+        manager.onAccessibilityRevoked = {
+            revocationCount += 1
+        }
+
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "stopped")
+        manager.stop()
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "stopped")
+        manager.stop()
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "stopped")
+
+        let exp = expectation(description: "No async revocation callback")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 0.2)
+        XCTAssertEqual(revocationCount, 0)
+    }
+
+    func testSimulatedPermissionLossLifecycleAndOneShotRevocationCallback() {
+        let manager = makeManager()
+        var revocationCount = 0
+        manager.onAccessibilityRevoked = {
+            revocationCount += 1
+        }
+
+        // First transition to revoked
+        manager.simulateRevocationForTesting()
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "revoked")
+
+        let exp1 = expectation(description: "First revocation callback dispatched")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            exp1.fulfill()
+        }
+        wait(for: [exp1], timeout: 0.2)
+        XCTAssertEqual(revocationCount, 1)
+
+        // Second simulated loss in the same generation must not emit again
+        manager.simulateRevocationForTesting()
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "revoked")
+
+        let exp2 = expectation(description: "Duplicate revocation suppressed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            exp2.fulfill()
+        }
+        wait(for: [exp2], timeout: 0.2)
+        XCTAssertEqual(revocationCount, 1)
+
+        // Reset generation after simulated successful start
+        manager.resetRevocationGenerationForTesting()
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "running")
+
+        // Next revocation in new generation should emit once more
+        manager.simulateRevocationForTesting()
+        XCTAssertEqual(manager.eventTapLifecycleStateDescription, "revoked")
+
+        let exp3 = expectation(description: "New generation revocation callback dispatched")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            exp3.fulfill()
+        }
+        wait(for: [exp3], timeout: 0.2)
+        XCTAssertEqual(revocationCount, 2)
+    }
+
+    func testInitialStartWithoutPermissionDoesNotEmitRevocationCallback() {
+        let manager = makeManager()
+        var revocationCount = 0
+        manager.onAccessibilityRevoked = {
+            revocationCount += 1
+        }
+
+        // If permission is absent, calling start() should transition to revoked but NOT emit revocation callback
+        if !PermissionManager.hasAccessibilityPermission {
+            let started = manager.start()
+            XCTAssertFalse(started)
+            XCTAssertEqual(manager.eventTapLifecycleStateDescription, "revoked")
+
+            let exp = expectation(description: "No revocation callback on initial start")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                exp.fulfill()
+            }
+            wait(for: [exp], timeout: 0.2)
+            XCTAssertEqual(revocationCount, 0, "Initial denial must not trigger onAccessibilityRevoked")
+        }
     }
 }

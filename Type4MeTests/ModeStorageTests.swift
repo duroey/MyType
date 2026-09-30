@@ -10,6 +10,37 @@ final class ModeStorageTests: XCTestCase {
         try? FileManager.default.removeItem(at: testURL)
     }
 
+    func testManualInputHotkeysSurviveCanonicalModeReload() throws {
+        let suite = "ModeStorageTests.ManualInput.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let storage = ModeStorage(fileURL: testURL, userDefaults: defaults)
+        var modes = ProcessingMode.builtins + [ProcessingMode.translate]
+        for index in modes.indices where modes[index].supportsManualInput {
+            modes[index].manualInputHotkey = HotkeyBinding(keyCode: 40 + index, modifiers: 0, style: .toggle)
+        }
+        try storage.save(modes)
+        let loaded = storage.load()
+        for mode in modes where mode.supportsManualInput {
+            XCTAssertEqual(loaded.first { $0.id == mode.id }?.manualInputHotkey,
+                           mode.manualInputHotkey, mode.name)
+            XCTAssertEqual(loaded.first { $0.id == mode.id }?.hotkeyBindings,
+                           mode.hotkeyBindings, "Voice bindings must remain independent")
+        }
+    }
+
+    func testLegacyModeDoesNotAcquireManualInputHotkey() throws {
+        let json = """
+        {"id":"\(UUID().uuidString)","name":"Legacy","prompt":"Translate {text}","isBuiltin":false,"hotkeyCode":18,"hotkeyModifiers":524288}
+        """
+        let mode = try JSONDecoder().decode(ProcessingMode.self, from: Data(json.utf8))
+        XCTAssertNil(mode.manualInputHotkey)
+        XCTAssertEqual(mode.hotkeyBindings.count, 1)
+        XCTAssertTrue(mode.supportsManualInput)
+        XCTAssertFalse(ProcessingMode.direct.supportsManualInput)
+        XCTAssertTrue(ProcessingMode.translation().supportsManualInput)
+    }
+
     func testSaveAndLoad() throws {
         let storage = ModeStorage(fileURL: testURL)
         let modes = ProcessingMode.builtins + [

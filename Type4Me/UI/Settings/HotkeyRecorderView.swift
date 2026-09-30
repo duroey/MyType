@@ -5,6 +5,8 @@ struct HotkeyRecorderView: View {
 
     @Binding var keyCode: Int?
     @Binding var modifiers: UInt64?
+    var onCapture: ((Int, UInt64) -> Void)? = nil
+    var onClear: (() -> Void)? = nil
 
     @State private var isRecording = false
     @State private var eventMonitor: Any?
@@ -44,8 +46,10 @@ struct HotkeyRecorderView: View {
 
                 if keyCode != nil {
                     Button(L("清除", "Clear")) {
-                        keyCode = nil
-                        modifiers = nil
+                        if let onClear { onClear() } else {
+                            keyCode = nil
+                            modifiers = nil
+                        }
                     }
                     .buttonStyle(RecorderControlButtonStyle(isDestructive: true))
                 }
@@ -91,9 +95,7 @@ struct HotkeyRecorderView: View {
                 modifierCaptureTask = nil
                 pendingModifierCode = nil
 
-                keyCode = ModeBinding.mediaKeyCode(for: keyType)
-                modifiers = 0
-                stopRecording()
+                acceptCapture(ModeBinding.mediaKeyCode(for: keyType), modifiers: 0)
                 return nil
             }
 
@@ -105,9 +107,7 @@ struct HotkeyRecorderView: View {
                 modifierCaptureTask = nil
                 pendingModifierCode = nil
 
-                keyCode = ModeBinding.mouseKeyCode(for: buttonNumber)
-                modifiers = 0
-                stopRecording()
+                acceptCapture(ModeBinding.mouseKeyCode(for: buttonNumber), modifiers: 0)
                 return nil  // Swallow the mouse event
             }
 
@@ -134,11 +134,7 @@ struct HotkeyRecorderView: View {
                     if let pending = pendingModifierCode {
                         modifierCaptureTask?.cancel()
                         modifierCaptureTask = nil
-                        keyCode = pending
-                        modifiers = pendingModifierModifiers
-                        pendingModifierCode = nil
-                        pendingModifierModifiers = 0
-                        stopRecording()
+                        acceptCapture(pending, modifiers: pendingModifierModifiers)
                     }
                 }
                 return event
@@ -156,11 +152,9 @@ struct HotkeyRecorderView: View {
                     stopRecording()
                     return nil
                 }
-                keyCode = kc
-                // Store modifier flags, stripping only non-hotkey noise.
+                // Store the complete combination atomically.
                 let clean = Self.sanitizedModifierFlags(event.modifierFlags, forKeyCode: kc)
-                modifiers = clean.isEmpty ? 0 : UInt64(clean.rawValue)
-                stopRecording()
+                acceptCapture(kc, modifiers: clean.isEmpty ? 0 : UInt64(clean.rawValue))
                 return nil
             }
 
@@ -170,9 +164,15 @@ struct HotkeyRecorderView: View {
 
     @MainActor
     private func captureModifierOnlyKey(_ keyCode: Int, modifiers: UInt64 = 0) {
-        self.keyCode = keyCode
-        self.modifiers = modifiers
+        acceptCapture(keyCode, modifiers: modifiers)
+    }
+
+    private func acceptCapture(_ code: Int, modifiers mods: UInt64) {
         stopRecording()
+        if let onCapture { onCapture(code, mods) } else {
+            keyCode = code
+            modifiers = mods
+        }
     }
 
     private func stopRecording() {

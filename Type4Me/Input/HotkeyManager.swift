@@ -9,6 +9,7 @@ enum GlobalHotkeyAction: String, Codable, Sendable {
 
 enum HotkeyOwner: Hashable, Sendable {
     case mode(UUID)
+    case manualInput
     case globalAction(GlobalHotkeyAction)
 }
 
@@ -361,11 +362,9 @@ final class HotkeyManager: NSObject {
 
     // MARK: - Configuration
 
-    /// Global keyboard shortcuts must be observed before app-level consumers such as
-    /// Feishu/Lark can consume a bare Fn event. Always prefer the HID tap and retain the
-    /// session tap as a compatibility fallback when HID access is unavailable.
+    /// Session-level tap ensures global shortcuts work reliably without intercepting
+    /// hardware IOHID streams, preventing kernel-level input freezes upon runtime permission changes.
     internal static let tapLocationPriority: [CGEventTapLocation] = [
-        .cghidEventTap,
         .cgSessionEventTap,
     ]
 
@@ -383,6 +382,8 @@ final class HotkeyManager: NSObject {
     private var activeRecordingModeId: UUID?
     private var activeRecordingOwner: HotkeyOwner?
     var onBusyConflict: (() -> Void)?
+    /// An open typed composer consumes mode presses without starting audio.
+    var onManualModePress: ((UUID) -> Bool)?
 
     private enum ModifierGestureState: Equatable {
         case idle
@@ -428,6 +429,8 @@ final class HotkeyManager: NSObject {
     /// When true, ESC key aborts active recording.
     var isESCAbortEnabled = true
 
+    /// Let Escape dismiss an IME candidate before cancelling the typed draft.
+    var passesEscapeToInputMethod: (() -> Bool)?
     /// When true, LLM post-processing is in progress (ESC can also abort this).
     var isProcessing = false
 
@@ -480,16 +483,79 @@ final class HotkeyManager: NSObject {
     /// Returns true when the event should be swallowed.
     var onKeyboardEvent: ((CGEventType, CGEvent) -> Bool)?
 
+    /// Accessibility trust consulted for every handled event. Tests drive
+    /// `handleEvent` directly from a process that is never trusted, so they
+    /// substitute a fixed answer instead of the live system check.
+    var isAccessibilityTrusted: () -> Bool = { PermissionManager.hasAccessibilityPermission }
+
+    internal enum EventTapRecoveryAction: Equatable {
+        case reenable
+        case revoke
+        case passThrough
+    }
+
+    private enum EventTapLifecycleState: Equatable {
+        case stopped
+        case starting
+        case running
+        case stopping
+        case revoked
+    }
+
+    private var eventTapLifecycleState: EventTapLifecycleState = .stopped
+    private var eventTapRunLoop: CFRunLoop?
+    private var hasEmittedAccessibilityRevoked = false
+    var onAccessibilityRevoked: (() -> Void)?
+
+    internal var eventTapLifecycleStateDescription: String {
+        switch eventTapLifecycleState {
+        case .stopped: return "stopped"
+        case .starting: return "starting"
+        case .running: return "running"
+        case .stopping: return "stopping"
+        case .revoked: return "revoked"
+        }
+    }
+
+    internal static func recoveryAction(
+        for type: CGEventType,
+        isAccessibilityTrusted: Bool
+    ) -> EventTapRecoveryAction {
+        if !isAccessibilityTrusted {
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                return .revoke
+            }
+        } else {
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                return .reenable
+            }
+        }
+        return .passThrough
+    }
+    internal func simulateRevocationForTesting() {
+        if eventTapLifecycleState != .running && eventTapLifecycleState != .revoked {
+            eventTapLifecycleState = .running
+        }
+        tearDownEventTap(finalState: .revoked)
+    }
+
+    internal func resetRevocationGenerationForTesting() {
+        hasEmittedAccessibilityRevoked = false
+        eventTapLifecycleState = .running
+    }
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var healthCheckTimer: Timer?
     /// Timestamp of the last event received by the tap callback.
     fileprivate var lastEventTime: Date?
+    /// Set only while dispatching a binding callback from the current event.
+    /// Modifier-only releases consult this so the stop event itself is swallowed.
+    private var didDispatchBindingCallback = false
 
     /// Tokens for MPRemoteCommandCenter handlers (prevents Apple Music from auto-launching).
     private var mediaCommandTokens: [(command: MPRemoteCommand, token: Any)] = []
     private var isMediaSessionActive = false
-
     // MARK: - Registration
 
     func registerBindings(_ newBindings: [ModeBinding]) {
@@ -510,6 +576,21 @@ final class HotkeyManager: NSObject {
 
     @discardableResult
     func start() -> Bool {
+        if eventTapLifecycleState == .running,
+           let tap = eventTap,
+           CFMachPortIsValid(tap),
+           CGEvent.tapIsEnabled(tap: tap) {
+            return true
+        }
+
+        guard PermissionManager.hasAccessibilityPermission else {
+            tearDownEventTap(finalState: .revoked)
+            return false
+        }
+
+        tearDownEventTap(finalState: .stopped)
+        eventTapLifecycleState = .starting
+
         let hasMediaKeyBindings = bindings.contains { $0.isMediaKey }
 
         let eventMask: CGEventMask =
@@ -519,7 +600,6 @@ final class HotkeyManager: NSObject {
             | (1 << CGEventType.otherMouseDown.rawValue)
             | (1 << CGEventType.otherMouseUp.rawValue)
             | (hasMediaKeyBindings ? (1 << 14) : 0)  // kCGEventSystemDefined (NX_SYSDEFINED) for media/headphone keys
-
         let userInfo = Unmanaged.passUnretained(self).toOpaque()
 
         var tap: CFMachPort?
@@ -539,6 +619,7 @@ final class HotkeyManager: NSObject {
         }
 
         guard let tap = tap else {
+            tearDownEventTap(finalState: .stopped)
             return false
         }
 
@@ -550,10 +631,19 @@ final class HotkeyManager: NSObject {
         eventTap = tap
         lastEventTime = nil
 
+        let currentRunLoop = CFRunLoopGetCurrent()
+        eventTapRunLoop = currentRunLoop
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         runLoopSource = source
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CFRunLoopAddSource(currentRunLoop, source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        guard CGEvent.tapIsEnabled(tap: tap) else {
+            tearDownEventTap(finalState: .stopped)
+            return false
+        }
+
+        eventTapLifecycleState = .running
+        hasEmittedAccessibilityRevoked = false
 
         startHealthCheck()
         updateMediaKeySession()
@@ -561,18 +651,33 @@ final class HotkeyManager: NSObject {
     }
 
     func stop() {
-        deactivateMediaKeySession()
+        tearDownEventTap(finalState: .stopped)
+    }
+
+    private func tearDownEventTap(finalState: EventTapLifecycleState) {
+        let previousState = eventTapLifecycleState
+        eventTapLifecycleState = .stopping
+
         healthCheckTimer?.invalidate()
         healthCheckTimer = nil
+        deactivateMediaKeySession()
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            let runLoop = eventTapRunLoop ?? CFRunLoopGetCurrent()
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFRunLoopSourceInvalidate(source)
         }
+        if let tap = eventTap {
+            CFMachPortInvalidate(tap)
+        }
+
         eventTap = nil
         runLoopSource = nil
+        eventTapRunLoop = nil
         lastEventTime = nil
+
         holdState = [:]
         wasModifierDown = [:]
         clearActiveRecordingState()
@@ -582,16 +687,35 @@ final class HotkeyManager: NSObject {
         gestureState = .idle
         previousModifierFlags = []
         heldModifierKeyCodes.removeAll()
+
+        eventTapLifecycleState = finalState
+
+        if finalState == .revoked {
+            if previousState == .running && !hasEmittedAccessibilityRevoked {
+                hasEmittedAccessibilityRevoked = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.onAccessibilityRevoked?()
+                }
+            }
+        }
     }
 
     // MARK: - Health check
 
-    /// Periodically verify the event tap is actually alive.
-    /// Detects the "silent disable" race where tapCreate succeeds but the tap is dead.
+    /// Periodically verify the event tap is actually alive and permission has not been lost.
     private func startHealthCheck() {
         healthCheckTimer?.invalidate()
-        healthCheckTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
-            guard let self, let tap = self.eventTap else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.eventTapLifecycleState == .running else { return }
+
+            guard PermissionManager.hasAccessibilityPermission else {
+                DebugFileLogger.log("hotkey watchdog detected accessibility permission loss")
+                self.tearDownEventTap(finalState: .revoked)
+                return
+            }
+
+            guard let tap = self.eventTap else { return }
 
             // Check 1: Is the tap port still valid? Only recreate the tap for real invalidation,
             // not for normal idle periods with no keyboard/mouse input.
@@ -611,10 +735,15 @@ final class HotkeyManager: NSObject {
                 }
             }
         }
+        RunLoop.current.add(timer, forMode: .common)
+        healthCheckTimer = timer
     }
-
     /// Tear down and recreate the event tap from scratch.
     private func reinstallTap() {
+        guard PermissionManager.hasAccessibilityPermission else {
+            tearDownEventTap(finalState: .revoked)
+            return
+        }
         stop()
         let ok = start()
         NSLog("[mytype] Tap reinstall: %@", ok ? "OK" : "FAILED")
@@ -624,18 +753,48 @@ final class HotkeyManager: NSObject {
 
     func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         lastEventTime = Date()
+        didDispatchBindingCallback = false
 
-        // Re-enable tap if system disabled it, and recover any stuck hold states.
-        // When macOS disables the tap (main thread blocked >1s), keyUp events are lost.
-        // We must check if held keys are still physically down; if not, fire onStop.
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        // Immediate fail-open guard: if Accessibility permission was revoked at runtime,
+        // tear down the active tap immediately and pass the event untouched to the system.
+        let isTrusted = isAccessibilityTrusted()
+        guard isTrusted else {
+            DebugFileLogger.log("hotkey event tap untrusted during event handling, tearing down immediately")
+            tearDownEventTap(finalState: .revoked)
+            return Unmanaged.passUnretained(event)
+        }
+        let recovery = Self.recoveryAction(
+            for: type,
+            isAccessibilityTrusted: isTrusted
+        )
+        switch recovery {
+        case .revoke:
+            DebugFileLogger.log("hotkey event tap revoked on disabled event type=\(type.rawValue)")
+            tearDownEventTap(finalState: .revoked)
+            return Unmanaged.passUnretained(event)
+        case .reenable:
             DebugFileLogger.log(
                 "hotkey event tap disabled type=\(type.rawValue) recording=\(activeRecordingBindingId != nil)"
             )
-            if let tap = eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
-            }
             recoverStuckHolds()
+            if let tap = eventTap, CFMachPortIsValid(tap) {
+                CGEvent.tapEnable(tap: tap, enable: true)
+                if !CGEvent.tapIsEnabled(tap: tap) {
+                    reinstallTap()
+                }
+            } else {
+                reinstallTap()
+            }
+            return Unmanaged.passUnretained(event)
+        case .passThrough:
+            break
+        }
+
+
+
+        // Type4Me's own Cmd+C / Delete / Cmd+V events must reach the target
+        // application but must never trigger a user-configured Type4Me hotkey.
+        if TextInjectionEngine.isSyntheticInput(event) {
             return Unmanaged.passUnretained(event)
         }
 
@@ -643,6 +802,8 @@ final class HotkeyManager: NSObject {
         if isSuppressed {
             return Unmanaged.passUnretained(event)
         }
+
+
 
         // MARK: Mouse button events (otherMouseDown/Up = middle + side buttons)
         if type == .otherMouseDown || type == .otherMouseUp {
@@ -734,7 +895,9 @@ final class HotkeyManager: NSObject {
                 rawFlags: event.flags.rawValue,
                 keyCode: keyCode
             )
-            return matchedCombo ? nil : Unmanaged.passUnretained(event)
+            return (matchedCombo || didDispatchBindingCallback)
+                ? nil
+                : Unmanaged.passUnretained(event)
         }
 
         if onKeyboardEvent?(type, event) == true {
@@ -774,6 +937,7 @@ final class HotkeyManager: NSObject {
 
         // ESC key (keyCode 53) - let the app validate the real session phase.
         if isESCAbortEnabled && type == .keyDown && keyCode == 53 {
+            if passesEscapeToInputMethod?() == true { return Unmanaged.passUnretained(event) }
             if handleEscapeAbort() {
                 return nil
             }
@@ -838,6 +1002,7 @@ final class HotkeyManager: NSObject {
     /// A toggle binding was pressed. Start when idle, stop when the same owner is recording,
     /// or hand off to cross-mode switching when a different mode is recording.
     private func handleTogglePress(binding: ModeBinding) {
+        if case .mode(let id) = binding.owner, onManualModePress?(id) == true { return }
         if activeRecordingBindingId != nil {
             if activeRecordingOwner == binding.owner {
                 // Same owner (same binding = toggle off, or a sibling binding): stop.
@@ -845,7 +1010,7 @@ final class HotkeyManager: NSObject {
             } else if case .mode = activeRecordingOwner, case .mode(let targetModeId) = binding.owner {
                 // Different mode: finish the current recording through the app's policy.
                 clearActiveRecordingState()
-                onCrossModeFinish?(targetModeId)
+                dispatchCrossModeFinish(targetModeId)
             } else if case .globalAction(.revise) = activeRecordingOwner, case .mode = binding.owner {
                 // Cross-mode finish for revise: pressing any mode key stops the revise recording.
                 stopActiveRecording()
@@ -865,6 +1030,7 @@ final class HotkeyManager: NSObject {
 
     /// A hold binding went down.
     private func handleHoldPress(binding: ModeBinding) {
+        if case .mode(let id) = binding.owner, onManualModePress?(id) == true { return }
         let bindingId = binding.bindingId
         // Ignore repeated down while already holding this binding.
         guard holdState[bindingId] != true else { return }
@@ -877,7 +1043,7 @@ final class HotkeyManager: NSObject {
             } else if case .mode = activeRecordingOwner, case .mode(let targetModeId) = binding.owner {
                 // Different mode: finish the current recording through the app's policy.
                 clearActiveRecordingState()
-                onCrossModeFinish?(targetModeId)
+                dispatchCrossModeFinish(targetModeId)
             } else if case .globalAction(.revise) = activeRecordingOwner, case .mode = binding.owner {
                 // Cross-mode finish for revise: pressing any mode key stops the revise recording.
                 stopActiveRecording()
@@ -921,14 +1087,30 @@ final class HotkeyManager: NSObject {
         activeRecordingBindingId = binding.bindingId
         activeRecordingModeId = binding.modeId
         activeRecordingOwner = binding.owner
-        binding.onStart()
+        // AppDelegate may detect that its session is already recording and
+        // reinterpret this nominal start callback as a stop. Route it through
+        // the same authorization gate so that desync recovery can still capture
+        // the actual hotkey event, without opening non-hotkey capture paths.
+        dispatchBindingCallback(binding.onStart)
     }
 
     /// Stop the active recording, invoking its binding's `onStop`.
     private func stopActiveRecording() {
         let active = activeRecordingBinding()
         clearActiveRecordingState()
-        active?.onStop()
+        if let active {
+            dispatchBindingCallback(active.onStop)
+        }
+    }
+
+    private func dispatchCrossModeFinish(_ targetModeId: UUID) {
+        guard let onCrossModeFinish else { return }
+        dispatchBindingCallback { onCrossModeFinish(targetModeId) }
+    }
+
+    private func dispatchBindingCallback(_ callback: () -> Void) {
+        didDispatchBindingCallback = true
+        callback()
     }
 
     /// Clear all active-recording bookkeeping. This is the single point where an in-flight
@@ -1009,7 +1191,13 @@ final class HotkeyManager: NSObject {
         rawFlags: UInt64? = nil,
         keyCode: CGKeyCode? = nil
     ) -> Bool {
-        evaluateModifierBindings(currentFlags: flags, rawFlags: rawFlags, keyCode: keyCode)
+        didDispatchBindingCallback = false
+        let matched = evaluateModifierBindings(
+            currentFlags: flags,
+            rawFlags: rawFlags,
+            keyCode: keyCode
+        )
+        return matched || didDispatchBindingCallback
     }
 
     /// Drive the regular-key pre-dispatch reducer with a synthetic regular key-down.
@@ -1352,7 +1540,7 @@ final class HotkeyManager: NSObject {
         if activeRecordingBindingId == id {
             stopActiveRecording()
         } else {
-            binding.onStop()
+            dispatchBindingCallback(binding.onStop)
         }
     }
 
@@ -1391,7 +1579,7 @@ final class HotkeyManager: NSObject {
                     if activeRecordingBindingId == id {
                         stopActiveRecording()
                     } else {
-                        binding.onStop()
+                        dispatchBindingCallback(binding.onStop)
                     }
                 }
             }

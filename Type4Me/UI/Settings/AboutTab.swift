@@ -21,9 +21,9 @@ struct AboutTab: View {
             Spacer().frame(height: 8)
 
             // App info rows
-            SettingsRow(label: L("版本", "Version"), value: appVersion)
+            SettingsRow(label: L("版本", "Version"), value: AppBuildInfo.current.version)
             SettingsDivider()
-            SettingsRow(label: L("构建", "Build"), value: buildNumber)
+            SettingsRow(label: L("构建", "Build"), value: AppBuildInfo.current.buildNumber)
             SettingsDivider()
             SettingsRow(label: L("平台", "Platform"), value: "macOS 14+")
             SettingsDivider()
@@ -267,15 +267,7 @@ struct AboutTab: View {
                     .foregroundStyle(TF.settingsTextTertiary)
             }
 
-            // Render each line of notes
-            let lines = update.notes.split(separator: "\n", omittingEmptySubsequences: false)
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                    Text(String(line))
-                        .font(.system(size: 12))
-                        .foregroundStyle(TF.settingsTextSecondary)
-                }
-            }
+            ReleaseNotesMarkupView(markup: update.notes)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -289,14 +281,6 @@ struct AboutTab: View {
     }
 
     // MARK: - Helpers
-
-    private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
-    }
-
-    private var buildNumber: String {
-        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
-    }
 
     private func linkButton(_ text: String, icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {

@@ -472,7 +472,7 @@ enum SoundFeedback {
         if let url = Bundle.main.url(forResource: filename, withExtension: "wav", subdirectory: "Sounds") {
             return url
         }
-        let appSupport = AppIdentity.appSupportDirectory()
+        let appSupport = AppDataLocation.profileDirectory
             .appendingPathComponent("Sounds", isDirectory: true)
         let url = appSupport.appendingPathComponent("\(filename).wav")
         return FileManager.default.fileExists(atPath: url.path) ? url : nil

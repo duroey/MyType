@@ -75,8 +75,10 @@ enum VolcProtocol: Sendable {
             // Cloud boosting table: skip inline hotwords, use table ID only
             corpus["boosting_table_id"] = boostingTableID
         } else if let contextString = buildContextString(hotwords: options.hotwords) {
-            // No cloud table: fall back to inline hotwords
-            requestDict["context"] = contextString
+            // No cloud table: fall back to inline hotwords. The documented
+            // field is `request.corpus.context`; a top-level `request.context`
+            // is not part of the bigmodel request schema.
+            corpus["context"] = contextString
         }
         if !corpus.isEmpty {
             requestDict["corpus"] = corpus
@@ -101,14 +103,54 @@ enum VolcProtocol: Sendable {
         return try! JSONSerialization.data(withJSONObject: payload)
     }
 
+    /// Documented direct-hotword budget for the bidirectional streaming endpoint.
+    static let inlineHotwordTokenBudget = 100
+
+    /// Hotwords that fit the direct-pass budget, in the user's list order.
+    static func inlineHotwords(_ hotwords: [String]) -> [String] {
+        var selected: [String] = []
+        var seen = Set<String>()
+        var usedTokens = 0
+        for raw in hotwords {
+            let word = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !word.isEmpty, seen.insert(word.lowercased()).inserted else { continue }
+            let cost = estimatedTokenCount(word)
+            guard usedTokens + cost <= inlineHotwordTokenBudget else { continue }
+            usedTokens += cost
+            selected.append(word)
+        }
+        return selected
+    }
+
+    /// Conservative estimate: one token per CJK character, and one token per
+    /// three characters of each Latin/digit run.
+    static func estimatedTokenCount(_ word: String) -> Int {
+        var tokens = 0
+        var latinRun = 0
+        func flushLatin() {
+            if latinRun > 0 { tokens += (latinRun + 2) / 3 }
+            latinRun = 0
+        }
+        for scalar in word.unicodeScalars {
+            if scalar.properties.isIdeographic {
+                flushLatin()
+                tokens += 1
+            } else if CharacterSet.alphanumerics.contains(scalar) {
+                latinRun += 1
+            } else {
+                flushLatin()
+            }
+        }
+        flushLatin()
+        return max(tokens, 1)
+    }
+
     private static func buildContextString(hotwords: [String]) -> String? {
         var contextObject: [String: Any] = [:]
 
-        let cleanedHotwords = hotwords
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        let cleanedHotwords = inlineHotwords(hotwords)
         if !cleanedHotwords.isEmpty {
-            contextObject["hotwords"] = cleanedHotwords.map { ["word": $0, "scale": 5.0] as [String: Any] }
+            contextObject["hotwords"] = cleanedHotwords.map { ["word": $0] }
         }
 
         guard !contextObject.isEmpty,
@@ -170,8 +212,102 @@ enum VolcProtocol: Sendable {
 
     // MARK: - Decode Server Message
 
+    /// Best-effort extraction of the code and text from a server error frame.
+    ///
+    /// The documented layout is header, 4-byte error code, 4-byte body size,
+    /// then the body, but no real error frame has ever been captured from this
+    /// client to confirm it — issue #290 reached us as a server-side error the
+    /// user only ever saw as a recording that stopped by itself. So rather than
+    /// trusting one offset and throwing `invalidPayload` when it does not fit,
+    /// this tries the plausible framings and returns whatever is readable.
+    /// Surfacing the server's own words matters more than parsing them
+    /// precisely; hiding them behind a parse failure is the actual defect.
+    static func extractServerError(_ data: Data) -> (code: Int?, message: String?) {
+        let headerBytes = Int((try? VolcHeader.decode(from: data))?.headerSize ?? 1) * 4
+        guard data.count > headerBytes else { return (nil, nil) }
+        let tail = Data(data[(data.startIndex + headerBytes)...])
+
+        var code: Int?
+        if tail.count >= 4 {
+            let value = tail.prefix(4).withUnsafeBytes { UInt32(bigEndian: $0.load(as: UInt32.self)) }
+            // Volcengine error codes are 8-digit. Anything else is far more
+            // likely to be a length prefix or the body itself, so it is
+            // dropped rather than reported as a bogus code.
+            if (10_000_000...99_999_999).contains(Int(value)) {
+                code = Int(value)
+            }
+        }
+
+        // Candidate bodies: the tail as-is, and with the code and size prefixes
+        // peeled off, each also tried gzip-decompressed.
+        var candidates: [Data] = []
+        for skip in [0, 4, 8] where tail.count > skip {
+            let slice = Data(tail[(tail.startIndex + skip)...])
+            candidates.append(slice)
+            if let inflated = try? gzipDecompress(slice) { candidates.append(inflated) }
+        }
+
+        for candidate in candidates {
+            if let found = readableError(from: candidate) {
+                // A code inside the body is unambiguous; the leading word is a
+                // guess about framing, so it only fills in when the body has none.
+                return (found.code ?? code, found.message)
+            }
+        }
+        return (code, nil)
+    }
+
+    /// Pulls a code and a human-readable error out of a byte slice: a JSON
+    /// object's fields if one is present, otherwise the raw text.
+    ///
+    /// Both shapes seen in this codebase are accepted — a body carrying its own
+    /// `code`, and one carrying only text with the code in the framing.
+    private static func readableError(from data: Data) -> (code: Int?, message: String?)? {
+        let keys = ["error", "message", "msg", "error_msg"]
+
+        func fromJSON(_ slice: Data) -> (code: Int?, message: String?)? {
+            guard let object = try? JSONSerialization.jsonObject(with: slice) as? [String: Any] else {
+                return nil
+            }
+            let code = object["code"] as? Int
+            for key in keys {
+                if let value = object[key] as? String, !value.isEmpty { return (code, value) }
+            }
+            return code.map { ($0, nil) }
+        }
+
+        if let found = fromJSON(data) { return found }
+
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        // The body may sit inside a larger slice when the framing guess is off.
+        if let open = text.firstIndex(of: "{"), let close = text.lastIndex(of: "}"), open < close {
+            let embedded = String(text[open...close])
+            if let found = fromJSON(Data(embedded.utf8)) { return found }
+        }
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Reject slices that are mostly control bytes: those are framing, not a
+        // message. Decoding succeeded only because those bytes happen to be
+        // valid UTF-8.
+        let scalars = trimmed.unicodeScalars
+        let printable = scalars.filter { $0.value >= 0x20 }.count
+        guard printable * 4 >= scalars.count * 3 else { return nil }
+        return (nil, String(trimmed.prefix(200)))
+    }
+
     static func decodeServerResponse(_ data: Data) throws -> VolcServerResponse {
         let header = try VolcHeader.decode(from: data)
+
+        // Handled before any length parsing: an error frame's framing is the
+        // part we cannot verify, and a strict parse here would replace the
+        // server's message with `invalidPayload`.
+        if header.messageType == .serverError {
+            let extracted = extractServerError(data)
+            throw VolcProtocolError.serverError(code: extracted.code, message: extracted.message)
+        }
+
         let headerBytes = Int(header.headerSize) * 4
         var offset = headerBytes
 
@@ -194,22 +330,6 @@ enum VolcProtocol: Sendable {
         }
 
         var payload = data[data.startIndex + offset ..< data.startIndex + offset + payloadSize]
-
-        // Handle server error
-        if header.messageType == .serverError {
-            // Error payload may also be compressed/JSON
-            if header.compression == .gzip {
-                payload = try gzipDecompress(Data(payload))
-            }
-            if header.serialization == .json, !payload.isEmpty {
-                if let json = try? JSONSerialization.jsonObject(with: Data(payload)) as? [String: Any] {
-                    let code = json["code"] as? Int
-                    let message = json["message"] as? String
-                    throw VolcProtocolError.serverError(code: code, message: message)
-                }
-            }
-            throw VolcProtocolError.serverError(code: nil, message: nil)
-        }
 
         // Decompress if needed
         if header.compression == .gzip {

@@ -1,12 +1,12 @@
 # Type4Me 改口（Revise）开发设计
 
 > 文档类型：开发设计
-> 文档状态：当前有效（设计完成，待实现）
+> 文档状态：当前有效（已实现，持续验证）
 > 适用平台：Type4Me macOS 14+
 > 对应产品设计：`docs/features/revise/product-design.md`
 > 设计日期：2026-08-18
-> 最后校验：2026-08-18
-> 实现基线：当前工作树（待实现）
+> 最后校验：2026-09-24
+> 实现基线：`d57ce17`（PR #322）
 > 阅读说明：本文基于 2026-08-18 当前代码结构设计；实现时若基础设施已变化，必须保持本文的产品契约、并发门和安全失败语义
 
 ---
@@ -1025,7 +1025,6 @@ func startReviseRecording(_ target: RevisePreparedTarget) async {
 - translation target freeze；
 - Ask Anything request context；
 - `PromptContext` 或剪贴板上下文；
-- speculative LLM；
 - short-text exemption；
 - Mac Action / Selection Ask 分流。
 
@@ -2162,7 +2161,6 @@ fake AX/pasteboard：
 - revise purpose 不改变 currentMode；
 - 不捕获 PromptContext/selection/clipboard；
 - 不调用 SnippetStorage；
-- 不启用 speculative LLM；
 - 复用 LLM cache；
 - empty instruction；
 - local undo 不调用 LLM；

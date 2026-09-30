@@ -72,8 +72,8 @@ struct SelectionAskView: View {
                     .zIndex(100)
             }
         }
-        .animation(.easeOut(duration: 0.08), value: isOpenInType4MeHovered)
         .id(language)
+        .settingsTooltipHost(.selectionAsk)
     }
 
     private var header: some View {
@@ -231,7 +231,7 @@ struct SelectionAskView: View {
                         Text(L("取消追问（ESC）", "Cancel follow-up (ESC)"))
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(TF.settingsOnStrong)
                     .padding(.horizontal, 13)
                     .frame(height: 36)
                     .background(
@@ -249,7 +249,7 @@ struct SelectionAskView: View {
                             .font(.system(size: 12, weight: .semibold))
                         VoiceBars()
                     }
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(TF.settingsOnStrong)
                     .padding(.horizontal, 13)
                     .frame(height: 36)
                     .background(
@@ -266,7 +266,7 @@ struct SelectionAskView: View {
                         Text(L("继续追问", "Ask follow-up"))
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(TF.settingsOnStrong)
                     .padding(.horizontal, 14)
                     .frame(height: 36)
                     .background(
