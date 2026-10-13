@@ -68,6 +68,7 @@ final class CodexDesktopNotificationSource: @unchecked Sendable {
         var reducers: [String: CodexInboxStateReducer] = [:]
         var followDeadlines: [String: TimeInterval] = [:]
         var pendingReadRefreshes: Set<String> = []
+        var readReconciliation = CodexReadReconciliationSchedule(configuration: configuration)
         var retries: [String: Int] = [:]
         var cooldowns: [String: TimeInterval] = [:]
         var nextDiscovery: TimeInterval = 0
@@ -123,6 +124,17 @@ final class CodexDesktopNotificationSource: @unchecked Sendable {
                     try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: false)
                     try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: true)
                     followDeadlines[id] = now + configuration.ioTimeoutSeconds
+                }
+                if let clientID {
+                    let candidates = Set(owners.keys.filter { reducers[$0]?.readReconciliationTurnID != nil })
+                    for id in readReconciliation.dueSessionIDs(candidates: candidates,
+                        inFlight: Set(followDeadlines.keys), now: now) {
+                        guard let owner = owners[id] else { continue }
+                        // Read changes can omit stream patches. Refresh only unresolved completed
+                        // turns, without interrupting a subscription or racing an in-flight snapshot.
+                        try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: true)
+                        followDeadlines[id] = now + configuration.ioTimeoutSeconds
+                    }
                 }
                 guard let packet = try socket.receive() else { continue }
                 if packet["type"] as? String == "client-discovery-request" {
@@ -251,13 +263,57 @@ enum CodexInboxError: Error, Equatable {
     case socketUnavailable, untrustedPeer, timeout, disconnected, protocolMismatch, revisionGap, invalidPatch, capacityExceeded
 }
 
+/// Bounds owner refreshes and rotates unresolved completions without accumulating a request queue.
+struct CodexReadReconciliationSchedule {
+    private let intervalSeconds: TimeInterval
+    private let maximumRefreshes: Int
+    private var nextCheck: TimeInterval = 0
+    private var lastScheduled: [String: TimeInterval] = [:]
+
+    /// Creates a small read-state reconciliation budget from the notification configuration.
+    ///
+    /// Args:
+    ///   configuration: Refresh cadence and maximum simultaneous refresh requests.
+    init(configuration: AgentNotificationConfiguration) {
+        intervalSeconds = configuration.codexReadReconcileIntervalSeconds
+        maximumRefreshes = configuration.maximumCodexReadRefreshes
+    }
+
+    /// Selects the longest-unchecked completions, leaving outstanding requests untouched.
+    ///
+    /// Args:
+    ///   candidates: Verified owners whose latest completed turn still lacks read evidence.
+    ///   inFlight: Sessions already waiting for an owner snapshot, regardless of its trigger.
+    ///   now: Monotonic observation time.
+    ///
+    /// Returns:
+    ///   A bounded set of session identities to refresh this cycle.
+    mutating func dueSessionIDs(candidates: Set<String>, inFlight: Set<String>, now: TimeInterval) -> [String] {
+        lastScheduled = lastScheduled.filter { candidates.contains($0.key) }
+        guard now >= nextCheck else { return [] }
+        nextCheck = now + intervalSeconds
+        let available = max(0, maximumRefreshes - inFlight.count)
+        let selected = candidates.subtracting(inFlight).sorted {
+            let left = lastScheduled[$0] ?? -TimeInterval.infinity
+            let right = lastScheduled[$1] ?? -TimeInterval.infinity
+            return left == right ? $0 < $1 : left < right
+        }.prefix(available)
+        for id in selected { lastScheduled[id] = now }
+        return Array(selected)
+    }
+}
+
 /// Atomic replay of the desktop's versioned Immer state without interpreting tool output as dialogue.
 struct CodexInboxStateReducer {
     private let configuration: AgentNotificationConfiguration
     private(set) var state: [String: Any]?
     private(set) var revision: Int?
     private(set) var estimatedBytes = 0
+    private(set) var readReconciliationTurnID: String?
     private var turnStatuses: [String: String] = [:]
+    private var confirmedCompletedTurnID: String?
+    private var readCompletedTurnID: String?
+    private var lastProjectedStatus: AgentInboxStatus?
     private var outstanding: [String: (request: AgentInboxRequest, position: Position)] = [:]
 
     private struct Position: Comparable {
@@ -296,7 +352,11 @@ struct CodexInboxStateReducer {
     }
 
     /// Invalidates stale patch state while retaining unresolved asynchronous questions.
-    mutating func invalidateRevision() { state = nil; revision = nil; estimatedBytes = 0; turnStatuses = [:] }
+    mutating func invalidateRevision() {
+        state = nil; revision = nil; estimatedBytes = 0; turnStatuses = [:]
+        confirmedCompletedTurnID = nil; readCompletedTurnID = nil
+        readReconciliationTurnID = nil; lastProjectedStatus = nil
+    }
 
     /// Recomputes actual state size only when conservative incremental accounting reaches its budget.
     ///
@@ -314,7 +374,7 @@ struct CodexInboxStateReducer {
     ///   session: Exact native conversation metadata.
     ///
     /// Returns:
-    ///   Current visible state; snapshots never generate completion alerts.
+    ///   Current visible state and turn-bound read evidence; snapshots never generate completion alerts.
     ///
     /// Raises:
     ///   CodexInboxError: State cannot safely be attributed or replayed.
@@ -361,7 +421,8 @@ struct CodexInboxStateReducer {
         let unread = next["hasUnreadTurn"] as? NSNumber
         let nativeHasUnreadTurn = hasFreshReadState && unread.map { CFGetTypeID($0) == CFBooleanGetTypeID() } == true
             ? unread?.boolValue : nil
-        return project(next, session: session, snapshot: isSnapshot, nativeHasUnreadTurn: nativeHasUnreadTurn)
+        return project(next, session: session, snapshot: isSnapshot,
+                       hasFreshReadState: hasFreshReadState, nativeHasUnreadTurn: nativeHasUnreadTurn)
     }
 
     /// Applies one bounded Immer path with strict array bounds and no partial state mutation.
@@ -418,12 +479,13 @@ struct CodexInboxStateReducer {
     ///   state: Validated, completely replayed native state.
     ///   session: Exact conversation descriptor.
     ///   snapshot: Whether this is baseline/recovery state that must stay quiet.
-    ///   nativeHasUnreadTurn: Read state explicitly refreshed by this packet, never inherited from old patches.
+    ///   hasFreshReadState: Whether this packet explicitly supplied or removed the native read field.
+    ///   nativeHasUnreadTurn: Read state explicitly refreshed by this packet, never inherited from cached fields.
     ///
     /// Returns:
     ///   A bounded UI projection with no tool execution output.
     private mutating func project(_ state: [String: Any], session: AgentSessionDescriptor, snapshot: Bool,
-                                  nativeHasUnreadTurn: Bool?) -> AgentInboxUpdate {
+                                  hasFreshReadState: Bool, nativeHasUnreadTurn: Bool?) -> AgentInboxUpdate {
         let history = ((state["turnHistory"] as? [String: Any])?["history"] as? [String: Any])?["entitiesByKey"] as? [String: Any] ?? [:]
         var turnsByID: [String: [String: Any]] = [:]
         for turn in (state["turns"] as? [[String: Any]] ?? []) + history.values.compactMap({ $0 as? [String: Any] }) {
@@ -485,9 +547,31 @@ struct CodexInboxStateReducer {
         let latest = turns.last?["status"] as? String
         let flags = runtime["activeFlags"] as? [String] ?? []
         let waiting = hasBlockingRequest || flags.contains("waitingOnApproval") || flags.contains("waitingOnUserInput")
-        if completion != turns.last?["turnId"] as? String { completion = nil }
+        let latestTurnID = turns.last?["turnId"] as? String
+        let hasPendingTurnSubmission = (state["unconfirmedTurnSubmissions"] as? [Any])?.isEmpty == false
+        let completedWithoutRequests = latest == "completed" && requests.isEmpty && !waiting && !hasPendingTurnSubmission
+        if completion != latestTurnID || hasPendingTurnSubmission { completion = nil }
+        if latest != "completed" || confirmedCompletedTurnID != latestTurnID || hasPendingTurnSubmission {
+            confirmedCompletedTurnID = nil
+        }
+        if completion != nil, !hasPendingTurnSubmission { confirmedCompletedTurnID = completion }
+        if !completedWithoutRequests || readCompletedTurnID != latestTurnID
+            || nativeHasUnreadTurn == true || (hasFreshReadState && nativeHasUnreadTurn == nil) {
+            readCompletedTurnID = nil
+        }
+        if completedWithoutRequests, nativeHasUnreadTurn == false {
+            // A verified read can precede runtime idle. Retain evidence for this completed turn
+            // only; a new/in-progress turn cannot inherit the previous turn's read receipt.
+            readCompletedTurnID = latestTurnID
+        }
+        readReconciliationTurnID = completedWithoutRequests && readCompletedTurnID != latestTurnID
+            ? latestTurnID : nil
         let status: AgentInboxStatus
         if completion != nil { status = .completed }
+        // A runtime-active snapshot can lag the explicit completion patch. Keep that exact
+        // completed turn stable so reconciliation cannot cancel its pending notification.
+        else if completedWithoutRequests, confirmedCompletedTurnID != nil,
+                confirmedCompletedTurnID == latestTurnID { status = .completed }
         else if runtime["type"] as? String == "active" { status = waiting ? .waiting : .running }
         else if latest == "interrupted" { status = .interrupted }
         else if latest == "failed" { status = .failed }
@@ -496,9 +580,13 @@ struct CodexInboxStateReducer {
         else if runtime["type"] as? String == "idle" { status = .idle }
         else { status = .unknown }
         turnStatuses = newStatuses
+        let resolvedReadState = status == .completed && lastProjectedStatus != .completed && completedWithoutRequests
+            && readCompletedTurnID != nil && readCompletedTurnID == latestTurnID
+            ? false : nativeHasUnreadTurn
+        lastProjectedStatus = status
         return .init(session: session, status: status,
                      pendingRequests: Array(requests.prefix(configuration.maximumPendingRequests)), preview: preview,
-                     completionID: completion, nativeHasUnreadTurn: nativeHasUnreadTurn)
+                     completionID: completion, nativeHasUnreadTurn: resolvedReadState)
     }
 }
 

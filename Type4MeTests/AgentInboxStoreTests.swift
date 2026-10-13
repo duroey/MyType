@@ -96,6 +96,32 @@ final class AgentInboxStoreTests: XCTestCase {
         XCTAssertTrue(store.items[0].pendingRequests.isEmpty)
     }
 
+    /// New questions and approvals alert once; rereads, text updates and removals stay quiet.
+    func testNewRequestsAlertWithoutTreatingThemAsCompletion() {
+        let store = immediateStore()
+        var requests: [AgentInboxItem] = []
+        var completions = 0
+        store.onRequest = { requests.append($0) }
+        store.onCompletion = { _ in completions += 1 }
+        let question = AgentInboxRequest(id: "question", kind: .input, text: "Which option?")
+        let approval = AgentInboxRequest(id: "approval", kind: .approval, text: "Approve?")
+        store.apply(.init(session: session(), status: .waiting, pendingRequests: [question]))
+        store.apply(.init(session: session(), status: .waiting, pendingRequests: [question]))
+        store.markRead(session().id)
+        store.apply(.init(session: session(), status: .completed, pendingRequests: [question], completionID: "turn"))
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(completions, 0)
+        XCTAssertEqual(store.items.first?.pendingRequests, [question])
+        store.apply(.init(session: session(), status: .waiting, pendingRequests: [approval, question]))
+        XCTAssertEqual(requests.count, 2)
+        store.apply(.init(session: session(), status: .waiting, pendingRequests: [question, approval]))
+        store.apply(.init(session: session(), status: .waiting, pendingRequests: [approval]))
+        XCTAssertEqual(requests.count, 2)
+        let changedText = AgentInboxRequest(id: "approval", kind: .approval, text: "Updated reason")
+        store.apply(.init(session: session(), status: .waiting, pendingRequests: [changedText]))
+        XCTAssertEqual(requests.count, 2)
+    }
+
     /// Verifies identical provider titles/IDs cannot overwrite another provider's inbox row.
     func testApplicationQualifiedIdentityAndLateUpdateRejection() {
         let store = immediateStore()

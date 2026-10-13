@@ -21,6 +21,7 @@ final class AgentInboxStore: ObservableObject {
     @Published private(set) var items: [AgentInboxItem] = []
     @Published private(set) var storageError = false
     var onCompletion: ((AgentInboxItem) -> Void)?
+    var onRequest: ((AgentInboxItem) -> Void)?
 
     private let configuration: AgentNotificationConfiguration
     private let persistence: AgentInboxPersistence?
@@ -103,7 +104,11 @@ final class AgentInboxStore: ObservableObject {
             receipts = Array(receipts.suffix(configuration.maximumCompletionReceipts))
         }
         let semanticChange = old.map { !sameContent($0, next) } ?? true
-        let newRequest = !next.pendingRequests.isEmpty && next.pendingRequests != old?.pendingRequests
+        // Removing or reordering existing requests must not alert for an already seen question.
+        let previousRequestIDs = Set((old?.pendingRequests ?? []).map { $0.kind.rawValue + ":" + $0.id })
+        let newRequest = next.pendingRequests.contains {
+            !previousRequestIDs.contains($0.kind.rawValue + ":" + $0.id)
+        }
         next.isUnread = update.nativeHasUnreadTurn != false && (next.isUnread || newCompletion || newRequest)
         if !semanticChange, !newCompletion { next.updatedAt = old?.updatedAt ?? next.updatedAt }
 
@@ -131,6 +136,7 @@ final class AgentInboxStore: ObservableObject {
             dismiss(next.id)
             return
         }
+        if newRequest { onRequest?(next) }
         if newCompletion { scheduleCompletionAlert(next) }
     }
 

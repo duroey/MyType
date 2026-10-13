@@ -5,6 +5,7 @@ struct AgentInboxView: View {
     @ObservedObject var store: AgentInboxStore
     @ObservedObject var model: AgentInboxViewModel
     let onClose: () -> Void
+    var onHoverChanged: (Bool) -> Void = { _ in }
     @AppStorage("tf_language") private var languageRaw = AppLanguage.systemDefault
     @AppStorage(SettingsTheme.storageKey) private var themeRaw = SettingsTheme.defaultValue.rawValue
 
@@ -46,7 +47,9 @@ struct AgentInboxView: View {
         .foregroundStyle(TF.settingsText)
         .preferredColorScheme(theme.colorScheme)
         .environment(\.locale, Locale(identifier: language == .zh ? "zh_CN" : "en_US"))
-        .background(AgentInboxWindowAppearance(theme: theme, title: copy(.title)))
+        .background(AgentInboxWindowAppearance(
+            theme: theme, title: copy(.title), onHoverChanged: onHoverChanged
+        ))
     }
 
     private var header: some View {
@@ -229,6 +232,7 @@ private struct AgentInboxRow: View {
 private struct AgentInboxWindowAppearance: NSViewRepresentable {
     let theme: SettingsTheme
     let title: String
+    let onHoverChanged: (Bool) -> Void
 
     /// Creates an invisible bridge for live window title and theme changes.
     ///
@@ -241,6 +245,7 @@ private struct AgentInboxWindowAppearance: NSViewRepresentable {
         let view = AppearanceView()
         view.theme = theme
         view.title = title
+        view.onHoverChanged = onHoverChanged
         return view
     }
 
@@ -252,11 +257,39 @@ private struct AgentInboxWindowAppearance: NSViewRepresentable {
     func updateNSView(_ nsView: AppearanceView, context: Context) {
         nsView.theme = theme
         nsView.title = title
+        nsView.onHoverChanged = onHoverChanged
     }
 
     final class AppearanceView: NSView {
         var theme = SettingsTheme.defaultValue { didSet { window?.appearance = theme.appearance } }
         var title = "" { didSet { window?.title = title } }
+        var onHoverChanged: ((Bool) -> Void)?
+
+        /// Tracks reading even when the nonactivating queue does not own keyboard focus.
+        override func updateTrackingAreas() {
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(NSTrackingArea(
+                rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self
+            ))
+            super.updateTrackingAreas()
+        }
+
+        /// Suspends the notification deadline only for a pointer actually inside this view.
+        override func mouseEntered(with event: NSEvent) {
+            guard containsMouse else { return }
+            onHoverChanged?(true)
+        }
+
+        /// Ignores synthetic exits caused by resizing while the pointer is still over the queue.
+        override func mouseExited(with event: NSEvent) {
+            guard !containsMouse else { return }
+            onHoverChanged?(false)
+        }
+
+        private var containsMouse: Bool {
+            guard let window, window.isVisible else { return false }
+            return bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        }
 
         /// Updates AppKit after the observer joins its native window.
         override func viewDidMoveToWindow() {

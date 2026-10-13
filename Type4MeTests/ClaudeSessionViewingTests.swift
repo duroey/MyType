@@ -68,6 +68,51 @@ final class ClaudeSessionViewingTests: XCTestCase {
         XCTAssertFalse(try cursor.read(log).continuous)
     }
 
+    /// An observer restart can restore current-process focus without requiring another navigation.
+    func testCursorRestoresOnlyCurrentProcessFocusWhenExplicitlyEnabled() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appendingPathComponent("main.log")
+        let focusedAt = Date(timeIntervalSinceNow: -60)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(formatter.string(from: focusedAt)) [info] [CCD] LocalSessions.setFocusedSession: sessionId=\(sessionID)\n"
+        try Data(line.utf8).write(to: log)
+        var cursor = ClaudeFocusLogCursor(maximumBytes: 1024, processStartedAt: focusedAt.addingTimeInterval(-60))
+        let restored = try cursor.read(log)
+        XCTAssertFalse(restored.continuous)
+        XCTAssertEqual(restored.selections, [sessionID])
+        XCTAssertNotNil(restored.restoredFocusAt)
+        XCTAssertTrue(try cursor.read(log).selections.isEmpty)
+
+        var laterProcess = ClaudeFocusLogCursor(maximumBytes: 1024, processStartedAt: focusedAt.addingTimeInterval(1))
+        XCTAssertTrue(try laterProcess.read(log).selections.isEmpty)
+    }
+
+    /// Null, schema drift and incomplete tails must never recover an older valid identity.
+    func testTailRecoveryFailsClosedAfterAmbiguousFocus() {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let now = Date()
+        let prefix = "\(formatter.string(from: now.addingTimeInterval(-60))) [info] [CCD] LocalSessions.setFocusedSession: sessionId="
+        let good = prefix + sessionID + "\n"
+        for tail in [good + prefix + "null\n", good + prefix + "invalid\n", good + "LocalSessions.setFocusedSession: unknown-schema\n", good + "unfinished"] {
+            XCTAssertNil(ClaudeFocusLogCursor.restoreSelection(
+                from: Data(tail.utf8), skipsFirstLine: false,
+                processStartedAt: now.addingTimeInterval(-120), now: now
+            ))
+        }
+        XCTAssertNil(ClaudeFocusLogCursor.restoreSelection(
+            from: Data(good.utf8), skipsFirstLine: true,
+            processStartedAt: now.addingTimeInterval(-120), now: now
+        ))
+    }
+
     /// Appends fixture bytes without replacing the inode used by the native log reader.
     ///
     /// Args:

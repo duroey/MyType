@@ -79,6 +79,168 @@ final class CodexDesktopNotificationTests: XCTestCase {
         XCTAssertNil(laterPatch.completionID)
     }
 
+    /// A read snapshot between completion and idle must consume that exact completed result.
+    @MainActor
+    func testReadSnapshotBeforeRuntimeIdleConsumesOnlyCompletedTurn() throws {
+        var configuration = AgentNotificationConfiguration()
+        configuration.completionAlertDelaySeconds = 0
+        let inbox = AgentInboxStore(configuration: configuration)
+        var reducer = CodexInboxStateReducer()
+        inbox.apply(try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress")], active: true, unread: false),
+                                       ownerID: ownerID, session: session()))
+        inbox.apply(try reducer.accept(packet: patches(base: 1, next: 2, values: [
+            ["op": "replace", "path": ["turns", 0, "status"], "value": "completed"],
+        ]), ownerID: ownerID, session: session()))
+        XCTAssertEqual(inbox.items.first?.status, .completed)
+        XCTAssertEqual(reducer.readReconciliationTurnID, "turn-1")
+
+        let read = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true,
+                                                       revision: 2, unread: false), ownerID: ownerID, session: session())
+        inbox.apply(read)
+        XCTAssertEqual(read.status, .completed)
+        XCTAssertEqual(read.nativeHasUnreadTurn, false)
+        XCTAssertNil(reducer.readReconciliationTurnID)
+        XCTAssertTrue(inbox.items.isEmpty)
+        let idle = try reducer.accept(packet: patches(base: 2, next: 3, values: [
+            ["op": "replace", "path": ["threadRuntimeStatus"], "value": ["type": "idle"]],
+        ]), ownerID: ownerID, session: session())
+        XCTAssertEqual(idle.status, .completed)
+        XCTAssertNil(idle.nativeHasUnreadTurn)
+        XCTAssertNil(idle.completionID)
+        inbox.apply(idle)
+        XCTAssertTrue(inbox.items.isEmpty)
+    }
+
+    /// Periodic snapshots between completion and idle must not cancel an unread result's popup.
+    @MainActor
+    func testUnreadCompletionAlertSurvivesActiveReconciliationSnapshot() async throws {
+        var configuration = AgentNotificationConfiguration()
+        configuration.completionAlertDelaySeconds = 0.03
+        let inbox = AgentInboxStore(configuration: configuration)
+        var popups = 0
+        inbox.onCompletion = { _ in popups += 1 }
+        var reducer = CodexInboxStateReducer()
+        inbox.apply(try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress")], active: true, unread: false),
+                                       ownerID: ownerID, session: session()))
+        inbox.apply(try reducer.accept(packet: patches(base: 1, next: 2, values: [
+            ["op": "replace", "path": ["turns", 0, "status"], "value": "completed"],
+            ["op": "replace", "path": ["hasUnreadTurn"], "value": true],
+        ]), ownerID: ownerID, session: session()))
+        let refreshed = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true,
+                                                            revision: 2, unread: true), ownerID: ownerID, session: session())
+        XCTAssertEqual(refreshed.status, .completed)
+        XCTAssertNil(refreshed.completionID)
+        inbox.apply(refreshed)
+        inbox.apply(try reducer.accept(packet: patches(base: 2, next: 3, values: [
+            ["op": "replace", "path": ["threadRuntimeStatus"], "value": ["type": "idle"]],
+        ]), ownerID: ownerID, session: session()))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(popups, 1)
+        XCTAssertEqual(inbox.items.first?.status, .completed)
+        XCTAssertEqual(inbox.items.first?.isUnread, true)
+    }
+
+    /// A preserved completion cannot hide a genuine new turn, resumed work, request or submission.
+    func testConfirmedCompletionYieldsToNewWorkAndRequests() throws {
+        let request: [String: Any] = ["id": 42, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": sessionID, "reason": "Approval needed"]]
+        let cases: [(patch: [String: Any], status: AgentInboxStatus)] = [
+            (["op": "add", "path": ["turns", 1], "value": turn(id: "turn-2", status: "inProgress", time: 2)], .running),
+            (["op": "replace", "path": ["turns", 0, "status"], "value": "inProgress"], .running),
+            (["op": "add", "path": ["requests", 0], "value": request], .waiting),
+            (["op": "add", "path": ["unconfirmedTurnSubmissions"], "value": [["id": "next-submission"]]], .running),
+        ]
+        for example in cases {
+            var reducer = CodexInboxStateReducer()
+            _ = try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress")], active: true, unread: false),
+                                   ownerID: ownerID, session: session())
+            _ = try reducer.accept(packet: patches(base: 1, next: 2, values: [
+                ["op": "replace", "path": ["turns", 0, "status"], "value": "completed"],
+            ]), ownerID: ownerID, session: session())
+            let next = try reducer.accept(packet: patches(base: 2, next: 3, values: [example.patch]),
+                                          ownerID: ownerID, session: session())
+            XCTAssertEqual(next.status, example.status)
+            XCTAssertNil(next.nativeHasUnreadTurn)
+            XCTAssertNil(reducer.readReconciliationTurnID)
+        }
+    }
+
+    /// Read evidence for a completed turn cannot consume another turn starting before native idle.
+    func testPendingCompletedReadDoesNotTransferToNextTurn() throws {
+        var reducer = CodexInboxStateReducer()
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true, unread: false),
+                               ownerID: ownerID, session: session())
+        let running = try reducer.accept(packet: patches(base: 1, next: 2, values: [
+            ["op": "add", "path": ["turns", 1], "value": turn(id: "turn-2", status: "inProgress", time: 2)],
+        ]), ownerID: ownerID, session: session())
+        XCTAssertEqual(running.status, .running)
+        XCTAssertNil(running.nativeHasUnreadTurn)
+        XCTAssertNil(reducer.readReconciliationTurnID)
+        let completed = try reducer.accept(packet: patches(base: 2, next: 3, values: [
+            ["op": "replace", "path": ["turns", 1, "status"], "value": "completed"],
+            ["op": "replace", "path": ["threadRuntimeStatus"], "value": ["type": "idle"]],
+        ]), ownerID: ownerID, session: session())
+        XCTAssertEqual(completed.completionID, "turn-2")
+        XCTAssertNil(completed.nativeHasUnreadTurn)
+        XCTAssertEqual(reducer.readReconciliationTurnID, "turn-2")
+    }
+
+    /// Unread, missing, malformed and recovered native states invalidate an earlier read receipt.
+    func testUncertainSnapshotsAndRequestsDoNotReuseCompletedRead() throws {
+        for unread in [nil, true as Any?, "false" as Any?] {
+            var reducer = CodexInboxStateReducer()
+            _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true, unread: false),
+                                   ownerID: ownerID, session: session())
+            _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true,
+                                                   revision: 2, unread: unread), ownerID: ownerID, session: session())
+            XCTAssertEqual(reducer.readReconciliationTurnID, "turn-1")
+            let idle = try reducer.accept(packet: patches(base: 2, next: 3, values: [
+                ["op": "replace", "path": ["threadRuntimeStatus"], "value": ["type": "idle"]],
+            ]), ownerID: ownerID, session: session())
+            XCTAssertNil(idle.nativeHasUnreadTurn)
+        }
+        var reducer = CodexInboxStateReducer()
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true, unread: false),
+                               ownerID: ownerID, session: session())
+        reducer.invalidateRevision()
+        let recovered = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], revision: 2),
+                                            ownerID: ownerID, session: session())
+        XCTAssertNil(recovered.nativeHasUnreadTurn)
+        XCTAssertEqual(reducer.readReconciliationTurnID, "turn-1")
+        let request: [String: Any] = ["id": 42, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": sessionID, "reason": "Approval needed"]]
+        let waiting = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], requests: [request],
+                                                          active: true, revision: 3, unread: false),
+                                         ownerID: ownerID, session: session())
+        XCTAssertEqual(waiting.pendingRequests?.count, 1)
+        XCTAssertNil(reducer.readReconciliationTurnID)
+
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], active: true,
+                                               revision: 4, unread: false), ownerID: ownerID, session: session())
+        let removedReadField = try reducer.accept(packet: patches(base: 4, next: 5, values: [
+            ["op": "remove", "path": ["hasUnreadTurn"]],
+            ["op": "replace", "path": ["threadRuntimeStatus"], "value": ["type": "idle"]],
+        ]), ownerID: ownerID, session: session())
+        XCTAssertNil(removedReadField.nativeHasUnreadTurn)
+        XCTAssertEqual(reducer.readReconciliationTurnID, "turn-1")
+    }
+
+    /// Reconciliation remains bounded, skips in-flight work and rotates all unresolved candidates.
+    func testReadReconciliationCadenceCapacityAndFairness() {
+        var configuration = AgentNotificationConfiguration()
+        configuration.codexReadReconcileIntervalSeconds = 2
+        configuration.maximumCodexReadRefreshes = 2
+        var schedule = CodexReadReconciliationSchedule(configuration: configuration)
+        let candidates: Set<String> = ["a", "b", "c", "d"]
+        XCTAssertEqual(schedule.dueSessionIDs(candidates: candidates, inFlight: ["b"], now: 0), ["a"])
+        XCTAssertTrue(schedule.dueSessionIDs(candidates: candidates, inFlight: [], now: 1).isEmpty)
+        XCTAssertTrue(schedule.dueSessionIDs(candidates: candidates, inFlight: ["a", "b"], now: 2).isEmpty)
+        XCTAssertEqual(schedule.dueSessionIDs(candidates: candidates, inFlight: [], now: 4), ["b", "c"])
+        XCTAssertEqual(schedule.dueSessionIDs(candidates: candidates, inFlight: [], now: 6), ["d", "a"])
+        XCTAssertTrue(schedule.dueSessionIDs(candidates: [], inFlight: [], now: 8).isEmpty)
+        XCTAssertEqual(schedule.dueSessionIDs(candidates: ["b"], inFlight: [], now: 10), ["b"])
+    }
+
     /// Unknown and wrongly typed read fields retain the completion instead of silently marking it read.
     func testMalformedAndMissingNativeReadStateIsUnknown() throws {
         for unread in [0 as Any, 1 as Any, "false" as Any, NSNull()] {

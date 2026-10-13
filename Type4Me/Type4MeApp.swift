@@ -303,6 +303,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AgentInboxStore.shared.onCompletion = { item in
             AgentInboxPanelController.shared.showCompletion(item)
         }
+        AgentInboxStore.shared.onRequest = { item in
+            AgentInboxPanelController.shared.showRequest(item)
+        }
         AgentNotificationService.shared.start()
         migrateRememberedMicrophoneProfileIfNeeded()
         floatingBarController = FloatingBarController(state: appState)
@@ -2744,6 +2747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         AgentNotificationService.shared.stop()
         AgentInboxStore.shared.onCompletion = nil
+        AgentInboxStore.shared.onRequest = nil
         AgentInboxPanelController.shared.stop()
         AgentIndexService.shared.stop()
         hotkeyManager.stop()

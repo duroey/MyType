@@ -214,6 +214,152 @@ final class AgentInboxUITests: XCTestCase {
         XCTAssertNil(model.failure)
     }
 
+    /// Outside clicks and app changes hide the window without consuming stored messages.
+    @MainActor
+    func testOutsideInteractionPreservesUnreadQueueForManualReopening() {
+        let store = AgentInboxStore()
+        let completed = fixture(status: .completed)
+        store.apply(.init(session: completed.session, status: .completed, completionID: "unread-turn"))
+        let original = store.items
+        var isPresented = false
+        let controller = AgentInboxPanelController(
+            storeProvider: { store }, present: { _ in isPresented = true }, dismiss: { isPresented = false }
+        )
+        controller.show()
+        controller.handleOutsideInteraction()
+        XCTAssertFalse(isPresented)
+        XCTAssertEqual(store.items, original)
+        controller.show()
+        XCTAssertTrue(isPresented)
+        controller.handleApplicationChange()
+        XCTAssertFalse(isPresented)
+        XCTAssertEqual(store.items, original)
+        controller.stop()
+    }
+
+    /// Automatic presentation uses the configured timeout while retaining the original message.
+    @MainActor
+    func testAutomaticPresentationExpiresWithoutMarkingMessagesRead() async {
+        let delayStarted = expectation(description: "Notification timeout scheduled")
+        let didDismiss = expectation(description: "Notification window hidden")
+        let gate = InboxDelayGate()
+        let store = AgentInboxStore()
+        let completed = fixture(status: .completed)
+        store.apply(.init(session: completed.session, status: .completed, completionID: "unread-turn"))
+        let original = store.items
+        let configuration = AgentNotificationConfiguration()
+        var isPresented = false
+        let controller = AgentInboxPanelController(
+            configuration: configuration,
+            sleep: { seconds in
+                XCTAssertEqual(seconds, configuration.inboxAutoHideSeconds)
+                await gate.wait { _ in delayStarted.fulfill() }
+            },
+            storeProvider: { store }, present: { _ in isPresented = true },
+            dismiss: { isPresented = false; didDismiss.fulfill() }
+        )
+        controller.showCompletion(completed)
+        await fulfillment(of: [delayStarted], timeout: 1)
+        XCTAssertTrue(isPresented)
+        await gate.resumeNext()
+        await fulfillment(of: [didDismiss], timeout: 1)
+        XCTAssertFalse(isPresented)
+        XCTAssertEqual(store.items, original)
+    }
+
+    /// Pointer entry cancels the old delay and pointer exit starts a full new reading interval.
+    @MainActor
+    func testHoverPreventsTimeoutUntilPointerLeaves() async {
+        let firstDelay = expectation(description: "Initial timeout")
+        let nextDelay = expectation(description: "Timeout after reading")
+        let didDismiss = expectation(description: "New timeout expires")
+        let gate = InboxDelayGate()
+        var isPresented = false
+        let controller = AgentInboxPanelController(
+            sleep: { _ in
+                await gate.wait { index in
+                    if index == 1 { firstDelay.fulfill() } else { nextDelay.fulfill() }
+                }
+            },
+            storeProvider: { fatalError("No live store access in presentation tests") },
+            present: { _ in isPresented = true }, dismiss: { isPresented = false; didDismiss.fulfill() }
+        )
+        controller.showCompletion(fixture(status: .completed))
+        await fulfillment(of: [firstDelay], timeout: 1)
+        controller.setPointerInside(true)
+        await gate.resumeNext()
+        await Task.yield()
+        XCTAssertTrue(isPresented)
+        controller.setPointerInside(false)
+        await fulfillment(of: [nextDelay], timeout: 1)
+        XCTAssertTrue(isPresented)
+        await gate.resumeNext()
+        await fulfillment(of: [didDismiss], timeout: 1)
+        XCTAssertFalse(isPresented)
+    }
+
+    /// App activation and timeout stay suppressed until native navigation finishes.
+    @MainActor
+    func testNavigationPausesTimeoutAndIgnoresItsApplicationSwitch() async {
+        let firstDelay = expectation(description: "Initial timeout")
+        let nextDelay = expectation(description: "Timeout after navigation")
+        let didDismiss = expectation(description: "Resumed timeout expires")
+        let gate = InboxDelayGate()
+        var isPresented = false
+        let controller = AgentInboxPanelController(
+            sleep: { _ in
+                await gate.wait { index in
+                    if index == 1 { firstDelay.fulfill() } else { nextDelay.fulfill() }
+                }
+            },
+            storeProvider: { fatalError("No live store access in presentation tests") },
+            present: { _ in isPresented = true }, dismiss: { isPresented = false; didDismiss.fulfill() }
+        )
+        controller.showCompletion(fixture(status: .completed))
+        await fulfillment(of: [firstDelay], timeout: 1)
+        controller.setNavigationInProgress(true)
+        controller.handleApplicationChange()
+        await gate.resumeNext()
+        await Task.yield()
+        XCTAssertTrue(isPresented)
+        controller.setNavigationInProgress(false)
+        await fulfillment(of: [nextDelay], timeout: 1)
+        XCTAssertTrue(isPresented)
+        await gate.resumeNext()
+        await fulfillment(of: [didDismiss], timeout: 1)
+        XCTAssertFalse(isPresented)
+    }
+
+    /// A late notification timer must not close a queue that the user manually reopened.
+    @MainActor
+    func testOldTimeoutCannotCloseManualPresentation() async {
+        let delayStarted = expectation(description: "Automatic timeout scheduled")
+        let delayReturned = expectation(description: "Cancelled timeout delivered late")
+        let gate = InboxDelayGate()
+        var isPresented = false
+        var dismissCount = 0
+        let controller = AgentInboxPanelController(
+            sleep: { _ in
+                await gate.wait { _ in delayStarted.fulfill() }
+                delayReturned.fulfill()
+            },
+            storeProvider: { fatalError("No live store access in presentation tests") },
+            present: { _ in isPresented = true }, dismiss: { isPresented = false; dismissCount += 1 }
+        )
+        controller.showCompletion(fixture(status: .completed))
+        await fulfillment(of: [delayStarted], timeout: 1)
+        controller.close()
+        controller.show()
+        await gate.resumeNext()
+        await fulfillment(of: [delayReturned], timeout: 1)
+        await Task.yield()
+        XCTAssertTrue(isPresented)
+        XCTAssertEqual(dismissCount, 1)
+        controller.handleOutsideInteraction()
+        XCTAssertFalse(isPresented)
+        XCTAssertEqual(dismissCount, 2)
+    }
+
     /// Builds a provider-qualified native conversation without reading user data.
     ///
     /// Args:
@@ -245,5 +391,29 @@ final class AgentInboxUITests: XCTestCase {
 
     private enum FixtureFailure: Error {
         case unavailable
+    }
+}
+
+/// Delivers timer completions under test control, including deliberately cancelled waits.
+private actor InboxDelayGate {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var delayCount = 0
+
+    /// Suspends without wall-clock waiting until the test releases this delay.
+    ///
+    /// Args:
+    ///   didStart: Receives the one-based delay number after its continuation is stored.
+    func wait(didStart: @Sendable (Int) -> Void) async {
+        delayCount += 1
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+            didStart(delayCount)
+        }
+    }
+
+    /// Completes the oldest delay even if its owning presentation has already been cancelled.
+    func resumeNext() {
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume()
     }
 }

@@ -51,20 +51,29 @@ struct ClaudeSessionViewingGate {
     }
 }
 
-/// Reads only newly appended complete lines, resetting at EOF after any discontinuity.
+/// Reads complete focus events, optionally restoring the current native process's last selection.
 struct ClaudeFocusLogCursor {
-    struct Batch { let continuous: Bool; let selections: [String] }
+    struct Batch {
+        let continuous: Bool
+        let selections: [String]
+        var restoredFocusAt: Date? = nil
+    }
     let maximumBytes: Int
+    private let processStartedAt: Date?
     private var identity: String?
     private var offset: UInt64 = 0
     private var pending = Data()
     private var skipPartialLine = false
 
-    /// Creates an unprimed cursor that skips historical contents on its first read.
+    /// Creates a bounded cursor with optional recovery for an already running native app.
     ///
     /// Args:
     ///   maximumBytes: Maximum incremental read and unfinished-line memory.
-    init(maximumBytes: Int) { self.maximumBytes = maximumBytes }
+    ///   processStartedAt: Verified native process start; nil disables log-tail recovery.
+    init(maximumBytes: Int, processStartedAt: Date? = nil) {
+        self.maximumBytes = maximumBytes
+        self.processStartedAt = processStartedAt
+    }
 
     /// Reads bounded new log events from an owned, regular file without following symlinks.
     ///
@@ -82,11 +91,31 @@ struct ClaudeFocusLogCursor {
         let current = "\(info.st_dev):\(info.st_ino)"
         let size = UInt64(info.st_size)
         guard identity == current, size >= offset, size - offset <= UInt64(maximumBytes) else {
+            let mayRestore = identity == nil
             identity = current; offset = size; pending.removeAll()
             if size > 0 {
                 try handle.seek(toOffset: size - 1)
                 skipPartialLine = try handle.read(upToCount: 1)?.first != 10
             } else { skipPartialLine = false }
+            // A prior launch's focus event cannot identify the current native conversation.
+            // Restored evidence still needs metadata, foreground visibility and a full dwell.
+            if mayRestore, let processStartedAt, !skipPartialLine {
+                let start = size > UInt64(maximumBytes) ? size - UInt64(maximumBytes) : 0
+                try handle.seek(toOffset: start)
+                let tail = try handle.read(upToCount: Int(size - start)) ?? Data()
+                var currentInfo = stat()
+                guard lstat(url.path, &currentInfo) == 0,
+                      currentInfo.st_dev == info.st_dev, currentInfo.st_ino == info.st_ino,
+                      currentInfo.st_size >= off_t(size), tail.count == Int(size - start) else {
+                    identity = nil
+                    return Batch(continuous: false, selections: [])
+                }
+                if let restored = Self.restoreSelection(
+                    from: tail, skipsFirstLine: start > 0, processStartedAt: processStartedAt
+                ) {
+                    return Batch(continuous: false, selections: [restored.id], restoredFocusAt: restored.focusedAt)
+                }
+            }
             return Batch(continuous: false, selections: [])
         }
         try handle.seek(toOffset: offset)
@@ -121,6 +150,43 @@ struct ClaudeFocusLogCursor {
         return Batch(continuous: true, selections: selections)
     }
 
+    /// Recovers the last exact focus event only if it belongs to the verified running process.
+    ///
+    /// Args:
+    ///   data: Bounded log tail ending at a complete line boundary.
+    ///   skipsFirstLine: Whether the tail may start in the middle of a record.
+    ///   processStartedAt: Kernel start time of the signature-checked native application.
+    ///   now: Upper bound rejecting future or incorrectly interpreted timestamps.
+    ///
+    /// Returns:
+    ///   Exact native identity and event time, or nil for old, null or uncertain selection.
+    static func restoreSelection(
+        from data: Data, skipsFirstLine: Bool, processStartedAt: Date, now: Date = Date()
+    ) -> (id: String, focusedAt: Date)? {
+        guard data.last == 10 else { return nil }
+        var lines = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false)
+        if skipsFirstLine, !lines.isEmpty { lines.removeFirst() }
+        let marker = " [info] [CCD] LocalSessions.setFocusedSession: sessionId="
+        for line in lines.reversed() where line.contains("LocalSessions.setFocusedSession") {
+            // Never fall back to an older valid identity after null or schema drift.
+            guard let range = line.range(of: marker) else { return nil }
+            let timestamp = String(line[..<range.lowerBound])
+            let id = String(line[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard AgentSessionMetadataValidation.isValidClaudeNativeIdentifier(id),
+                  timestamp.range(of: #"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"#, options: .regularExpression) != nil else { return nil }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = .current
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            formatter.isLenient = false
+            guard let focusedAt = formatter.date(from: timestamp),
+                  focusedAt > processStartedAt, focusedAt <= now else { return nil }
+            return (id, focusedAt)
+        }
+        return nil
+    }
+
     /// Opens bounded-observer input using kernel type/owner checks and no symlink traversal.
     ///
     /// Args:
@@ -151,6 +217,7 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
     private struct AppState: Sendable {
         let processID: Int32
         let generation: String
+        let startedAt: Date
         let eligible: Bool
     }
     private struct Metadata: Decodable {
@@ -184,6 +251,7 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
             var gate = makeGate()
             var generation: String?
             var selected: String?
+            var restoredFocusAt: Date?
             var startedAt = Date()
             var metadataURL: URL?
             var metadataRevision: String?
@@ -198,17 +266,21 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
                             throw CocoaError(.fileReadNoPermission)
                         }
                         generation = app.generation
-                        cursor = ClaudeFocusLogCursor(maximumBytes: configuration.maximumClaudeFocusLogBytes)
+                        cursor = ClaudeFocusLogCursor(maximumBytes: configuration.maximumClaudeFocusLogBytes,
+                                                      processStartedAt: app.startedAt)
                         selected = nil; metadataURL = nil; metadata = nil; metadataRevision = nil
+                        restoredFocusAt = nil
                         startedAt = Date(); gate = makeGate()
                     }
                     let batch = try cursor.read(log)
                     if !batch.continuous {
                         selected = nil; metadataURL = nil; metadata = nil; metadataRevision = nil
+                        restoredFocusAt = nil
                         startedAt = Date(); gate = makeGate()
                     }
                     if let event = batch.selections.last {
                         selected = event == "null" ? nil : event
+                        restoredFocusAt = batch.restoredFocusAt
                         metadataURL = nil; metadata = nil; metadataRevision = nil; gate = makeGate()
                     }
                     if let selected {
@@ -226,8 +298,17 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
                         }
                     }
                     let corroborated = metadata.map {
-                        !$0.isArchived && $0.sessionId == selected && UUID(uuidString: $0.cliSessionId) != nil
-                            && $0.lastFocusedAt.isFinite && $0.lastFocusedAt / 1_000 >= startedAt.timeIntervalSince1970
+                        let focusSeconds = $0.lastFocusedAt / 1_000
+                        let matchesFocus: Bool
+                        if let restoredFocusAt {
+                            // Native log timestamps have one-second precision; metadata has milliseconds.
+                            matchesFocus = floor(focusSeconds) == restoredFocusAt.timeIntervalSince1970
+                                && focusSeconds >= app.startedAt.timeIntervalSince1970
+                        } else {
+                            matchesFocus = focusSeconds >= startedAt.timeIntervalSince1970
+                        }
+                        return !$0.isArchived && $0.sessionId == selected && UUID(uuidString: $0.cliSessionId) != nil
+                            && $0.lastFocusedAt.isFinite && matchesFocus
                     } ?? false
                     // Metadata I/O may overlap an in-app navigation. Recheck the stream before
                     // acknowledging, and keep the original sample time rather than minting a newer one.
@@ -235,6 +316,7 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
                     if !verification.continuous || !verification.selections.isEmpty {
                         selected = verification.continuous ? verification.selections.last : nil
                         if selected == "null" { selected = nil }
+                        restoredFocusAt = nil
                         metadataURL = nil; metadata = nil; metadataRevision = nil; gate = makeGate()
                         if !verification.continuous { startedAt = Date() }
                     }
@@ -249,6 +331,7 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
                     reportedUnavailable = false
                 } catch {
                     selected = nil; metadataURL = nil; metadata = nil; metadataRevision = nil
+                    restoredFocusAt = nil
                     generation = nil; gate = makeGate()
                     if !reportedUnavailable {
                         Logger(subsystem: "com.mytype.app", category: "AgentInbox").info("Claude viewing evidence unavailable; completed messages retained.")
@@ -310,7 +393,8 @@ final class ClaudeSessionViewingSource: @unchecked Sendable {
         let eligible = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
             && console["kCGSSessionOnConsoleKey"] as? Bool == true
             && console["CGSSessionScreenIsLocked"] as? Bool != true && visible.count == 1
-        return AppState(processID: app.processIdentifier, generation: "\(app.processIdentifier):\(start)", eligible: eligible)
+        return AppState(processID: app.processIdentifier, generation: "\(app.processIdentifier):\(start)",
+                        startedAt: Date(timeIntervalSince1970: TimeInterval(start)), eligible: eligible)
     }
 
     /// Verifies the running publisher once per process generation, without attaching a debugger.

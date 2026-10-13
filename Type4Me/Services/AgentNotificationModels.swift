@@ -39,7 +39,7 @@ struct AgentInboxUpdate: Sendable {
     ///   pendingRequests: Authoritative requests; nil preserves last known requests.
     ///   preview: Visible assistant text only, without tool payloads.
     ///   completionID: Stable ID only for a newly observed successful turn.
-    ///   nativeHasUnreadTurn: Fresh read state from the verified native owner; nil means unavailable.
+    ///   nativeHasUnreadTurn: Fresh owner read state or verified same-turn completion receipt; nil means unavailable.
     ///   observedAt: Local observation time used to reject late updates.
     init(session: AgentSessionDescriptor, status: AgentInboxStatus,
          pendingRequests: [AgentInboxRequest]? = nil, preview: String = "",
@@ -61,8 +61,11 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
     var ioTimeoutSeconds: Double = 3
     var socketPollSeconds: Double = 0.25
     var claudeReconcileIntervalSeconds: Double = 2
+    var codexReadReconcileIntervalSeconds: Double = 2
+    var maximumCodexReadRefreshes = 4
     var persistenceDebounceSeconds: Double = 0.25
     var completionAlertDelaySeconds: Double = 2.5
+    var inboxAutoHideSeconds: Double = 8
     var viewingPollSeconds: Double = 0.25
     var viewingStableSeconds: Double = 1
     var viewingEvidenceMaxAgeSeconds: Double = 1
@@ -117,7 +120,10 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
         guard intervals.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 300 }),
               discoveryIntervalSeconds >= 5, reconnectDelaySeconds >= 1,
               socketPollSeconds >= 0.05, claudeReconcileIntervalSeconds >= 0.5,
+              codexReadReconcileIntervalSeconds.isFinite, (0.5...30).contains(codexReadReconcileIntervalSeconds),
+              (1...16).contains(maximumCodexReadRefreshes),
               completionAlertDelaySeconds.isFinite, (0...10).contains(completionAlertDelaySeconds),
+              inboxAutoHideSeconds.isFinite, (3...60).contains(inboxAutoHideSeconds),
               (0.1...2).contains(viewingPollSeconds), (0.5...5).contains(viewingStableSeconds),
               viewingEvidenceMaxAgeSeconds >= viewingPollSeconds, viewingEvidenceMaxAgeSeconds <= 5,
               (1_024...1_048_576).contains(maximumClaudeFocusLogBytes),
