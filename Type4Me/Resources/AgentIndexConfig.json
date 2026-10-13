@@ -1,0 +1,17 @@
+{
+  "endpoint": "http://127.0.0.1:18742",
+  "expectedAPIVersion": 10,
+  "expectedDataVersion": 128,
+  "expectedIndexScope": "dialogue-date-v1|days=30|from=|to=|tz=UTC",
+  "pollIntervalSeconds": 30,
+  "coverageIntervalSeconds": 300,
+  "startupTimeoutSeconds": 30,
+  "startupProbeIntervalSeconds": 1,
+  "requestTimeoutSeconds": 5,
+  "resourceTimeoutSeconds": 10,
+  "syncTimeoutSeconds": 600,
+  "minimumSyncIntervalSeconds": 60,
+  "restartDelaysSeconds": [2, 8, 30],
+  "maximumResponseBytes": 262144,
+  "maximumRuntimeRecordBytes": 65536
+}

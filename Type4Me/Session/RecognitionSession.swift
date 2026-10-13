@@ -960,6 +960,8 @@ actor RecognitionSession {
     /// session so a Settings change cannot alter an in-flight recording.
     private var clipboardOutputPolicy = ClipboardOutputPolicy.defaultValue
     private var completionIntent: CompletionIntent = .normal
+    /// Desktop-open task owned by the current recognition generation.
+    private var agentRouterTask: Task<AgentRouterResult, Never>?
     /// Continuation resumed when a final (isFinal) transcript arrives during stop.
     private var finalTranscriptCont: CheckedContinuation<String?, Never>?
     /// Continuation resumed when first non-empty streaming text arrives (for short-recording wait).
@@ -2036,10 +2038,15 @@ actor RecognitionSession {
         await forceReset()
     }
 
-    /// Mark the current result as cancelled. Recognition and history still
-    /// proceed; the frozen clipboard policy decides whether it is retained.
+    /// Marks the result as cancelled and stops any pending desktop-agent opening.
+    ///
+    /// Recognition and history still proceed according to the frozen clipboard policy.
+    ///
+    /// Returns:
+    ///   Nothing. Records the cancellation intent and cancels the owned routing task.
     func abortInjection() {
         completionIntent = .cancelled
+        agentRouterTask?.cancel()
         DebugFileLogger.log(
             "abortInjection: policy=\(clipboardOutputPolicy.rawValue) "
                 + "processesCancelled=\(clipboardOutputPolicy.processesCancelledResult)"
@@ -2828,7 +2835,8 @@ actor RecognitionSession {
             // rewritten nothing downstream can tell a replacement from a misrecognition,
             // and re-running rules later would describe whatever rules exist by then.
             // Typed input skips the rules, which is itself a known fact: none fired.
-            let snippetApplication = isManualInput
+            // Agent requests carry the spoken intent, not expanded personal snippets.
+            let snippetApplication = isManualInput || currentMode.id == ProcessingMode.agentRouterModeId
                 ? SnippetApplication(text: finalText, appliedRules: [])
                 : applyOutputSnippets(
                     to: finalText,
@@ -2840,20 +2848,28 @@ actor RecognitionSession {
             var intelliSenseGuardInput = finalText
 
             if currentMode.id == ProcessingMode.agentRouterModeId {
+                guard ownsSession(myGeneration) else { return }
                 state = .postProcessing
-                let routerResult = CmuxAgentRouterService.shared.handle(finalText)
-                let routerText = routerResult.message
-                let routerOutcome: InjectionOutcome = routerResult.handled
-                    ? .inserted
-                    : .actionFailed(routerText)
+                let routerInput = finalText
+                let cancellationRequested = completionIntent == .cancelled || Task.isCancelled
+                let routerTask = Task { () -> AgentRouterResult in
+                    guard !cancellationRequested, !Task.isCancelled, completionIntent == .normal else {
+                        return AgentRouterResult(outcome: .cancelled)
+                    }
+                    return await AgentCommandService.shared.handle(routerInput)
+                }
+                agentRouterTask = routerTask
+                let routerResult = await routerTask.value
+                guard ownsSession(myGeneration) else { return }
+                agentRouterTask = nil
+                let routeCancelled = cancellationRequested || completionIntent == .cancelled || routerTask.isCancelled
+                let effectiveResult = routeCancelled ? AgentRouterResult(outcome: .cancelled) : routerResult
+                let routerText = effectiveResult.message
                 emitRecognitionEvent(
-                    .processingResult(text: routerText),
+                    .agentRoutingResult(effectiveResult),
                     ownerGeneration: myGeneration
                 )
-                emitRecognitionEvent(
-                    .finalized(text: routerText, injection: routerOutcome, llmFailed: false),
-                    ownerGeneration: myGeneration
-                )
+                emitRecognitionEvent(.completed, ownerGeneration: myGeneration)
 
                 let recordId = UUID().uuidString
                 let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
@@ -2865,7 +2881,7 @@ actor RecognitionSession {
                     processingMode: currentMode.name,
                     processedText: nil,
                     finalText: routerText,
-                    status: routerResult.historyStatus,
+                    status: routeCancelled ? "discarded" : routerResult.historyStatus,
                     characterCount: routerText.count,
                     asrProvider: activeProvider.displayName
                 ))
@@ -3896,7 +3912,7 @@ actor RecognitionSession {
 
         case .processingResult, .processingLabelOverride, .recoveryStarted,
              .recoveryPrompt, .recoverySucceeded, .recoveryFailed,
-             .recoveryInterrupted, .finalized, .macActionResult,
+             .recoveryInterrupted, .finalized, .macActionResult, .agentRoutingResult,
              .selectionAskStarted, .selectionAskAnswerDelta,
              .selectionAskAnswerCompleted, .selectionAskAnswerFailed,
              .reviseProcessing, .reviseCompleted, .reviseFailed,
@@ -5109,6 +5125,8 @@ actor RecognitionSession {
         sessionGeneration &+= 1
         let resetGeneration = sessionGeneration
         state = .resetting
+        agentRouterTask?.cancel()
+        agentRouterTask = nil
 
         if let cont = firstStreamingTextCont {
             firstStreamingTextCont = nil

@@ -534,7 +534,7 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
         switch mode.id {
         case ProcessingMode.directId, ProcessingMode.smartDirectId: return "bolt.fill"
         case ProcessingMode.formalWritingId: return "wand.and.stars"
-        case ProcessingMode.agentRouterModeId: return "terminal.fill"
+        case ProcessingMode.agentRouterModeId: return "macwindow"
         case ProcessingMode.translationModeId: return "character.book.closed.fill"
         case ProcessingMode.intelliSenseId: return "sparkles"
         case ProcessingMode.macActionId: return "command.circle.fill"
@@ -722,8 +722,8 @@ struct ModesSettingsTab: View, SettingsCardHelpers {
     private func builtinModeDescription(for mode: ProcessingMode) -> String {
         if mode.id == ProcessingMode.agentRouterModeId {
             return L(
-                "用于呼出 Agent 路由，按语音内容查找或启动对应工作目录。此模式是系统工作流的一部分，只允许配置快捷键，不能编辑提示词或处理逻辑。",
-                "Opens the Agent Router and uses speech to find or start the target workspace. This mode is part of the system workflow: only its hotkey can be configured."
+                "按事项名称查找 Codex 和 Claude Code 会话；有多个候选时选择具体会话。可为事项起一个常用称呼。此模式只允许配置快捷键，不能编辑提示词或处理逻辑。",
+                "Finds Codex and Claude Code sessions by activity name; choose a session when several match. You can give an activity a familiar name. Only this mode's hotkey can be configured."
             )
         }
         return L(

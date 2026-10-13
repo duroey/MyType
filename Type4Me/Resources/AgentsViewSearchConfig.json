@@ -1,0 +1,11 @@
+{
+  "endpoint": "http://127.0.0.1:18742",
+  "requestTimeoutSeconds": 15,
+  "resourceTimeoutSeconds": 30,
+  "maximumResponseBytes": 262144,
+  "maximumQueryCharacters": 512,
+  "maximumResults": 20,
+  "maximumSnippetCharacters": 400,
+  "maximumSessionIdentifierCharacters": 256,
+  "maximumOrdinalRangeEntries": 32
+}

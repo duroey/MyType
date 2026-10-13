@@ -3,8 +3,7 @@ import XCTest
 
 final class AgentLauncherServiceTests: XCTestCase {
     private final class RunRecorder: @unchecked Sendable {
-        var runs: [[String]] = []
-        var cmuxWorkspaces: [(name: String, cwd: String, command: String)] = []
+        var opens: [(application: AgentDesktopApplication, projectURL: URL?, sessionID: String?)] = []
     }
 
     private var tempRoot: URL!
@@ -31,7 +30,7 @@ final class AgentLauncherServiceTests: XCTestCase {
         XCTAssertEqual(service.parseQuery(from: "项目"), "")
     }
 
-    func testMatchesProjectFromZshHistory() throws {
+    func testMatchesProjectFromZshHistory() async throws {
         let projectURL = homeDirectory.appendingPathComponent("Projects/MyCoolApp", isDirectory: true)
         try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
         try ": 1700000000:0;cd ~/Projects/MyCoolApp\n".write(
@@ -41,39 +40,40 @@ final class AgentLauncherServiceTests: XCTestCase {
         )
 
         let service = makeService()
-        let result = service.handle("打开 My Cool 项目", launch: false)
+        let result = await service.handle("打开 My Cool 项目", launch: false)
 
         XCTAssertTrue(result.launched)
         XCTAssertEqual(result.project?.path, projectURL.standardizedFileURL.path)
-        XCTAssertEqual(result.message, "已启动 Agent：MyCoolApp")
+        XCTAssertEqual(result.application, .codex)
+        XCTAssertEqual(result.outcome, .opened)
     }
 
-    func testNoMatchDoesNotLaunch() {
+    func testNoMatchDoesNotLaunch() async {
         let recorder = RunRecorder()
         let service = makeService(recorder: recorder)
 
-        let result = service.handle("打开不存在的项目", launch: true)
+        let result = await service.handle("打开不存在的项目", launch: true)
 
         XCTAssertFalse(result.launched)
         XCTAssertNil(result.project)
-        XCTAssertTrue(recorder.runs.isEmpty)
+        XCTAssertTrue(recorder.opens.isEmpty)
     }
 
-    func testMatchesProjectFromSpotlightFolderSearch() throws {
+    func testMatchesProjectFromSpotlightFolderSearch() async throws {
         let projectURL = homeDirectory.appendingPathComponent("Downloads/计算机图形学", isDirectory: true)
         try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
         let service = makeService(spotlightSearcher: { query in
             query == "计算机图形学" ? [projectURL] : []
         })
 
-        let result = service.handle("去计算机图形学", launch: false)
+        let result = await service.handle("去计算机图形学", launch: false)
 
         XCTAssertTrue(result.launched)
         XCTAssertEqual(result.project?.path, projectURL.standardizedFileURL.path)
         XCTAssertEqual(result.project?.name, "计算机图形学")
     }
 
-    func testRejectsAmbiguousProjectNames() throws {
+    func testRejectsAmbiguousProjectNames() async throws {
         let mechanismURL = homeDirectory.appendingPathComponent("Work/自动唤醒机制", isDirectory: true)
         let flowURL = homeDirectory.appendingPathComponent("Work/自动唤醒流程", isDirectory: true)
         try FileManager.default.createDirectory(at: mechanismURL, withIntermediateDirectories: true)
@@ -88,80 +88,84 @@ final class AgentLauncherServiceTests: XCTestCase {
         )
         let service = makeService()
 
-        let result = service.handle("去自动唤醒", launch: false)
+        let result = await service.handle("去自动唤醒", launch: false)
 
         XCTAssertFalse(result.launched)
         XCTAssertNil(result.project)
-        XCTAssertEqual(result.message, "未找到匹配项目：自动唤醒")
+        XCTAssertEqual(result.outcome, .noProjectMatch)
     }
 
-    func testShellCommandUsesCodexResumeCommand() throws {
-        let service = makeService()
-        let projectURL = homeDirectory.appendingPathComponent("Work/Space's App", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        let project = AgentLauncherProject(
-            path: projectURL.path,
-            name: projectURL.lastPathComponent,
-            normalizedName: service.normalize(projectURL.lastPathComponent),
-            lastSeen: 0
-        )
-
-        let command = service.shellCommand(for: project)
-
-        XCTAssertTrue(command.contains("codex --dangerously-bypass-approvals-and-sandbox resume"))
-        XCTAssertTrue(command.contains("'\\''"))
-    }
-
-    func testCmuxCommandUsesWorkingDirectoryFlagOnly() throws {
-        let service = makeService()
-        let projectURL = homeDirectory.appendingPathComponent("Downloads/计算机图形学", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        let project = AgentLauncherProject(
-            path: projectURL.path,
-            name: projectURL.lastPathComponent,
-            normalizedName: service.normalize(projectURL.lastPathComponent),
-            lastSeen: 0
-        )
-
-        let command = service.cmuxCommand(for: project)
-
-        XCTAssertEqual(command, "codex --dangerously-bypass-approvals-and-sandbox resume")
-        XCTAssertFalse(command.contains("cd "))
-    }
-
-    func testCmuxLaunchCreatesNewWorkspaceForMatchedProject() throws {
+    /// Verifies the chosen desktop agent receives the original project path.
+    func testSelectedClaudeOpensMatchedProject() async throws {
         let recorder = RunRecorder()
         let projectURL = homeDirectory.appendingPathComponent("Downloads/计算机图形学", isDirectory: true)
         try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        try ": 1700000000:0;cd ~/Downloads/计算机图形学\n".write(
-            to: homeDirectory.appendingPathComponent(".zsh_history"),
-            atomically: true,
-            encoding: .utf8
-        )
         let service = makeService(
             recorder: recorder,
-            preferredTerminalProvider: { .cmux },
-            cmuxWorkspaceCreator: { project, command in
-                recorder.cmuxWorkspaces.append((project.name, project.path, command))
-                return true
-            }
+            spotlightSearcher: { _ in [projectURL] },
+            preferredApplicationProvider: { .claudeCode }
         )
 
-        let result = service.handle("去计算机图形学", launch: true)
+        let result = await service.handle("去计算机图形学")
 
         XCTAssertTrue(result.launched)
-        XCTAssertEqual(result.project?.path, projectURL.standardizedFileURL.path)
-        XCTAssertTrue(recorder.runs.isEmpty)
-        XCTAssertEqual(recorder.cmuxWorkspaces.count, 1)
-        XCTAssertEqual(recorder.cmuxWorkspaces.first?.name, "计算机图形学")
-        XCTAssertEqual(recorder.cmuxWorkspaces.first?.cwd, projectURL.standardizedFileURL.path)
-        XCTAssertEqual(
-            recorder.cmuxWorkspaces.first?.command,
-            "codex --dangerously-bypass-approvals-and-sandbox resume"
-        )
+        XCTAssertEqual(result.application, .claudeCode)
+        XCTAssertEqual(recorder.opens.count, 1)
+        XCTAssertEqual(recorder.opens.first?.application, .claudeCode)
+        XCTAssertEqual(recorder.opens.first?.projectURL, projectURL.standardizedFileURL)
+        XCTAssertNil(recorder.opens.first?.sessionID)
     }
 
-    func testReconcileProjectIndexAddsDiscoveredProjectsAndRemovesMissingCachedProjects() throws {
+    /// Verifies an app-only request does not require a matching project folder.
+    func testSpokenApplicationNameOpensDesktopWithoutProject() async {
+        let recorder = RunRecorder()
+        let service = makeService(recorder: recorder)
+
+        let result = await service.handle("打开 Claude Code")
+
+        XCTAssertTrue(result.launched)
+        XCTAssertEqual(result.application, .claudeCode)
+        XCTAssertNil(result.project)
+        XCTAssertEqual(recorder.opens.count, 1)
+        XCTAssertNil(recorder.opens.first?.projectURL)
+    }
+
+    /// Verifies a missing chosen app ends routing before directory discovery.
+    func testMissingApplicationDoesNotSearchOrOpenAnotherAgent() async {
+        let recorder = RunRecorder()
+        let service = makeService(
+            recorder: recorder,
+            spotlightSearcher: { _ in XCTFail("Missing apps must not search projects"); return [] },
+            preferredApplicationProvider: { .claudeCode },
+            installationChecker: { $0 == .codex }
+        )
+
+        let result = await service.handle("打开 MyType")
+
+        XCTAssertFalse(result.launched)
+        XCTAssertEqual(result.application, .claudeCode)
+        XCTAssertEqual(result.outcome, .applicationUnavailable)
+        XCTAssertTrue(recorder.opens.isEmpty)
+    }
+
+    /// Verifies an explicit project suffix preserves folders named after an agent.
+    func testProjectNamedCodexDoesNotBecomeAppOnlyRequest() async throws {
+        let recorder = RunRecorder()
+        let projectURL = homeDirectory.appendingPathComponent("Work/codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let service = makeService(
+            recorder: recorder, spotlightSearcher: { _ in [projectURL] },
+            preferredApplicationProvider: { .claudeCode }
+        )
+
+        let result = await service.handle("打开 Codex 项目")
+
+        XCTAssertTrue(result.launched)
+        XCTAssertEqual(result.application, .claudeCode)
+        XCTAssertEqual(recorder.opens.first?.projectURL, projectURL.standardizedFileURL)
+    }
+
+    func testReconcileProjectIndexAddsDiscoveredProjectsAndRemovesMissingCachedProjects() async throws {
         let service = makeService()
         let existingURL = homeDirectory.appendingPathComponent("Work/ExistingApp", isDirectory: true)
         let newURL = homeDirectory.appendingPathComponent("Work/NewApp", isDirectory: true)
@@ -196,34 +200,39 @@ final class AgentLauncherServiceTests: XCTestCase {
 
         XCTAssertEqual(Set(reconciled.map(\.name)), ["ExistingApp", "NewApp"])
         XCTAssertEqual(cachedNames, ["ExistingApp", "NewApp"])
-        XCTAssertTrue(service.handle("去 ExistingApp", launch: false).launched)
-        XCTAssertTrue(service.handle("去 NewApp", launch: false).launched)
-        XCTAssertFalse(service.handle("去 MissingApp", launch: false).launched)
+        let existing = await service.handle("去 ExistingApp", launch: false)
+        let newProject = await service.handle("去 NewApp", launch: false)
+        let missing = await service.handle("去 MissingApp", launch: false)
+        XCTAssertTrue(existing.launched)
+        XCTAssertTrue(newProject.launched)
+        XCTAssertFalse(missing.launched)
     }
 
-    /// Builds a launcher service with isolated filesystem and process dependencies.
+    /// Builds a launcher with isolated storage and recorded desktop open requests.
     ///
     /// Args:
-    ///   recorder: Recorder for terminal launch commands.
+    ///   recorder: Recorder for desktop open requests.
     ///   spotlightSearcher: Injected Spotlight folder searcher.
+    ///   preferredApplicationProvider: Optional desktop agent selector.
+    ///   installationChecker: Injected installed-app check.
     ///
     /// Returns:
     ///   Configured launcher service.
     private func makeService(
         recorder: RunRecorder = RunRecorder(),
         spotlightSearcher: @escaping @Sendable (String) -> [URL] = { _ in [] },
-        preferredTerminalProvider: (@Sendable () -> AgentLauncherTerminal)? = nil,
-        cmuxWorkspaceCreator: (@Sendable (AgentLauncherProject, String) -> Bool)? = nil
+        preferredApplicationProvider: (@Sendable () -> AgentDesktopApplication)? = { .codex },
+        installationChecker: @escaping @Sendable (AgentDesktopApplication) -> Bool = { _ in true }
     ) -> AgentLauncherService {
         AgentLauncherService(
             homeDirectory: homeDirectory,
             cacheURL: tempRoot.appendingPathComponent("agent-projects.json"),
             spotlightSearcher: spotlightSearcher,
-            processRunner: { args in
-                recorder.runs.append(args)
-            },
-            preferredTerminalProvider: preferredTerminalProvider,
-            cmuxWorkspaceCreator: cmuxWorkspaceCreator
+            preferredApplicationProvider: preferredApplicationProvider,
+            installationChecker: installationChecker,
+            desktopOpener: { application, projectURL, sessionID in
+                recorder.opens.append((application, projectURL, sessionID))
+            }
         )
     }
 }

@@ -44,7 +44,6 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @AppStorage(FocusAcousticMode.storageKey) private var focusAcousticMode = FocusAcousticMode.noisy.rawValue
     @AppStorage(FocusAutoStopSilenceSetting.storageKey) private var focusAutoStopSilenceSeconds = FocusAutoStopSilenceSetting.defaultSeconds
     @AppStorage(FocusWakeupController.focusWakeupModeIdKey) private var focusWakeupModeId = ""
-    @AppStorage("tf_agentLauncherTerminal") private var agentLauncherTerminal = "auto"
     @AppStorage(CrossModeFinishPreference.storageKey) private var allowCrossModeFinish = CrossModeFinishPreference.defaultValue
     @AppStorage(AudioInputDevicePreferenceStore.modeKey) private var microphonePreferenceMode = AudioInputDevicePreferenceMode.systemDefault.rawValue
     @AppStorage(AudioInputDevicePreferenceStore.priorityEntriesKey) private var microphonePriorityEntriesStorage = ""
@@ -59,7 +58,11 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     @State private var focusAutoStopSilenceText = FocusAutoStopSilenceSetting.formatted(FocusAutoStopSilenceSetting.defaultSeconds)
     @State private var launcherModes: [ProcessingMode] = ModeStorage().load()
     @State private var launcherHotkeyRecordingTarget: RecordingTarget?
-    @State private var availableLauncherTerminals: [AgentLauncherTerminal] = []
+    @State private var launcherInstallations: [AgentDesktopInstallation] = []
+    @State private var isBrowsingAgentActivities = false
+    @State private var agentBrowseResult: AgentRouterResult?
+    @AppStorage(AgentHistorySearchPreference.storageKey)
+    private var agentHistorySearchEnabled = AgentHistorySearchPreference.defaultEnabled
     @State private var showMicrophonePrioritySheet = false
     @State private var draftMicrophonePriorityEntries: [AudioInputDevicePreferenceEntry] = []
 
@@ -179,15 +182,82 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             Spacer().frame(height: 16)
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // CARD 3: Agent 启动器
+            // CARD 3: Agent 事项
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            settingsGroupCard(L("Agent 启动器", "Agent Launcher"), icon: "terminal.fill") {
+            settingsGroupCard(L("Agent 事项", "Agent Activities"), icon: "macwindow") {
+                HStack(spacing: 12) {
+                    Text(AgentInboxCopy.text(.entryDetail, language: AppLanguage(rawValue: language) ?? .en))
+                        .font(.system(size: 12))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                    Spacer()
+                    Button {
+                        AgentInboxPanelController.shared.show()
+                    } label: {
+                        Label(AgentInboxCopy.text(.showInbox, language: AppLanguage(rawValue: language) ?? .en),
+                              systemImage: "tray")
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TF.settingsAccentBlue)
+                }
+                SettingsDivider()
                 HStack(alignment: .top, spacing: 16) {
                     launcherHotkeyRow
                         .frame(maxWidth: .infinity)
-                    launcherTerminalRow
+                    launcherApplicationRow
                         .frame(maxWidth: .infinity)
+                }
+                Toggle(L("根据历史内容找事情", "Find activities from conversation history"), isOn: $agentHistorySearchEnabled)
+                    .font(.system(size: 12))
+                    .tint(TF.settingsAccentBlue)
+                    .onChange(of: agentHistorySearchEnabled) { _, _ in
+                        AgentIndexService.shared.preferencesDidChange()
+                    }
+                Text(L("从过去的工作内容中查找，核对候选后打开原会话。", "Search past work, review the matches, and open the original conversation."))
+                    .font(.system(size: 11))
+                    .foregroundStyle(TF.settingsTextSecondary)
+                if agentHistorySearchEnabled {
+                    HStack(alignment: .top, spacing: 12) {
+                        Text(AgentIndexService.shared.status.summary(language: AppLanguage(rawValue: language) ?? .en))
+                            .font(.system(size: 11))
+                            .foregroundStyle(TF.settingsTextSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button(L("更新记录", "Update records")) {
+                            switch AgentIndexService.shared.status.phase {
+                            case .failed, .portOccupied, .incompatible, .notRunning:
+                                AgentIndexService.shared.retry()
+                            default:
+                                AgentIndexService.shared.requestSync()
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(TF.settingsAccentBlue)
+                    }
+                    Text(L("自动更新最近 30 天活跃会话的可见对话；旧会话重新续聊后会再次纳入。", "Automatically updates visible dialogue from sessions active in the last 30 days. Resumed older sessions are included again."))
+                        .font(.system(size: 11))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                }
+                HStack(spacing: 12) {
+                    Text(L("查看会话，为事项起一个常用称呼", "View sessions and give activities familiar names"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                    Spacer()
+                    Button(L("查看事情", "View activities")) {
+                        browseAgentActivities()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(TF.settingsAccentBlue)
+                    .disabled(isBrowsingAgentActivities)
+                }
+                if let agentBrowseResult {
+                    Text(agentBrowseResult.message(language: AppLanguage(rawValue: language) ?? .en))
+                        .font(.system(size: 11))
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -289,7 +359,7 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
             refreshMicrophones()
             refreshSpeakers()
             reloadLauncherModes()
-            refreshLauncherTerminals()
+            refreshLauncherApplications()
         }
         .onChange(of: launchAtLogin) { _, newValue in
             setLoginItem(enabled: newValue)
@@ -305,6 +375,14 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         }
         .onReceive(NotificationCenter.default.publisher(for: .audioInputDevicesDidChange)) { _ in
             refreshMicrophones()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshLauncherApplications()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agentActivityRoutingFinished)) { notification in
+            if let result = notification.object as? AgentRouterResult {
+                agentBrowseResult = result
+            }
         }
         .sheet(item: $launcherHotkeyRecordingTarget) { target in
             HotkeyRecordingSheet(
@@ -920,14 +998,14 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
     private var launcherHotkeyRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
-                Text(L("启动器热键", "Launcher Hotkey").uppercased())
+                Text(L("Agent 按键", "Agent Hotkey").uppercased())
                     .font(.system(size: 10, weight: .semibold))
                     .tracking(0.8)
                     .foregroundStyle(TF.settingsTextTertiary)
                 Text("|")
                     .font(.system(size: 10))
                     .foregroundStyle(TF.settingsTextTertiary.opacity(0.5))
-                Text(L("呼出 Agent 路由", "Open agent router"))
+                Text(L("找回会话或交接工作", "Find conversations or hand off work"))
                     .font(.system(size: 10))
                     .foregroundStyle(TF.settingsTextTertiary)
             }
@@ -966,35 +1044,36 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         .padding(.vertical, 6)
     }
 
-    private var launcherTerminalRow: some View {
+    private var launcherApplicationRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
-                Text(L("终端", "Terminal").uppercased())
+                Text(L("应用", "App").uppercased())
                     .font(.system(size: 10, weight: .semibold))
                     .tracking(0.8)
                     .foregroundStyle(TF.settingsTextTertiary)
                 Text("|")
                     .font(.system(size: 10))
                     .foregroundStyle(TF.settingsTextTertiary.opacity(0.5))
-                Text(L("启动 Agent 使用的终端", "Terminal used for agents"))
+                Text(L("桌面 Agent 安装状态", "Desktop agent availability"))
                     .font(.system(size: 10))
                     .foregroundStyle(TF.settingsTextTertiary)
                 Spacer()
                 Button {
-                    refreshLauncherTerminals()
+                    refreshLauncherApplications()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 10))
                         .foregroundStyle(TF.settingsTextTertiary)
                 }
                 .buttonStyle(.plain)
-                .help(L("刷新终端列表", "Refresh terminal list"))
+                .help(L("刷新应用安装状态", "Refresh app installation status"))
+                .accessibilityLabel(L("刷新应用安装状态", "Refresh app installation status"))
             }
-            settingsDropdown(
-                selection: $agentLauncherTerminal,
-                options: launcherTerminalOptions,
-                icon: "terminal"
-            )
+            Text(launcherInstallationSummary)
+                .font(.system(size: 12))
+                .foregroundStyle(TF.settingsTextSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(minHeight: 36, alignment: .leading)
         }
         .padding(.vertical, 6)
     }
@@ -1017,19 +1096,36 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         )
     }
 
-    private var launcherTerminalOptions: [(value: String, label: String)] {
-        var options: [(value: String, label: String)] = [("auto", L("自动检测", "Auto Detect"))]
-        options.append(contentsOf: availableLauncherTerminals.map { ($0.rawValue, $0.displayName) })
+    private var launcherInstallationSummary: String {
+        Self.launcherInstallationSummary(
+            language: AppLanguage(rawValue: language) ?? .en,
+            installations: launcherInstallations
+        )
+    }
 
-        if agentLauncherTerminal != "auto",
-           let selected = AgentLauncherTerminal(rawValue: agentLauncherTerminal),
-           !availableLauncherTerminals.contains(selected) {
-            options.insert(
-                (selected.rawValue, L("\(selected.displayName)（未安装）", "\(selected.displayName) (Not Installed)")),
-                at: 1
-            )
+    /// Renders installed desktop agents without choosing one for every activity.
+    ///
+    /// Args:
+    ///   language: Interface language observed by the settings view.
+    ///   installations: Latest desktop-agent installation snapshot.
+    ///
+    /// Returns:
+    ///   One localized status line, with installation guidance when none exist.
+    nonisolated static func launcherInstallationSummary(
+        language: AppLanguage,
+        installations: [AgentDesktopInstallation]
+    ) -> String {
+        let names = AgentDesktopApplication.allCases.filter { application in
+            installations.contains { $0.application == application && $0.isInstalled }
+        }.map(\.displayName)
+        guard !names.isEmpty else {
+            return language == .zh
+                ? "尚未检测到 Codex 或 Claude Code。安装桌面应用后点击刷新。"
+                : "Codex and Claude Code were not found. Install a desktop app, then refresh."
         }
-        return options
+        return language == .zh
+            ? "已安装：\(names.joined(separator: "、"))"
+            : "Installed: \(names.joined(separator: ", "))"
     }
 
     private var keepOnNormalInputRow: some View {
@@ -1129,15 +1225,31 @@ struct GeneralSettingsTab: View, SettingsCardHelpers {
         launcherModes = ModeStorage().load()
     }
 
-    /// Refreshes the installed terminal list for the launcher dropdown.
+    /// Refreshes desktop-agent availability for the informational status line.
     ///
     /// Args:
     ///   None.
     ///
     /// Returns:
-    ///   Nothing. Updates the terminal choices displayed in Settings.
-    private func refreshLauncherTerminals() {
-        availableLauncherTerminals = AgentLauncherTerminal.available()
+    ///   Nothing. Updates the displayed snapshot without saving an app preference.
+    private func refreshLauncherApplications() {
+        launcherInstallations = AgentDesktopLauncherService.shared.detectInstallations()
+    }
+
+    /// Opens the shared activity picker for choosing sessions and naming activities.
+    ///
+    /// Args:
+    ///   None.
+    ///
+    /// Returns:
+    ///   Nothing. Saves semantic feedback for rendering in the observed language.
+    private func browseAgentActivities() {
+        guard !isBrowsingAgentActivities else { return }
+        isBrowsingAgentActivities = true
+        Task { @MainActor in
+            defer { isBrowsingAgentActivities = false }
+            agentBrowseResult = await AgentRouterService.shared.browse()
+        }
     }
 
     /// Finds an existing hotkey owner outside the launcher mode.

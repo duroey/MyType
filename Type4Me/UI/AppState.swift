@@ -459,8 +459,8 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             return L("用语音触发常用 macOS 操作", "Trigger common macOS actions with your voice")
         case agentRouterModeId:
             return L(
-                "呼出 Agent 路由并启动对应工作目录",
-                "Open Agent Router and launch the matching workspace"
+                "找回 Agent 会话或交接工作",
+                "Find agent conversations or hand off work"
             )
         default:
             return ""
@@ -570,8 +570,8 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
             )
         case agentRouterModeId:
             return BuiltinLocalizedName(
-                chinese: "呼出 Agent 路由并启动对应工作目录",
-                english: "Open Agent Router and launch the matching workspace"
+                chinese: "找回 Agent 会话或交接工作",
+                english: "Find agent conversations or hand off work"
             )
         default:
             return nil
@@ -598,9 +598,25 @@ struct ProcessingMode: Codable, Identifiable, Equatable, Hashable {
         localizedDisplayDescription(for: .current)
     }
 
+    /// Renders system descriptions while preserving descriptions edited by users.
+    ///
+    /// Args:
+    ///   language: Interface language used to display the description.
+    ///
+    /// Returns:
+    ///   Localized default copy, including earlier Agent Router defaults, or the
+    ///   user's verbatim description.
     func localizedDisplayDescription(for language: AppLanguage) -> String {
+        let isEarlierAgentRouterDefault = id == Self.agentRouterModeId && [
+            "呼出 Agent 路由并启动对应工作目录",
+            "Open Agent Router and launch the matching workspace",
+            "根据口述项目名打开所选桌面 Agent",
+            "Open the selected desktop agent for a spoken project name",
+            "按事项名称查找并选择 Agent 会话",
+            "Find and choose agent sessions by activity name",
+        ].contains(description)
         guard let localizedDescription = Self.builtinLocalizedDescription(for: id),
-              localizedDescription.matchesStoredName(description)
+              localizedDescription.matchesStoredName(description) || isEarlierAgentRouterDefault
         else { return description }
         return localizedDescription.value(for: language)
     }
@@ -1451,7 +1467,11 @@ final class AppState {
 
     // MARK: Floating Bar
 
-    var barPhase: FloatingBarPhase = .hidden
+    var barPhase: FloatingBarPhase = .hidden {
+        didSet {
+            if barPhase != .done && barPhase != .error { agentRoutingResult = nil }
+        }
+    }
     var segments: [TranscriptionSegment] = []
     var currentMode: ProcessingMode
     var recordingProvider: ASRProvider? = nil
@@ -1460,7 +1480,11 @@ final class AppState {
     @ObservationIgnored let audioLevel = AudioLevelMeter()
     var recordingStartDate: Date?
     var availableModes: [ProcessingMode]
-    var feedbackMessage: String = L("已完成", "Done")
+    var feedbackMessage: String = L("已完成", "Done") {
+        didSet { agentRoutingResult = nil }
+    }
+    /// Keeps navigation feedback semantic while the done/error surface is visible.
+    private(set) var agentRoutingResult: AgentRouterResult?
     var feedbackKind: FeedbackKind = .standard
     var processingLabelOverride: String?
     var processingFinishTime: Date?
@@ -1885,6 +1909,49 @@ final class AppState {
         }
         onShowPanel?()
         scheduleAutoHide(for: barPhase, delay: .seconds(3))
+    }
+
+    /// Presents semantic activity-routing feedback using the existing action-result style.
+    ///
+    /// Args:
+    ///   result: Navigation outcome, preserving activity identity and user-provided titles.
+    ///
+    /// Returns:
+    ///   Nothing. Shows request feedback without claiming that text was inserted.
+    func showAgentRoutingResult(_ result: AgentRouterResult) {
+        activityKind = .standard
+        latestReviseUndoTicketID = nil
+        processingLabelOverride = nil
+        processingFinishTime = nil
+        showMacActionResult(message: result.message, status: Self.agentRoutingFeedbackStatus(for: result))
+        agentRoutingResult = result
+    }
+
+    /// Maps navigation outcomes to the existing status-specific action presentation.
+    ///
+    /// Args:
+    ///   result: Semantic activity-routing result.
+    ///
+    /// Returns:
+    ///   Unsure for a preview, pending or cancelled choice, success for a handled request,
+    ///   and failure for other routing outcomes.
+    nonisolated static func agentRoutingFeedbackStatus(for result: AgentRouterResult) -> MacActionResultStatus {
+        if result.outcome == .matchedPreview || result.outcome == .selectionRequired || result.outcome == .cancelled
+            || result.outcome == .handoffPrepared || result.outcome == .historyIndexUpdating {
+            return .unsure
+        }
+        return result.handled ? .success : .failure
+    }
+
+    /// Renders visible routing feedback from semantic state in the requested language.
+    ///
+    /// Args:
+    ///   language: Interface language observed by the persistent floating bar.
+    ///
+    /// Returns:
+    ///   Localized routing feedback, or the existing message for other feedback.
+    func feedbackMessage(for language: AppLanguage) -> String {
+        agentRoutingResult?.message(language: language) ?? feedbackMessage
     }
 
     // MARK: Computed

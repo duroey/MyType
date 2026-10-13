@@ -88,6 +88,18 @@ protocol FloatingBarState: AnyObject, Observable {
     var latestReviseUndoTicketID: UUID? { get }
     func performRecordingControlAction(_ action: RecordingControlAction)
     func performReviseUndo()
+    func feedbackMessage(for language: AppLanguage) -> String
+}
+
+extension FloatingBarState {
+    /// Provides unchanged feedback for states without semantic routing results.
+    ///
+    /// Args:
+    ///   language: Interface language selected by the floating-bar view.
+    ///
+    /// Returns:
+    ///   The state's existing feedback message.
+    func feedbackMessage(for language: AppLanguage) -> String { feedbackMessage }
 }
 
 /// Stable hover state for the transcript preview.
@@ -204,6 +216,10 @@ struct FloatingBarView<S: FloatingBarState>: View {
     @AppStorage("tf_language") private var language = AppLanguage.systemDefault
 
     // MARK: - Presentation Resolution
+
+    private var visibleFeedbackMessage: String {
+        state.feedbackMessage(for: AppLanguage(rawValue: language) ?? .en)
+    }
 
     private var effectiveTheme: RecordingTheme {
         presentationOverride?.theme
@@ -363,14 +379,14 @@ struct FloatingBarView<S: FloatingBarState>: View {
             let textW = measure(state.effectiveProcessingLabel)
             return basePadding + iconWidth + textW
         case .done:
-            let textW = measure(state.feedbackMessage)
+            let textW = measure(visibleFeedbackMessage)
             var actionW: CGFloat = 0
             if state.activityKind == .revise && state.latestReviseUndoTicketID != nil {
                 actionW = measure(L("撤销", "Undo")) + 22.0
             }
             return basePadding + iconWidth + textW + (actionW > 0 ? (actionW + 6.0) : 0)
         case .error:
-            let textW = measure(state.feedbackMessage)
+            let textW = measure(visibleFeedbackMessage)
             return basePadding + iconWidth + textW
         }
     }
@@ -423,9 +439,9 @@ struct FloatingBarView<S: FloatingBarState>: View {
         case .recovering:
             return min(TF.barWidth, measureText(state.effectiveProcessingLabel) + 86.0)
         case .done:
-            return feedbackWidth(for: state.feedbackMessage)
+            return feedbackWidth(for: visibleFeedbackMessage)
         case .error:
-            return feedbackWidth(for: state.feedbackMessage)
+            return feedbackWidth(for: visibleFeedbackMessage)
         case .hidden:
             return TF.barHeight
         }
@@ -639,7 +655,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 compactDoneContent
                     .transition(.textSwap.animation(.easeInOut(duration: 0.15)))
             case .error:
-                compactStatusContent(phase: .error, text: state.feedbackMessage)
+                compactStatusContent(phase: .error, text: visibleFeedbackMessage)
                     .transition(.opacity.animation(.easeInOut(duration: 0.18)))
             case .hidden:
                 EmptyView()
@@ -733,7 +749,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
         HStack(spacing: 6) {
             compactDoneIcon
 
-            Text(state.feedbackMessage)
+            Text(visibleFeedbackMessage)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(effectiveTheme == .light ? TF.floatingTextLight : .white)
                 .lineLimit(1)
@@ -760,7 +776,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
         }
         .padding(.horizontal, 10)
         .frame(height: TF.compactIndicatorHeight)
-        .accessibilityLabel(state.feedbackMessage)
+        .accessibilityLabel(visibleFeedbackMessage)
     }
 
     @ViewBuilder
@@ -1034,7 +1050,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
         Group {
             if state.activityKind == .revise && state.latestReviseUndoTicketID != nil {
                 HStack(spacing: 8) {
-                    Text(state.feedbackMessage)
+                    Text(visibleFeedbackMessage)
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(effectiveTheme == .light ? TF.floatingTextLight : .white)
                         .lineLimit(1)
@@ -1061,14 +1077,14 @@ struct FloatingBarView<S: FloatingBarState>: View {
                     Image(systemName: icon.symbol)
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(icon.color)
-                    Text(state.feedbackMessage)
+                    Text(visibleFeedbackMessage)
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(effectiveTheme == .light ? TF.floatingTextLight : .white)
                         .lineLimit(1)
                 }
                 .padding(.horizontal, 14)
             } else {
-                Text(state.feedbackMessage)
+                Text(visibleFeedbackMessage)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(effectiveTheme == .light ? TF.floatingTextLight : .white)
                     .frame(maxWidth: .infinity)
@@ -1086,7 +1102,7 @@ struct FloatingBarView<S: FloatingBarState>: View {
                 ErrorDot()
             }
 
-            Text(state.feedbackMessage)
+            Text(visibleFeedbackMessage)
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(effectiveTheme == .light ? TF.floatingTextLight : .white)
                 .lineLimit(1)

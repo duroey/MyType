@@ -224,7 +224,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private let hotkeyManager = HotkeyManager()
     private let cmuxDefaultReplyController = CmuxDefaultReplyController()
-    private let codexSessionIndexWatcher = CodexSessionIndexWatcher()
     private let session = RecognitionSession()
     private var selectionAskFollowUpStartGate = SelectionAskFollowUpStartGate()
     private var recordingStartGate = RecordingStartGate()
@@ -238,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recognitionEventContinuation: AsyncStream<RecognitionEventBridgeItem>.Continuation?
     private var pendingRecordingStartTask: Task<Void, Never>?
     private var inputDeviceChangeObservers: [NSObjectProtocol] = []
+    private var agentActivityResultObserver: NSObjectProtocol?
 
     private var effectiveInputDevice: AudioInputDevice?
     private var hasEstablishedInputDeviceBaseline = false
@@ -299,6 +299,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         DebugFileLogger.startSession()
         DebugFileLogger.log("applicationDidFinishLaunching")
+        AgentIndexService.shared.startIfEnabled()
+        AgentInboxStore.shared.onCompletion = { item in
+            AgentInboxPanelController.shared.showCompletion(item)
+        }
+        AgentNotificationService.shared.start()
         migrateRememberedMicrophoneProfileIfNeeded()
         floatingBarController = FloatingBarController(state: appState)
         appState.onRecordingControlAction = { [weak self] action in
@@ -479,6 +484,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.focusWakeupController?.sessionDidFinish()
                         self.hotkeyManager.isProcessing = false
                         self.safeResetHotkeyState()
+                    case .agentRoutingResult(let result):
+                        appState.showAgentRoutingResult(result)
+                        self.focusWakeupController?.sessionDidFinish()
+                        self.hotkeyManager.isProcessing = false
+                        self.safeResetHotkeyState()
                     case .selectionAskStarted(
                         let requestID,
                         let question,
@@ -568,6 +578,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshModeAvailability()
 
         // Re-register when modes change in Settings
+        agentActivityResultObserver = NotificationCenter.default.addObserver(
+            forName: .agentActivityRoutingFinished, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let result = notification.object as? AgentRouterResult else { return }
+            MainActor.assumeIsolated {
+                guard let self, [.hidden, .done, .error].contains(self.appState.barPhase) else { return }
+                self.appState.showAgentRoutingResult(result)
+            }
+        }
+
         NotificationCenter.default.addObserver(
             forName: .modesDidChange,
             object: nil,
@@ -705,10 +725,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.startHotkeyWithRetry()
             Task.detached(priority: .utility) {
                 DebugFileLogger.log("agent router index reconcile started")
-                CmuxAgentRouterService.shared.reconcileIndexes()
+                await AgentRouterService.shared.reconcileIndexes()
                 DebugFileLogger.log("agent router index reconcile finished")
             }
-            self.codexSessionIndexWatcher.start()
             self.reconcileRememberedMicrophoneProfile(restartFocusWakeup: false)
             if self.isFocusWakeupEnabled(), Self.shouldCalibrateNoiseFloorAtStartup() {
                 Task {
@@ -2723,6 +2742,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        AgentNotificationService.shared.stop()
+        AgentInboxStore.shared.onCompletion = nil
+        AgentInboxPanelController.shared.stop()
+        AgentIndexService.shared.stop()
         hotkeyManager.stop()
         inputDeviceChangeObservers.forEach(NotificationCenter.default.removeObserver)
         inputDeviceChangeObservers.removeAll()
@@ -2730,7 +2753,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recognitionEventContinuation?.finish()
         recognitionEventTask?.cancel()
         focusWakeupController?.stop()
-        codexSessionIndexWatcher.stop()
+        if let agentActivityResultObserver {
+            NotificationCenter.default.removeObserver(agentActivityResultObserver)
+        }
+        agentActivityResultObserver = nil
         backupSchedulerTask?.cancel()
         SystemVolumeManager.restore()
         // Synchronous kill: don't rely on async Task, app exits immediately after this returns
@@ -2907,7 +2933,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Menu Bar Content
 
 struct MenuBarContent: View {
+    @AppStorage("tf_language") private var language = AppLanguage.systemDefault
+
     var body: some View {
+        Button(L("Agent 消息队列…", "Agent Inbox…")) {
+            AgentInboxPanelController.shared.show()
+        }
+        Button(L("交接 Agent 会话…", "Hand Off an Agent Conversation…")) {
+            AgentHandoffWindowController.shared.show()
+        }
+        Divider()
         MenuBarControlCenterView()
     }
 }

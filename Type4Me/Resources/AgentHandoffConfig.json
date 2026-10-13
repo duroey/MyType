@@ -1,0 +1,19 @@
+{
+  "endpoint": "http://127.0.0.1:18742",
+  "requestTimeoutSeconds": 15,
+  "resourceTimeoutSeconds": 30,
+  "maximumHistoryBytes": 16777216,
+  "pageSize": 500,
+  "maximumPages": 1000,
+  "maximumInstructionCharacters": 8000,
+  "maximumInlineHistoryBytes": 262144,
+  "processTimeoutSeconds": 15,
+  "maximumProcessOutputBytes": 65536,
+  "socketTimeoutSeconds": 5,
+  "maximumClaudeRegistryEntries": 512,
+  "maximumClaudeRegistryFileBytes": 65536,
+  "processTerminationGraceSeconds": 0.3,
+  "maximumTranscriptDirectories": 2048,
+  "maximumIdentityProbeBytes": 65536,
+  "maximumClaudePacketBytes": 1048576
+}

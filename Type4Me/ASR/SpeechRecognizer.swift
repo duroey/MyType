@@ -125,6 +125,7 @@ enum RecognitionEvent: Sendable {
     /// Mac Action mode: action result to surface in the floating bar with
     /// status-specific icon and color, holding for ~3 seconds.
     case macActionResult(message: String, status: MacActionResultStatus)
+    case agentRoutingResult(AgentRouterResult)
     /// Selection ask mode: show a separate answer panel and stream Markdown into it.
     case selectionAskStarted(
         requestID: UUID,

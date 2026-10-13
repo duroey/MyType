@@ -7,128 +7,59 @@ struct AgentLauncherProject: Codable, Equatable, Sendable {
     let lastSeen: TimeInterval
 }
 
+enum AgentLauncherOutcome: Equatable, Sendable {
+    case opened
+    case emptyQuery
+    case noProjectMatch
+    case applicationUnavailable
+    case openFailed
+}
+
 struct AgentLauncherResult: Equatable, Sendable {
-    let launched: Bool
+    let outcome: AgentLauncherOutcome
+    let application: AgentDesktopApplication
     let query: String
     let project: AgentLauncherProject?
     let message: String
-}
 
-enum AgentLauncherTerminal: String, CaseIterable, Sendable {
-    case cmux
-    case ghostty
-    case warp
-    case iterm2
-    case kitty
-    case alacritty
-    case wezterm
-    case terminal
+    var launched: Bool { outcome == .opened }
 
-    var displayName: String {
-        switch self {
-        case .cmux:
-            return "cmux"
-        case .ghostty:
-            return "Ghostty"
-        case .warp:
-            return "Warp"
-        case .iterm2:
-            return "iTerm2"
-        case .kitty:
-            return "Kitty"
-        case .alacritty:
-            return "Alacritty"
-        case .wezterm:
-            return "WezTerm"
-        case .terminal:
-            return "Terminal.app"
+    var historyStatus: String {
+        switch outcome {
+        case .opened: return "agent_launched"
+        case .emptyQuery, .noProjectMatch: return "agent_no_match"
+        case .applicationUnavailable: return "agent_app_missing"
+        case .openFailed: return "agent_launch_failed"
         }
-    }
-
-    private var applicationPaths: [String] {
-        switch self {
-        case .cmux:
-            return ["/Applications/cmux.app"]
-        case .ghostty:
-            return ["/Applications/Ghostty.app"]
-        case .warp:
-            return ["/Applications/Warp.app"]
-        case .iterm2:
-            return ["/Applications/iTerm.app"]
-        case .kitty:
-            return ["/Applications/kitty.app", "/Applications/Kitty.app"]
-        case .alacritty:
-            return ["/Applications/Alacritty.app"]
-        case .wezterm:
-            return ["/Applications/WezTerm.app"]
-        case .terminal:
-            return ["/System/Applications/Utilities/Terminal.app"]
-        }
-    }
-
-    /// Returns whether this terminal is installed.
-    ///
-    /// Args:
-    ///   fileManager: File manager used to check application paths.
-    ///
-    /// Returns:
-    ///   `true` when the app exists, with Terminal.app always available as fallback.
-    func isInstalled(fileManager: FileManager = .default) -> Bool {
-        if self == .terminal {
-            return true
-        }
-        return applicationPaths.contains { fileManager.fileExists(atPath: $0) }
-    }
-
-    /// Resolves the application path to launch.
-    ///
-    /// Args:
-    ///   fileManager: File manager used to prefer an installed path.
-    ///
-    /// Returns:
-    ///   The first installed app path, or the primary known path.
-    func applicationPath(fileManager: FileManager = .default) -> String {
-        applicationPaths.first(where: { fileManager.fileExists(atPath: $0) }) ?? applicationPaths[0]
-    }
-
-    /// Lists installed terminals in launcher priority order.
-    ///
-    /// Args:
-    ///   fileManager: File manager used to check application paths.
-    ///
-    /// Returns:
-    ///   Installed terminal identifiers, always including Terminal.app.
-    static func available(fileManager: FileManager = .default) -> [AgentLauncherTerminal] {
-        let found = allCases.filter { $0.isInstalled(fileManager: fileManager) }
-        return found.contains(.terminal) ? found : found + [.terminal]
     }
 }
 
 final class AgentLauncherService: @unchecked Sendable {
     static let shared = AgentLauncherService()
     static let minimumMatchScore = AgentFuzzyMatcher.defaultThreshold
-    private static let codexResumeCommand = "codex --dangerously-bypass-approvals-and-sandbox resume"
+    private static let projectQuerySuffixes = ["项目", "工程", "目录", "folder", "project", "directory"]
 
     private let homeDirectory: URL
     private let cacheURL: URL
     private let fileManager: FileManager
     private let spotlightSearcher: @Sendable (String) -> [URL]
-    private let processRunner: @Sendable ([String]) throws -> Void
-    private let preferredTerminalProvider: (@Sendable () -> AgentLauncherTerminal)?
-    private let cmuxWorkspaceCreator: @Sendable (AgentLauncherProject, String) -> Bool
+    private let preferredApplicationProvider: (@Sendable () -> AgentDesktopApplication)?
+    private let installationChecker: @Sendable (AgentDesktopApplication) -> Bool
+    private let desktopOpener: @Sendable (AgentDesktopApplication, URL?, String?) async throws -> Void
     private let matcher: AgentFuzzyMatcher
     private let projectCacheRefreshInterval: TimeInterval = 3600
 
-    /// Creates a launcher service for routing spoken project names to terminal agents.
+    /// Creates a launcher that opens installed desktop agents for spoken projects.
     ///
-    /// - Parameters:
-    ///   - homeDirectory: User home directory used for shell history, Claude state, and project discovery.
-    ///   - cacheURL: Optional cache location for the discovered project index.
-    ///   - fileManager: File manager used for filesystem access.
-    ///   - spotlightSearcher: Folder searcher used when the cached project index misses.
-    ///   - processRunner: Process launcher injected by tests to avoid opening terminal windows.
-    ///   - preferredTerminalProvider: Optional terminal selector injected by tests.
-    ///   - cmuxWorkspaceCreator: cmux workspace creator injected by tests.
+    /// Args:
+    ///   homeDirectory: Home directory used to discover project folders.
+    ///   cacheURL: Optional location for the existing project index.
+    ///   fileManager: File manager used for project discovery.
+    ///   spotlightSearcher: Folder searcher used when the project index misses.
+    ///   preferredApplicationProvider: Optional desktop preference injected by tests.
+    ///   installationChecker: Installed-app check injected by tests.
+    ///   desktopOpener: Desktop open request injected by tests.
+    ///   matcher: Existing project-name fuzzy matcher.
     init(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         cacheURL: URL? = nil,
@@ -136,80 +67,188 @@ final class AgentLauncherService: @unchecked Sendable {
         spotlightSearcher: @escaping @Sendable (String) -> [URL] = { query in
             AgentLauncherService.searchSpotlightFolders(matching: query)
         },
-        processRunner: @escaping @Sendable ([String]) throws -> Void = { arguments in
-            try AgentLauncherService.runProcess(arguments: arguments)
+        preferredApplicationProvider: (@Sendable () -> AgentDesktopApplication)? = nil,
+        installationChecker: @escaping @Sendable (AgentDesktopApplication) -> Bool = { application in
+            AgentDesktopLauncherService.shared.detectInstallation(for: application).isInstalled
         },
-        preferredTerminalProvider: (@Sendable () -> AgentLauncherTerminal)? = nil,
-        cmuxWorkspaceCreator: (@Sendable (AgentLauncherProject, String) -> Bool)? = nil,
+        desktopOpener: @escaping @Sendable (AgentDesktopApplication, URL?, String?) async throws -> Void = {
+            application, projectURL, sessionID in
+            try await AgentDesktopLauncherService.shared.open(
+                application: application, projectURL: projectURL, sessionID: sessionID
+            )
+        },
         matcher: AgentFuzzyMatcher = AgentFuzzyMatcher()
     ) {
         self.homeDirectory = homeDirectory.standardizedFileURL
         self.fileManager = fileManager
         self.spotlightSearcher = spotlightSearcher
-        self.processRunner = processRunner
-        self.preferredTerminalProvider = preferredTerminalProvider
+        self.preferredApplicationProvider = preferredApplicationProvider
+        self.installationChecker = installationChecker
+        self.desktopOpener = desktopOpener
         self.matcher = matcher
-        self.cmuxWorkspaceCreator = cmuxWorkspaceCreator ?? { project, command in
-            CmuxCommandClient().newWorkspace(name: project.name, cwd: project.path, command: command)
+        self.cacheURL = cacheURL ?? AppIdentity.appSupportDirectory()
+            .appendingPathComponent("agent-projects.json")
+    }
+
+    /// Handles a transcript using one fixed desktop agent for the whole request.
+    ///
+    /// Args:
+    ///   text: Final ASR transcript containing an app or project name.
+    ///   launch: Whether to send a desktop open request; tests may disable it.
+    ///
+    /// Returns:
+    ///   Typed routing outcome, selected app, matched project, and localized feedback.
+    func handle(_ text: String, launch: Bool = true) async -> AgentLauncherResult {
+        let query = parseQuery(from: text)
+        let namedApplication = applicationNamed(by: query, originalText: text)
+        let application = namedApplication ?? preferredApplication()
+        guard !query.isEmpty else {
+            return AgentLauncherResult(
+                outcome: .emptyQuery, application: application, query: "", project: nil,
+                message: L("没有听到应用或项目名", "No app or project name was heard")
+            )
         }
-        if let cacheURL {
-            self.cacheURL = cacheURL
-        } else {
-            self.cacheURL = AppIdentity.appSupportDirectory().appendingPathComponent("agent-projects.json")
+        guard installationChecker(application) else {
+            return unavailableResult(application: application, query: query)
+        }
+        if namedApplication != nil {
+            return await openRequest(application: application, query: query, launch: launch)
+        }
+        guard let project = bestMatch(for: query) else {
+            return AgentLauncherResult(
+                outcome: .noProjectMatch, application: application, query: query, project: nil,
+                message: L("未找到匹配项目：\(query)", "No matching project: \(query)")
+            )
+        }
+        return await openRequest(
+            application: application, query: query, project: project, launch: launch
+        )
+    }
+
+    /// Opens an indexed Codex chat without converting it into a new terminal session.
+    ///
+    /// Args:
+    ///   session: Indexed Codex chat with its original technical thread ID.
+    ///   launch: Whether to send the desktop open request.
+    ///
+    /// Returns:
+    ///   Open-request outcome and localized feedback; this is not a GUI receipt.
+    func resumeSession(_ session: CodexSessionIndexEntry, launch: Bool = true) async -> AgentLauncherResult {
+        guard installationChecker(.codex) else {
+            return unavailableResult(application: .codex, query: session.workspaceName)
+        }
+        return await openRequest(
+            application: .codex, query: session.workspaceName, sessionID: session.id, launch: launch
+        )
+    }
+
+    /// Resolves the explicit preference, or chooses an installed app on first use.
+    ///
+    /// Returns:
+    ///   Stored desktop agent, or the first installed app with Codex preferred.
+    func preferredApplication() -> AgentDesktopApplication {
+        if let preferredApplicationProvider { return preferredApplicationProvider() }
+        if let stored = UserDefaults.standard.string(forKey: AgentDesktopApplication.storageKey),
+           let application = AgentDesktopApplication(rawValue: stored) {
+            return application
+        }
+        return AgentDesktopApplication.allCases.first(where: installationChecker)
+            ?? AgentDesktopApplication.defaultValue
+    }
+
+    /// Recognizes app-only requests independently of project folder matching.
+    ///
+    /// Args:
+    ///   query: Cleaned spoken name.
+    ///   originalText: Original utterance, used to preserve explicit project requests.
+    ///
+    /// Returns:
+    ///   Recognized desktop agent, or nil when the query names a project.
+    private func applicationNamed(by query: String, originalText: String) -> AgentDesktopApplication? {
+        let trimmedText = originalText.trimmingCharacters(
+            in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "，。！？,.!?；;：: "))
+        ).lowercased()
+        guard !Self.projectQuerySuffixes.contains(where: trimmedText.hasSuffix) else { return nil }
+        switch normalize(query) {
+        case "codex", "code x", "chatgpt", "chat gpt": return .codex
+        case "claude code", "claudecode", "cloud code", "claude": return .claudeCode
+        default: return nil
         }
     }
 
-    /// Handles a final ASR transcript as an agent-launch command.
+    /// Produces feedback for an explicitly chosen app that is no longer installed.
     ///
-    /// - Parameters:
-    ///   - text: Final transcript from ASR.
-    ///   - launch: Whether to actually launch a terminal process. Tests pass `false`.
-    /// - Returns: Routing result with the matched project and user-facing status.
-    func handle(_ text: String, launch: Bool = true) -> AgentLauncherResult {
-        let query = parseQuery(from: text)
-        guard !query.isEmpty else {
-            return AgentLauncherResult(
-                launched: false,
-                query: "",
-                project: nil,
-                message: "没有听到可启动的项目名"
+    /// Args:
+    ///   application: Desktop agent requested by this invocation.
+    ///   query: Original project or application query.
+    ///
+    /// Returns:
+    ///   An unavailable outcome that must not fall through to session matching.
+    private func unavailableResult(application: AgentDesktopApplication, query: String) -> AgentLauncherResult {
+        AgentLauncherResult(
+            outcome: .applicationUnavailable, application: application, query: query, project: nil,
+            message: L(
+                "未检测到 \(application.displayName)，请安装后重试或在设置中选择其他 Agent",
+                "\(application.displayName) was not found. Install it or choose another agent in Settings."
             )
-        }
+        )
+    }
 
-        guard let project = bestMatch(for: query) else {
-            return AgentLauncherResult(
-                launched: false,
-                query: query,
-                project: nil,
-                message: "未找到匹配项目：\(query)"
-            )
-        }
-
+    /// Sends one desktop request and preserves failures without trying another app.
+    ///
+    /// Args:
+    ///   application: Desktop agent fixed for this request.
+    ///   query: Cleaned spoken target.
+    ///   project: Optional matched project.
+    ///   sessionID: Optional existing Codex chat ID.
+    ///   launch: Whether to execute the request.
+    ///
+    /// Returns:
+    ///   Desktop dispatch result, including the original error on failure.
+    private func openRequest(
+        application: AgentDesktopApplication,
+        query: String,
+        project: AgentLauncherProject? = nil,
+        sessionID: String? = nil,
+        launch: Bool
+    ) async -> AgentLauncherResult {
         do {
             if launch {
-                try launchTerminal(for: project)
+                try await desktopOpener(application, project.map { URL(fileURLWithPath: $0.path) }, sessionID)
+            }
+            let message: String
+            if sessionID != nil {
+                message = L("已请求打开 Codex 会话：\(query)", "Requested Codex chat: \(query)")
+            } else if let project {
+                message = L(
+                    "已请求用 \(application.displayName) 打开项目：\(project.name)",
+                    "Requested \(application.displayName) project: \(project.name)"
+                )
+            } else {
+                message = L("已打开 \(application.displayName)", "Opened \(application.displayName)")
             }
             return AgentLauncherResult(
-                launched: true,
-                query: query,
-                project: project,
-                message: "已启动 Agent：\(project.name)"
+                outcome: .opened, application: application, query: query, project: project, message: message
             )
         } catch {
-            DebugFileLogger.log("AgentLauncherService launch failed: \(error.localizedDescription)")
+            DebugFileLogger.log("AgentLauncherService desktop open failed: \(error.localizedDescription)")
             return AgentLauncherResult(
-                launched: false,
-                query: query,
-                project: project,
-                message: "启动失败：\(project.name)"
+                outcome: .openFailed, application: application, query: query, project: project,
+                message: L(
+                    "打开 \(application.displayName) 失败：\(error.localizedDescription)",
+                    "Could not open \(application.displayName): \(error.localizedDescription)"
+                )
             )
         }
     }
 
     /// Extracts a project query from spoken launcher text.
     ///
-    /// - Parameter text: Final ASR transcript.
-    /// - Returns: Cleaned project query, or an empty string when the text is too vague.
+    /// Args:
+    ///   text: Final ASR transcript.
+    ///
+    /// Returns:
+    ///   Cleaned project query, or an empty string when the text is too vague.
     func parseQuery(from text: String) -> String {
         var query = text.trimmingCharacters(in: .whitespacesAndNewlines)
         query = query.trimmingCharacters(in: CharacterSet(charactersIn: "，。！？,.!?；;：: "))
@@ -228,7 +267,7 @@ final class AgentLauncherService: @unchecked Sendable {
         }
 
         query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let suffixes = ["项目", "工程", "目录", "folder", "project", "directory"]
+        let suffixes = Self.projectQuerySuffixes
         let loweredQuery = query.lowercased()
         for suffix in suffixes where loweredQuery.hasSuffix(suffix) {
             query = String(query.dropLast(suffix.count))
@@ -241,40 +280,6 @@ final class AgentLauncherService: @unchecked Sendable {
             return ""
         }
         return query
-    }
-
-    /// Builds the shell command used to enter a project and start Codex.
-    ///
-    /// Args:
-    ///   project: Matched project descriptor.
-    ///
-    /// Returns:
-    ///   Shell-safe command string for the target terminal.
-    func shellCommand(for project: AgentLauncherProject) -> String {
-        "cd \(shellQuote(project.path)) && \(Self.codexResumeCommand)"
-    }
-
-    /// Builds the command passed to cmux when `--cwd` already sets the directory.
-    ///
-    /// Args:
-    ///   project: Matched project descriptor. The value is accepted to keep the
-    ///     call site aligned with terminal-specific command builders.
-    ///
-    /// Returns:
-    ///   Command string for cmux `workspace create --command`.
-    func cmuxCommand(for _: AgentLauncherProject) -> String {
-        Self.codexResumeCommand
-    }
-
-    /// Builds the command passed to cmux for resuming a specific Codex session.
-    ///
-    /// Args:
-    ///   sessionID: Codex session identifier accepted by `codex resume`.
-    ///
-    /// Returns:
-    ///   Shell-safe command string for cmux `workspace create --command`.
-    func cmuxSessionCommand(for sessionID: String) -> String {
-        "\(Self.codexResumeCommand) \(shellQuote(sessionID))"
     }
 
     /// Returns the best project match for a spoken query.
@@ -570,86 +575,6 @@ final class AgentLauncherService: @unchecked Sendable {
         )
     }
 
-    private func launchTerminal(for project: AgentLauncherProject) throws {
-        let terminal = preferredTerminal()
-        switch terminal {
-        case .cmux:
-            let command = cmuxCommand(for: project)
-            guard cmuxWorkspaceCreator(project, command) else {
-                throw AgentLauncherError.launchFailed
-            }
-        case .ghostty:
-            let command = shellCommand(for: project)
-            try processRunner([
-                "/usr/bin/open", "-na", terminal.applicationPath(fileManager: fileManager),
-                "--args", "-e", "/bin/zsh", "-ilc", "\(command); exec $SHELL"
-            ])
-        case .iterm2:
-            let command = shellCommand(for: project)
-            try runAppleScript("""
-            tell application "iTerm"
-                create window with default profile command \(appleScriptString(command))
-                activate
-            end tell
-            """)
-        case .warp:
-            let command = shellCommand(for: project)
-            try runAppleScript("""
-            tell application "Warp"
-                activate
-            end tell
-            tell application "System Events"
-                keystroke \(appleScriptString(command))
-                key code 36
-            end tell
-            """)
-        case .kitty, .alacritty, .wezterm:
-            let command = shellCommand(for: project)
-            try processRunner([
-                "/usr/bin/open", "-na", terminal.applicationPath(fileManager: fileManager),
-                "--args", "-e", "/bin/zsh", "-ilc", "\(command); exec $SHELL"
-            ])
-        case .terminal:
-            let command = shellCommand(for: project)
-            try runAppleScript("""
-            tell application "Terminal"
-                do script \(appleScriptString(command))
-                activate
-            end tell
-            """)
-        }
-        DebugFileLogger.log("AgentLauncherService launched \(project.name) in \(terminal.rawValue)")
-    }
-
-    private func preferredTerminal() -> AgentLauncherTerminal {
-        if let preferredTerminalProvider {
-            return preferredTerminalProvider()
-        }
-        let stored = UserDefaults.standard.string(forKey: "tf_agentLauncherTerminal") ?? "auto"
-        if stored != "auto",
-           let terminal = AgentLauncherTerminal(rawValue: stored),
-           terminalExists(terminal) {
-            return terminal
-        }
-        return AgentLauncherTerminal.allCases.first(where: terminalExists) ?? .terminal
-    }
-
-    private func terminalExists(_ terminal: AgentLauncherTerminal) -> Bool {
-        terminal.isInstalled(fileManager: fileManager)
-    }
-
-    private func runAppleScript(_ source: String) throws {
-        try processRunner(["/usr/bin/osascript", "-e", source])
-    }
-
-    private func shellQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
-    }
-
-    private func appleScriptString(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
-    }
-
     private func directoryExists(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         return fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
@@ -660,14 +585,6 @@ final class AgentLauncherService: @unchecked Sendable {
             return false
         }
         return values.isDirectory == true
-    }
-
-    private static func runProcess(arguments: [String]) throws {
-        guard let executable = arguments.first else { return }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = Array(arguments.dropFirst())
-        try process.run()
     }
 
     /// Searches Spotlight for folders matching a spoken project query.
@@ -734,8 +651,4 @@ final class AgentLauncherService: @unchecked Sendable {
         var isDirectory: ObjCBool = false
         return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
-}
-
-private enum AgentLauncherError: Error {
-    case launchFailed
 }

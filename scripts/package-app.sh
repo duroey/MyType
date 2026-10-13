@@ -99,48 +99,43 @@ fi
 
 BINARY="${BINARY:-}"
 if [ -z "$BINARY" ]; then
+    BUILD_ARGS=(-c release --package-path "$PROJECT_DIR" --arch arm64)
+    if [ "$ARCH" != "arm64" ]; then
+        BUILD_ARGS+=(--arch x86_64)
+    fi
+
     if [ "${SKIP_BUILD:-0}" != "1" ]; then
         if [ "$ARCH" = "arm64" ]; then
             echo "Building arm64 release..."
-            swift build -c release --package-path "$PROJECT_DIR" --arch arm64
         else
             echo "Building universal release (arm64 + x86_64)..."
-            swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64
         fi
+        swift build "${BUILD_ARGS[@]}"
     fi
 
-    if [ "$ARCH" = "arm64" ]; then
-        candidates=(
-            "$PROJECT_DIR/.build/release/Type4Me"
-            "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me"
-            "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
-        )
-    else
-        candidates=(
-            "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
-            "$PROJECT_DIR/.build/release/Type4Me"
-        )
+    # Ask SwiftPM for the output of these exact build arguments to avoid stale binaries.
+    BINARY_DIR="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
+    if [ -z "$BINARY_DIR" ]; then
+        echo "Build failed: SwiftPM did not report a binary directory"
+        exit 1
     fi
-
-    for candidate in "${candidates[@]}"; do
-        if [ -f "$candidate" ]; then
-            archs="$(lipo -archs "$candidate" 2>/dev/null || true)"
-            if [ "$ARCH" = "universal" ]; then
-                if echo "$archs" | grep -q "arm64" && echo "$archs" | grep -q "x86_64"; then
-                    BINARY="$candidate"
-                    break
-                fi
-            else
-                if echo "$archs" | grep -q "$ARCH"; then
-                    BINARY="$candidate"
-                    break
-                fi
-            fi
+    BINARY="$BINARY_DIR/Type4Me"
+    if [ ! -f "$BINARY" ]; then
+        echo "Build failed: binary not found at $BINARY"
+        exit 1
+    fi
+    if ! archs="$(lipo -archs "$BINARY" 2>/dev/null)"; then
+        echo "Build failed: cannot inspect binary architectures at $BINARY"
+        exit 1
+    fi
+    if [ "$ARCH" = "universal" ]; then
+        if ! echo "$archs" | grep -q "arm64" || ! echo "$archs" | grep -q "x86_64"; then
+            echo "Build failed: expected arm64 and x86_64 at $BINARY, found $archs"
+            exit 1
         fi
-    done
-
-    if [ -z "$BINARY" ]; then
-        BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Type4Me' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    elif ! echo "$archs" | grep -q "$ARCH"; then
+        echo "Build failed: expected $ARCH at $BINARY, found $archs"
+        exit 1
     fi
 fi
 
@@ -155,6 +150,22 @@ cp "$BINARY" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
 cp "$PROJECT_DIR/Type4Me/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
 mkdir -p "$APP_PATH/Contents/Resources/Assets"
 cp "$PROJECT_DIR/Type4Me/Resources/Assets/"*.svg "$APP_PATH/Contents/Resources/Assets/"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentsViewSearchConfig.json" "$APP_PATH/Contents/Resources/AgentsViewSearchConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentHandoffConfig.json" "$APP_PATH/Contents/Resources/AgentHandoffConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentIntentConfig.json" "$APP_PATH/Contents/Resources/AgentIntentConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentIndexConfig.json" "$APP_PATH/Contents/Resources/AgentIndexConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentNotificationConfig.json" "$APP_PATH/Contents/Resources/AgentNotificationConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentEmbeddingConfig.json" "$APP_PATH/Contents/Resources/AgentEmbeddingConfig.json"
+# Embed the explicitly selected backend; never pick up an unrelated PATH binary.
+if [ -n "${AGENTSVIEW_BINARY:-}" ]; then
+    if [ ! -x "$AGENTSVIEW_BINARY" ] || [ ! -f "${AGENTSVIEW_LICENSE:-}" ]; then
+        echo "ERROR: AgentsView requires an executable and its license."
+        exit 1
+    fi
+    mkdir -p "$APP_PATH/Contents/Helpers"
+    cp "$AGENTSVIEW_BINARY" "$APP_PATH/Contents/Helpers/agentsview"
+    cp "$AGENTSVIEW_LICENSE" "$APP_PATH/Contents/Resources/AGENTSVIEW_LICENSE"
+fi
 BINARY_DIR="$(dirname "$BINARY")"
 find "$BINARY_DIR" -maxdepth 1 -name "*.bundle" -exec cp -R {} "$APP_PATH/Contents/Resources/" \; 2>/dev/null || true
 
@@ -416,6 +427,8 @@ if [ "$NEEDS_SIGN" = "1" ]; then
         -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) \
         -exec codesign --force --options runtime "${CODESIGN_TIMESTAMP_ARGS[@]}" --sign "$SIGNING_IDENTITY" {} \; 2>/dev/null || true
     codesign_macho_tree "$APP_PATH/Contents/Resources/qwen3-asr-server-dist"
+
+    codesign_macho_tree "$APP_PATH/Contents/Helpers"
 
     # Sign the wrapper script in Contents/MacOS
     Q3_WRAPPER="$APP_PATH/Contents/MacOS/qwen3-asr-server"

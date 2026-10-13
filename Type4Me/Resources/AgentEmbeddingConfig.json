@@ -1,0 +1,8 @@
+{
+  "endpoint": "http://127.0.0.1:18741",
+  "applicationBundleID": "com.electron.ollama",
+  "executableRelativePath": "Contents/Resources/ollama",
+  "manifestRelativePath": "manifests/registry.ollama.ai/library/qwen3-embedding/0.6b",
+  "requestTimeoutSeconds": 2,
+  "maximumLaunchAttempts": 3
+}
