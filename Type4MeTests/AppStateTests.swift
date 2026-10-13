@@ -863,3 +863,108 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(selection, LocalASREngineSelection(senseVoiceEnabled: true, qwen3Enabled: false))
     }
 }
+
+@MainActor
+final class RecordingDisplayMetadataTests: XCTestCase {
+    /// Verifies the floating bar reports the batch model actually selected by each client.
+    func testBatchModelNamesMatchNormalizedProviderConfiguration() throws {
+        let cases: [(ASRProvider, String)] = [
+            (.gemini, GeminiASRConfig.defaultBatchModel),
+            (.bailian, BailianASRConfig.defaultBatchModel),
+            (.elevenlabs, ElevenLabsASRConfig.defaultBatchModel),
+        ]
+        for (provider, expected) in cases {
+            let config = try makeConfig(provider, values: ["recognitionMode": "batch"])
+            XCTAssertEqual(RecordingDisplayMetadata.resolved(for: provider, config: config).modelName, expected)
+        }
+    }
+
+    /// Verifies custom batch model names take precedence over dormant streaming values.
+    func testCustomBatchModelTakesPrecedenceOverStreamingModel() throws {
+        for provider in [ASRProvider.gemini, .bailian] {
+            let config = try makeConfig(provider, values: [
+                "recognitionMode": "batch", "model": "streaming-model", "batchModel": "custom-batch-model",
+            ])
+            XCTAssertEqual(
+                RecordingDisplayMetadata.resolved(for: provider, config: config).modelName,
+                "custom-batch-model"
+            )
+        }
+    }
+
+    /// Verifies streaming and older settings continue to display the selected streaming model.
+    func testStreamingAndLegacySettingsIgnoreBatchModel() throws {
+        for provider in [ASRProvider.gemini, .bailian] {
+            for mode in [nil, "streaming"] as [String?] {
+                var values = ["model": "custom-streaming-model", "batchModel": "custom-batch-model"]
+                values["recognitionMode"] = mode
+                let config = try makeConfig(provider, values: values)
+                XCTAssertEqual(
+                    RecordingDisplayMetadata.resolved(for: provider, config: config).modelName,
+                    "custom-streaming-model"
+                )
+            }
+        }
+    }
+
+    /// Verifies rejected ElevenLabs model names show the same fallback as its client.
+    func testElevenLabsDisplaysNormalizedModelFallbacks() throws {
+        for mode in ASRRecognitionMode.allCases {
+            let config = try makeConfig(.elevenlabs, values: [
+                "recognitionMode": mode.rawValue, "model": "unsupported", "batchModel": "unsupported",
+            ])
+            let expected = mode == .batch ? ElevenLabsASRConfig.defaultBatchModel : ElevenLabsASRConfig.defaultModel
+            XCTAssertEqual(RecordingDisplayMetadata.resolved(for: .elevenlabs, config: config).modelName, expected)
+        }
+    }
+
+    /// Verifies StepFun's fixed model labels follow the selected transport mode.
+    func testStepFunUsesTheFixedModelForEachMode() throws {
+        for mode in ASRRecognitionMode.allCases {
+            let config = try makeConfig(.stepfun, values: ["recognitionMode": mode.rawValue])
+            let expected = mode == .batch ? StepFunASRConfig.batchModel : StepFunASRConfig.model
+            XCTAssertEqual(RecordingDisplayMetadata.resolved(for: .stepfun, config: config).modelName, expected)
+        }
+    }
+
+    /// Verifies Azure batch ignores the streaming deployment while streaming keeps its name.
+    func testAzureUsesBatchModelOrStreamingDeployment() throws {
+        for mode in ASRRecognitionMode.allCases {
+            let config = try makeConfig(.azure, values: [
+                "recognitionMode": mode.rawValue, "resource": "metadata-fixture", "deployment": "custom-deployment",
+            ])
+            let expected = mode == .batch ? AzureASRConfig.batchModel : "custom-deployment"
+            XCTAssertEqual(RecordingDisplayMetadata.resolved(for: .azure, config: config).modelName, expected)
+        }
+    }
+
+    /// Verifies providers with fixed models retain their labels without reading credentials.
+    func testFixedModelProvidersKeepTheirLabels() throws {
+        XCTAssertEqual(
+            RecordingDisplayMetadata.resolved(for: .cartesia, config: nil).modelName,
+            CartesiaASRConfig.model
+        )
+        for mode in ASRRecognitionMode.allCases {
+            let config = try makeConfig(.grok, values: ["recognitionMode": mode.rawValue])
+            XCTAssertEqual(RecordingDisplayMetadata.resolved(for: .grok, config: config).modelName, GrokASRConfig.model)
+        }
+        XCTAssertNil(RecordingDisplayMetadata.resolved(for: .gemini, config: nil).modelName)
+    }
+
+    /// Creates a provider configuration from synthetic values without accessing the keychain.
+    ///
+    /// Args:
+    ///   provider: Provider whose normalized model metadata is being verified.
+    ///   values: Test-specific recognition mode and model fields.
+    ///
+    /// Returns:
+    ///   The provider's normalized configuration.
+    ///
+    /// Throws:
+    ///   An XCTest failure when the fixture does not form a valid configuration.
+    private func makeConfig(_ provider: ASRProvider, values: [String: String]) throws -> any ASRProviderConfig {
+        let type = try XCTUnwrap(ASRProviderRegistry.configType(for: provider))
+        let credentials = ["apiKey": "metadata-test-key"].merging(values) { _, value in value }
+        return try XCTUnwrap(type.init(credentials: credentials))
+    }
+}

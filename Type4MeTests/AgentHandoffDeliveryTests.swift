@@ -186,7 +186,9 @@ final class AgentHandoffDeliveryTests: XCTestCase {
         """
         try Data(script.utf8).write(to: helper)
         var config = AgentHandoffConfiguration()
-        config.processTimeoutSeconds = 1
+        // macOS may delay the first execution of a fresh bundle fixture. The deadline
+        // still bounds both phases; the 512-byte cap, not launch latency, is under test.
+        config.processTimeoutSeconds = 3
         config.maximumProcessOutputBytes = 512
         let service = AgentHandoffDeliveryService(
             configuration: config,
@@ -198,7 +200,10 @@ final class AgentHandoffDeliveryTests: XCTestCase {
             _ = try await service.send(history: history, target: codexTarget(), instruction: "Fixture task")
             XCTFail("An overflowing inherited stream must not confirm queueing")
         } catch {
-            XCTAssertTrue([AgentHandoffDeliveryError.deliveryUncertain, .commandFailed].contains(error as? AgentHandoffDeliveryError ?? .invalidConfiguration))
+            XCTAssertTrue(
+                [AgentHandoffDeliveryError.deliveryUncertain, .commandFailed].contains(error as? AgentHandoffDeliveryError ?? .invalidConfiguration),
+                "Unexpected bounded-helper error: \(error)"
+            )
         }
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - began, config.processTimeoutSeconds + config.processTerminationGraceSeconds * 4)
     }

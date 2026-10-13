@@ -2020,27 +2020,58 @@ final class AppState {
 
 extension AppState: FloatingBarState {}
 
-private struct RecordingDisplayMetadata {
+struct RecordingDisplayMetadata {
     let modelName: String?
 
+    /// Captures the current provider's model label for the floating recording bar.
+    ///
+    /// Args:
+    ///   provider: The selected recognition provider.
+    ///
+    /// Returns:
+    ///   Model metadata from the current local selection or saved provider configuration.
     static func current(for provider: ASRProvider) -> Self {
         if provider == .sherpa {
             return Self(
                 modelName: ModelManager.selectedStreamingModel.displayName
             )
         }
+        if provider == .cartesia || provider == .grok {
+            return resolved(for: provider, config: nil)
+        }
+        return resolved(for: provider, config: KeychainService.loadASRConfig(for: provider))
+    }
+
+    /// Resolves display metadata from the same normalized configuration used by recognition.
+    ///
+    /// Args:
+    ///   provider: The provider associated with the configuration.
+    ///   config: A normalized configuration; no stored credentials are read by this method.
+    ///
+    /// Returns:
+    ///   The active mode's model or deployment name, without the provider prefix.
+    static func resolved(for provider: ASRProvider, config: (any ASRProviderConfig)?) -> Self {
+        let isBatch = config.map { ASRProviderRegistry.recognitionMode(of: $0) == .batch } ?? false
         if provider == .cartesia {
             return Self(
                 modelName: CartesiaASRConfig.model
             )
         }
+        if provider == .stepfun {
+            return Self(modelName: isBatch ? StepFunASRConfig.batchModel : StepFunASRConfig.model)
+        }
         if provider == .grok {
             return Self(modelName: GrokASRConfig.model)
         }
+        if provider == .azure {
+            let deployment = (config as? AzureASRConfig)?.deployment ?? AzureASRConfig.streamingModel
+            return Self(modelName: isBatch ? AzureASRConfig.batchModel : deployment)
+        }
 
         let model: String?
-        if let credentials = KeychainService.loadASRConfig(for: provider)?.toCredentials() {
-            model = ["model", "resourceId", "devPid", "lmId"]
+        if let credentials = config?.toCredentials() {
+            let modelKeys = (isBatch ? ["batchModel"] : []) + ["model", "resourceId", "devPid", "lmId"]
+            model = modelKeys
                 .compactMap { credentials[$0]?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty }
         } else {

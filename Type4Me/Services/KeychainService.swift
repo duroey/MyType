@@ -96,6 +96,12 @@ enum KeychainService {
         lock.lock()
         defer { lock.unlock() }
         cachedCredentials = nil
+        #if DEBUG
+        failNextCredentialsFileSaveForTesting = false
+        secureReadErrorsForTesting = [:]
+        failNextSecureSaveAccountForTesting = nil
+        failNextSecureDeleteAccountForTesting = nil
+        #endif
         testingStorageConfiguration = StorageConfiguration(
             scalarService: "\(namespace).scalar",
             groupedService: "\(namespace).grouped",
@@ -111,6 +117,12 @@ enum KeychainService {
         lock.lock()
         defer { lock.unlock() }
         cachedCredentials = nil
+        #if DEBUG
+        failNextCredentialsFileSaveForTesting = false
+        secureReadErrorsForTesting = [:]
+        failNextSecureSaveAccountForTesting = nil
+        failNextSecureDeleteAccountForTesting = nil
+        #endif
         testingStorageConfiguration = nil
     }
 
@@ -133,7 +145,22 @@ enum KeychainService {
         return _loadAllUnlocked()
     }
 
+    #if DEBUG
+    /// Test seam: makes the next credentials-file write fail.
+    nonisolated(unsafe) static var failNextCredentialsFileSaveForTesting = false
+    /// Isolated credential tests can model a locked or unavailable item without using Security.
+    nonisolated(unsafe) static var secureReadErrorsForTesting: [String: KeychainReadError] = [:]
+    nonisolated(unsafe) static var failNextSecureSaveAccountForTesting: String?
+    nonisolated(unsafe) static var failNextSecureDeleteAccountForTesting: String?
+    #endif
+
     private static func saveAll(_ dict: [String: Any]) throws {
+        #if DEBUG
+        if isUsingTestStorage && failNextCredentialsFileSaveForTesting {
+            failNextCredentialsFileSaveForTesting = false
+            throw CocoaError(.fileWriteUnknown)
+        }
+        #endif
         let data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         try data.write(to: credentialsFileURL, options: .atomic)
         try FileManager.default.setAttributes(
@@ -177,18 +204,35 @@ enum KeychainService {
 
     static var selectedASRProvider: ASRProvider {
         get {
-            guard let raw = UserDefaults.standard.string(forKey: selectedProviderKey),
-                  let provider = ASRProvider(rawValue: raw)
-            else { return .volcano }
+            let raw = UserDefaults.standard.string(forKey: selectedProviderKey)
+            // Retain provider identity for display. Starting recognition must validate migration
+            // separately so this compatibility alias can never imply a switch to streaming.
+            if raw == legacyStepFunBatchRawValue { return .stepfun }
+            guard let raw, let provider = ASRProvider(rawValue: raw) else { return .volcano }
             return provider
         }
         set {
             let previous = selectedASRProvider
+            let hadPendingMigration = UserDefaults.standard.string(forKey: selectedProviderKey) == legacyStepFunBatchRawValue
             UserDefaults.standard.set(newValue.rawValue, forKey: selectedProviderKey)
-            guard previous != newValue else { return }
+            guard previous != newValue || hadPendingMigration else { return }
             NotificationCenter.default.post(name: .asrProviderDidChange, object: newValue)
             NotificationCenter.default.post(name: .credentialsDidChange, object: nil)
         }
+    }
+
+    /// Resolves the user's provider selection without falling back after a failed migration.
+    ///
+    /// Returns:
+    ///   The provider whose configuration may be used to start recognition.
+    ///
+    /// Throws:
+    ///   ASRProviderSelectionError when the selected legacy batch setup is not yet committed.
+    static func validatedSelectedASRProvider() throws -> ASRProvider {
+        guard UserDefaults.standard.string(forKey: selectedProviderKey) != legacyStepFunBatchRawValue else {
+            throw ASRProviderSelectionError.pendingStepFunBatchMigration
+        }
+        return selectedASRProvider
     }
 
     #if HAS_CLOUD_SUBSCRIPTION
@@ -280,6 +324,14 @@ enum KeychainService {
         return compatible.isEmpty ? nil : compatible
     }
 
+    /// Reads one non-secure value from the cached credentials file without touching the Keychain.
+    /// Safe to call while rendering lists.
+    static func loadASRPlaintextValue(for provider: ASRProvider, key: String) -> String? {
+        let value = stringDictionary(loadAll()[asrStorageKey(for: provider)])[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
+    }
+
     static func loadASRConfig(for provider: ASRProvider) -> (any ASRProviderConfig)? {
         do {
             return try loadASRConfigCheckingKeychain(for: provider)
@@ -302,10 +354,15 @@ enum KeychainService {
     ///   A provider configuration, or `nil` when required credentials are genuinely absent.
     ///
     /// Throws:
-    ///   `KeychainReadError` when secure credentials exist but are not currently readable.
+    ///   `KeychainReadError` when secure credentials exist but are not currently readable,
+    ///   or `ASRProviderSelectionError` while the selected legacy provider is unresolved.
     static func loadASRConfigCheckingKeychain(
         for provider: ASRProvider
     ) throws -> (any ASRProviderConfig)? {
+        if provider == .stepfun {
+            // Covers callers that load the selected config through the non-throwing wrapper.
+            _ = try validatedSelectedASRProvider()
+        }
         guard let configType = ASRProviderRegistry.configType(for: provider) else {
             return nil
         }
@@ -532,6 +589,9 @@ enum KeychainService {
             NSLog("[KeychainService] Migrated Bailian ASR credentials from tf_asr_aliyun → tf_asr_bailian")
         }
 
+        let finishStepFunMigration = migrateStepFunBatchProvider(in: &mutableDict)
+        migrated = finishStepFunMigration != nil || migrated
+
         // Migrate LLM: tf_llmApiKey/tf_llmModel/tf_llmEndpointId/tf_llmBaseURL → tf_llm_doubao
         let legacyLLMKeys = ["tf_llmApiKey", "tf_llmModel", "tf_llmEndpointId", "tf_llmBaseURL"]
         let legacyLLM = legacyDoubaoLLMCredentials(in: dict)
@@ -569,6 +629,7 @@ enum KeychainService {
                 try saveAll(mutableDict)
                 cachedCredentials = mutableDict
                 cleanLegacyExternalCredentialSources(legacyExternalKeysToClean)
+                finishStepFunMigration?()
             } catch {
                 NSLog("[KeychainService] Failed to persist credential migration: %@", error.localizedDescription)
             }
@@ -576,6 +637,159 @@ enum KeychainService {
             cleanLegacyExternalCredentialSources(legacyExternalKeysToClean)
         }
     }
+
+    /// StepFun used to be two providers (`stepfun` realtime, `stepfunBatch` batch). Fold the batch
+    /// credentials into `stepfun` as its batch recognition mode. A Step Plan key moves to
+    /// `stepPlanApiKey` so it never overwrites the standard realtime key.
+    static let legacyStepFunBatchRawValue = "stepfunBatch"
+    /// Backup for the standard key not chosen when realtime and batch used different keys.
+    /// Nothing reads it automatically; it only prevents silently deleting a credential.
+    static let stepFunUnusedStandardKeyAccount = "tf_asr_stepfun_unusedStandardKey"
+
+    private static let stepFunBatchMigrationCompletedKey = "tf_stepFunBatchMigrationCompleted"
+
+    /// Prepares a retryable migration while preserving the active recognition mode and keys.
+    ///
+    /// Args:
+    ///   dict: Working copy of plaintext credentials, saved by the caller after secure writes.
+    ///
+    /// Returns:
+    ///   A cleanup action to run after the file commit, or nil if no work can be committed.
+    private static func migrateStepFunBatchProvider(in dict: inout [String: Any]) -> (() -> Void)? {
+        let legacyStorageKey = "tf_asr_\(legacyStepFunBatchRawValue)"
+        let defaults = UserDefaults.standard
+        let selectedRawValue = defaults.string(forKey: selectedProviderKey)
+        let wasSelected = selectedRawValue == legacyStepFunBatchRawValue
+        let wasLastBYOK = defaults.string(forKey: "tf_lastBYOKProvider") == legacyStepFunBatchRawValue
+        let legacyPlaintext = stringDictionary(dict[legacyStorageKey])
+        let legacySecure: [String: String]
+        do {
+            legacySecure = try loadSecureValuesCheckingKeychain(account: legacyStorageKey)
+        } catch {
+            NSLog("[KeychainService] StepFun batch migration deferred; source credential read failed: %@", error.localizedDescription)
+            return nil
+        }
+
+        // Notifications while the migration lock is held could re-enter KeychainService.
+        let finishMigration = {
+            if wasSelected { defaults.set(ASRProvider.stepfun.rawValue, forKey: selectedProviderKey) }
+            if wasLastBYOK { defaults.set(ASRProvider.stepfun.rawValue, forKey: "tf_lastBYOKProvider") }
+            _ = deleteSecureValue(service: keychainGroupedService, account: legacyStorageKey)
+        }
+        // A committed migration can still have a legacy item if deletion was denied. Retry only
+        // cleanup: re-merging could overwrite a recognition-mode choice made since the commit.
+        if dict[stepFunBatchMigrationCompletedKey] as? Bool == true {
+            guard !legacyPlaintext.isEmpty || !legacySecure.isEmpty || wasSelected || wasLastBYOK else { return nil }
+            dict.removeValue(forKey: legacyStorageKey)
+            return finishMigration
+        }
+        guard !legacyPlaintext.isEmpty || !legacySecure.isEmpty || wasSelected || wasLastBYOK else { return nil }
+
+        let storageKey = asrStorageKey(for: .stepfun)
+        var plaintext = stringDictionary(dict[storageKey])
+        var secure: [String: String]
+        do {
+            secure = try loadSecureValuesCheckingKeychain(account: storageKey)
+        } catch {
+            NSLog("[KeychainService] StepFun batch migration deferred; destination credential read failed: %@", error.localizedDescription)
+            return nil
+        }
+        let existingAPIKey = secure["apiKey"] ?? plaintext["apiKey"] ?? ""
+        let legacyAPIKey = (legacySecure["apiKey"] ?? legacyPlaintext["apiKey"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let accessMode = legacyPlaintext["accessMode"].flatMap(StepFunBatchAccessMode.init(rawValue:)) ?? .stepPlan
+        for key in ["apiKey", "stepPlanApiKey"] {
+            if (secure[key] ?? "").isEmpty, let plainKey = plaintext[key], !plainKey.isEmpty {
+                secure[key] = plainKey
+            }
+            plaintext.removeValue(forKey: key)
+        }
+        var unusedStandardKey: String?
+        if !legacyAPIKey.isEmpty {
+            switch accessMode {
+            case .stepPlan:
+                if (secure["stepPlanApiKey"] ?? "").isEmpty { secure["stepPlanApiKey"] = legacyAPIKey }
+            case .standard:
+                if existingAPIKey.isEmpty {
+                    secure["apiKey"] = legacyAPIKey
+                } else if existingAPIKey != legacyAPIKey {
+                    unusedStandardKey = wasSelected ? existingAPIKey : legacyAPIKey
+                    if wasSelected { secure["apiKey"] = legacyAPIKey }
+                }
+            }
+        }
+        plaintext["accessMode"] = accessMode.rawValue
+        let hasRealtimeSelection = selectedRawValue == ASRProvider.stepfun.rawValue
+        let hasModePreference = plaintext[ASRRecognitionMode.credentialKey] != nil
+        if wasSelected || (!hasRealtimeSelection && !hasModePreference && existingAPIKey.isEmpty) {
+            plaintext[ASRRecognitionMode.credentialKey] = ASRRecognitionMode.batch.rawValue
+        }
+
+        do {
+            if let unusedStandardKey {
+                try saveSecureValues(["apiKey": unusedStandardKey], account: stepFunUnusedStandardKeyAccount)
+            }
+            if !secure.isEmpty { try saveSecureValues(secure, account: storageKey) }
+        } catch {
+            NSLog("[KeychainService] StepFun batch migration deferred; Keychain write failed: %@", error.localizedDescription)
+            return nil
+        }
+        dict[storageKey] = plaintext
+        dict.removeValue(forKey: legacyStorageKey)
+        dict[stepFunBatchMigrationCompletedKey] = true
+        return finishMigration
+    }
+
+    #if DEBUG
+    /// Test seam: stores credentials under a storage key that no longer maps to an `ASRProvider`.
+    static func seedLegacyASRCredentialsForTesting(
+        storageKey: String,
+        plaintext: [String: String],
+        secure: [String: String]
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var dict = _loadAllUnlocked()
+        if plaintext.isEmpty {
+            dict.removeValue(forKey: storageKey)
+        } else {
+            dict[storageKey] = plaintext
+        }
+        if secure.isEmpty {
+            _ = deleteSecureValue(service: keychainGroupedService, account: storageKey)
+        } else {
+            try saveSecureValues(secure, account: storageKey)
+        }
+        try saveAll(dict)
+        cachedCredentials = dict
+    }
+
+    /// Seeds only the isolated legacy namespace to verify MyType's Type4Me fallback.
+    ///
+    /// Args:
+    ///   account: Credential group name.
+    ///   values: Synthetic secure values for the test.
+    ///
+    /// Throws:
+    ///   A storage error if isolated storage is not active or the fixture cannot be saved.
+    static func seedLegacyGroupedValuesForTesting(account: String, values: [String: String]) throws {
+        guard isUsingTestStorage else { throw KeychainError.saveFailed(errSecNotAvailable) }
+        let data = try JSONSerialization.data(withJSONObject: values)
+        try saveSecureData(data, service: legacyKeychainGroupedService, account: account)
+    }
+
+    static func loadSecureValuesForTesting(account: String) -> [String: String] {
+        loadSecureValues(account: account)
+    }
+
+    static func deleteSecureValuesForTesting(account: String) {
+        _ = deleteSecureValue(service: keychainGroupedService, account: account)
+    }
+
+    static func hasStoredCredentialsForTesting(storageKey: String) -> Bool {
+        loadAll()[storageKey] != nil || !loadSecureValues(account: storageKey).isEmpty
+    }
+    #endif
 
     private static func removeLegacyFileKeys(_ keys: [String], from dict: inout [String: Any]) -> Bool {
         var changed = false
@@ -678,6 +892,12 @@ enum KeychainService {
     }
 
     private static func saveSecureData(_ data: Data, service: String, account: String) throws {
+        #if DEBUG
+        if isUsingTestStorage && failNextSecureSaveAccountForTesting == account {
+            failNextSecureSaveAccountForTesting = nil
+            throw KeychainError.saveFailed(errSecNotAvailable)
+        }
+        #endif
         guard activeStorageConfiguration.usesKeychain else {
             try saveTestingSecureData(data, service: service, account: account)
             return
@@ -736,6 +956,9 @@ enum KeychainService {
         service: String,
         account: String
     ) throws -> Data? {
+        #if DEBUG
+        if isUsingTestStorage, let error = secureReadErrorsForTesting[account] { throw error }
+        #endif
         guard activeStorageConfiguration.usesKeychain else {
             return loadTestingSecureData(service: service, account: account)
         }
@@ -800,14 +1023,13 @@ enum KeychainService {
         service: String,
         account: String
     ) throws {
-        guard activeStorageConfiguration.usesKeychain else {
-            deleteTestingSecureData(service: service, account: account)
-            return
+        #if DEBUG
+        if isUsingTestStorage && failNextSecureDeleteAccountForTesting == account {
+            failNextSecureDeleteAccountForTesting = nil
+            throw KeychainError.deleteFailed(errSecNotAvailable)
         }
-        let status = SecItemDelete(keychainQuery(service: service, account: account) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainError.deleteFailed(status)
-        }
+        #endif
+        try deleteSecureItem(service: service, account: account)
 
         let legacyService: String?
         if service == keychainScalarService {
@@ -818,12 +1040,27 @@ enum KeychainService {
             legacyService = nil
         }
         if let legacyService {
-            let legacyStatus = SecItemDelete(
-                keychainQuery(service: legacyService, account: account) as CFDictionary
-            )
-            guard legacyStatus == errSecSuccess || legacyStatus == errSecItemNotFound else {
-                throw KeychainError.deleteFailed(legacyStatus)
-            }
+            try deleteSecureItem(service: legacyService, account: account)
+        }
+    }
+
+    /// Deletes one storage item using the same fallback sequence in production and tests.
+    ///
+    /// Args:
+    ///   service: Current or legacy service name.
+    ///   account: Credential item name.
+    ///
+    /// Throws:
+    ///   A deletion error when the backing store rejects the operation.
+    private static func deleteSecureItem(service: String, account: String) throws {
+        guard activeStorageConfiguration.usesKeychain else {
+            let url = testingSecureDataURL(service: service, account: account)
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            return
+        }
+        let status = SecItemDelete(keychainQuery(service: service, account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.deleteFailed(status)
         }
     }
 
@@ -853,15 +1090,6 @@ enum KeychainService {
     ///   Stored secret bytes, or `nil` when no test item exists.
     private static func loadTestingSecureData(service: String, account: String) -> Data? {
         try? Data(contentsOf: testingSecureDataURL(service: service, account: account))
-    }
-
-    /// Deletes one test-only secret file.
-    ///
-    /// Args:
-    ///   service: Test service name.
-    ///   account: Test account name.
-    private static func deleteTestingSecureData(service: String, account: String) {
-        try? FileManager.default.removeItem(at: testingSecureDataURL(service: service, account: account))
     }
 
     /// Resolves the file URL for a test-only secret item.
@@ -1065,6 +1293,15 @@ enum KeychainService {
         return changed
     }
 
+    /// Moves plaintext secrets only after the merged secure group has been persisted.
+    ///
+    /// Args:
+    ///   dict: Pending credentials-file contents.
+    ///   storageKey: Group whose secure fields should move to Keychain.
+    ///   fields: Provider schema identifying secrets.
+    ///
+    /// Returns:
+    ///   True when the plaintext group changed; false on no work or a retryable storage failure.
     @discardableResult
     private static func migrateSecureFields(
         in dict: inout [String: Any],
@@ -1075,7 +1312,14 @@ enum KeychainService {
         let split = splitCredentials(values, using: fields)
         guard split.plaintext.count != values.count || !split.secure.isEmpty else { return false }
         if !split.secure.isEmpty {
-            try? saveSecureValues(split.secure, account: storageKey)
+            do {
+                let existing = try loadSecureValuesCheckingKeychain(account: storageKey)
+                let merged = split.secure.merging(existing) { _, current in current }
+                try saveSecureValues(merged, account: storageKey)
+            } catch {
+                NSLog("[KeychainService] Secure field migration deferred account=%@: %@", storageKey, error.localizedDescription)
+                return false
+            }
         }
         if split.plaintext.isEmpty {
             dict.removeValue(forKey: storageKey)
@@ -1172,6 +1416,20 @@ enum KeychainService {
         UserDefaults.standard.set(true, forKey: marker)
         if count > 0 {
             NSLog("[KeychainService] Migrated %d UserDefaults keys from %@", count, suiteName)
+        }
+    }
+}
+
+enum ASRProviderSelectionError: Error, Equatable, LocalizedError {
+    case pendingStepFunBatchMigration
+
+    var errorDescription: String? {
+        switch self {
+        case .pendingStepFunBatchMigration:
+            return L(
+                "阶跃星辰旧版非实时配置尚未完成迁移，已暂停识别。请重新打开 MyType 重试，或在设置中重新选择识别服务。",
+                "The legacy StepFun batch configuration has not finished migrating, so recognition is paused. Restart MyType to retry, or explicitly select a recognition provider in Settings."
+            )
         }
     }
 }

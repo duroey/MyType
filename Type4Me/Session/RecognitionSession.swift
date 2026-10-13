@@ -271,8 +271,20 @@ actor RecognitionSession {
         #endif
     }
 
+    /// Model label computed when the recording started. `currentConfig` is cleared before
+    /// history is written, so the label is captured up front.
+    private var sessionASRModelLabel: String?
+
     private func currentASRModelLabel(for provider: ASRProvider) -> String? {
+        if let sessionASRModelLabel { return sessionASRModelLabel }
+        let config = currentConfig.flatMap { type(of: $0).provider == provider ? $0 : nil }
+            ?? KeychainService.loadASRConfig(for: provider)
+        return Self.asrModelLabel(for: provider, config: config)
+    }
+
+    static func asrModelLabel(for provider: ASRProvider, config: (any ASRProviderConfig)?) -> String? {
         let providerName = provider.displayName
+        let isBatch = config.map { ASRProviderRegistry.recognitionMode(of: $0) == .batch } ?? false
 
         if provider == .sherpa {
             return "\(providerName) · \(ModelManager.selectedStreamingModel.displayName)"
@@ -281,17 +293,21 @@ actor RecognitionSession {
             return "\(providerName) · \(CartesiaASRConfig.model)"
         }
         if provider == .stepfun {
-            return "\(providerName) · \(StepFunASRConfig.model)"
+            return "\(providerName) · \(isBatch ? StepFunASRConfig.batchModel : StepFunASRConfig.model)"
         }
         if provider == .grok {
             return "\(providerName) · \(GrokASRConfig.model)"
         }
+        if provider == .azure {
+            let deployment = (config as? AzureASRConfig)?.deployment ?? AzureASRConfig.streamingModel
+            return "\(providerName) · \(isBatch ? AzureASRConfig.batchModel : deployment)"
+        }
 
-        guard let credentials = KeychainService.loadASRConfig(for: provider)?.toCredentials() else {
+        guard let credentials = config?.toCredentials() else {
             return providerName
         }
 
-        let modelKeys = ["model", "resourceId", "devPid", "lmId"]
+        let modelKeys = (isBatch ? ["batchModel"] : []) + ["model", "resourceId", "devPid", "lmId"]
         let model = modelKeys
             .compactMap { credentials[$0]?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
@@ -371,10 +387,13 @@ actor RecognitionSession {
         case .volcano:
             return "https://openspeech.bytedance.com"
         case .stepfun:
-            return (KeychainService.loadASRConfig(for: .stepfun) as? StepFunASRConfig)?.region.healthEndpoint
-                ?? StepFunASRConfig.defaultRegion.healthEndpoint
-        case .stepfunBatch:
-            return "https://api.stepfun.com"
+            guard let config = KeychainService.loadASRConfig(for: .stepfun) as? StepFunASRConfig else {
+                return StepFunASRConfig.defaultRegion.healthEndpoint
+            }
+            // Batch endpoints are only served from the China site.
+            return config.recognitionMode == .batch
+                ? StepFunASRRegion.china.healthEndpoint
+                : config.region.healthEndpoint
         case .soniox:
             return "https://stt-rt.soniox.com"
         case .deepgram:
@@ -383,6 +402,10 @@ actor RecognitionSession {
             return "https://generativelanguage.googleapis.com"
         case .metaMuse:
             return "https://api.meta.ai"
+        case .azure:
+            guard let config = KeychainService.loadASRConfig(for: .azure) as? AzureASRConfig else { return "" }
+            let host = config.recognitionMode == .batch ? config.speechHost : config.foundryHost
+            return host.map { "https://\($0)" } ?? ""
         default:
             return ""
         }
@@ -609,18 +632,6 @@ actor RecognitionSession {
     private var sessionGeneration: Int = 0
 
     // MARK: - Accumulated text
-
-    private let maxRecordingDuration: TimeInterval = 600  // 10 minutes
-
-    /// Gemini Live sessions are terminated by the server at roughly 10 minutes,
-    /// measured from `connect()`. Stopping slightly earlier lets Type4Me finish
-    /// the recording through the normal path (and surface the existing
-    /// "已达最大时长" hint) instead of losing the tail to a server-side close.
-    private let geminiMaxRecordingDuration: TimeInterval = 570  // 9m30s
-
-    private func maxRecordingDuration(for provider: ASRProvider) -> TimeInterval {
-        provider == .gemini ? geminiMaxRecordingDuration : maxRecordingDuration
-    }
 
     private var currentTranscript: RecognitionTranscript = .empty
     /// Keep evidence of speech even if a provider later clears its partial text.
@@ -1338,8 +1349,19 @@ actor RecognitionSession {
             targetApplication = frontmostApplication
             targetBundleId = frontmostApplication?.bundleIdentifier
         }
-        let provider = KeychainService.selectedASRProvider
+        let provider: ASRProvider
+        do {
+            provider = manualInput
+                ? KeychainService.selectedASRProvider
+                : try KeychainService.validatedSelectedASRProvider()
+        } catch {
+            emitRecognitionEvent(.error(error), ownerGeneration: myGeneration)
+            emitRecognitionEvent(.completed, ownerGeneration: myGeneration)
+            await failClaimedRecordingStart(purpose: purpose, ownerGeneration: myGeneration)
+            return
+        }
         activeProvider = provider
+        sessionASRModelLabel = nil
 
         #if HAS_CLOUD_SUBSCRIPTION
         if provider == .cloud && !manualInput {
@@ -1616,8 +1638,9 @@ actor RecognitionSession {
         }
 
         self.currentConfig = config
+        sessionASRModelLabel = Self.asrModelLabel(for: provider, config: config)
 
-        guard let client = ASRProviderRegistry.createClient(for: provider) else {
+        guard let client = ASRProviderRegistry.createClient(for: provider, config: config) else {
             NSLog("[Session] No client implementation for provider=%@", provider.rawValue)
             SoundFeedback.playError()
             emitRecognitionEvent(
@@ -1877,9 +1900,13 @@ actor RecognitionSession {
         asrCleanupTask?.cancel()
         asrCleanupTask = nil
         asrCleanupGeneration = nil
-        let recordingLimit = maxRecordingDuration(for: activeProvider)
-        maxDurationTask = Task { [weak self, recordingLimit, expectedGeneration] in
-            try? await Task.sleep(for: .seconds(recordingLimit))
+        let recordingLimit = ASRProviderRegistry.recordingDurationLimit(for: activeProvider, config: currentConfig)
+        let stopDelay = ASRProviderRegistry.recordingStopDelay(
+            for: activeProvider, config: currentConfig,
+            elapsed: recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        )
+        maxDurationTask = Task { [weak self, recordingLimit, stopDelay, expectedGeneration] in
+            try? await Task.sleep(for: .seconds(stopDelay))
             guard let self, !Task.isCancelled else { return }
             await self.autoStopIfRecording(
                 limit: recordingLimit,
@@ -2457,7 +2484,7 @@ actor RecognitionSession {
         // Phase 1: wait up to 1s for any streaming partial text.
         // Phase 2: if text arrives, endAudio + wait up to 1s for final result.
         let provider = activeProvider
-        let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider).isStreaming
+        let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider, config: currentConfig).isStreaming
         if providerIsStreaming && !shouldUseStartupAudioFallback {
             let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
             let hasStreamingText = !currentTranscript.composedText
@@ -2571,7 +2598,10 @@ actor RecognitionSession {
         var asrTeardownClean = !shouldUseStartupAudioFallback
         var endAudioSucceeded = false
         if let client = asrClient {
-            let endAudioTimeout: Duration = providerIsStreaming ? .seconds(3) : .seconds(60)
+            // Batch clients upload the whole recording here; their HTTP timeout is 120s.
+            let endAudioTimeout: Duration = providerIsStreaming
+                ? .seconds(3)
+                : .seconds(BatchASRHTTP.requestTimeout + 5)
             let endAudioOK = await withTimeout(endAudioTimeout) {
                 try await client.endAudio()
             }
@@ -3970,7 +4000,7 @@ actor RecognitionSession {
         // does NOT hop back to the actor.  This prevents a blocking
         // WebSocket send from starving stopRecording().
         let client = asrClient
-        let audioInput = ASRProviderRegistry.capabilities(for: activeProvider).audioInput
+        let audioInput = ASRProviderRegistry.capabilities(for: activeProvider, config: currentConfig).audioInput
         let expectedGeneration = sessionGeneration
 
         let failureFlag = UploadFailureFlag()
@@ -5056,7 +5086,7 @@ actor RecognitionSession {
 
         // Other providers: fresh streaming connection with all audio at once
         let resultTask = Task.detached { () -> String? in
-            guard let client = ASRProviderRegistry.createClient(for: provider) else { return nil }
+            guard let client = ASRProviderRegistry.createClient(for: provider, config: config) else { return nil }
             do {
                 let options = ASRRequestOptions(enablePunc: true)
                 try await client.connect(config: config, options: options)

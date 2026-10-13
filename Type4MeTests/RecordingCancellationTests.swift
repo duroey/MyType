@@ -32,6 +32,10 @@ final class RecordingCancellationTests: XCTestCase {
         XCTAssertEqual(disconnects, 1)
     }
 
+}
+
+/// Isolates transcript-retention grace periods from the multi-policy cancellation test.
+final class RecordingTranscriptRecoveryTests: XCTestCase {
     func testNormalStopOfEmptyStreamStillRetriesAndRetainsRecoveredText() async throws {
         let retryCount = OSAllocatedUnfairLock(initialState: 0)
         let session = try await makeSession(
@@ -99,6 +103,11 @@ final class RecordingCancellationTests: XCTestCase {
         }
     }
 
+}
+
+/// Keeps transport-recovery cases in a separate process from cancellation-policy cases.
+/// Each group stays within the test runner's per-process deadline without shortening real grace periods.
+final class RecordingTeardownRecoveryTests: XCTestCase {
     func testWhitespaceOnlyUpdatesDoNotTriggerCancelledRetry() async throws {
         let retryCount = OSAllocatedUnfairLock(initialState: 0)
         let session = try await makeSession(client: FinishingASRStub(), retryCount: retryCount)
@@ -168,7 +177,7 @@ final class RecordingCancellationTests: XCTestCase {
         // Batch providers are not expected to return text during recording.
         let retryCount = OSAllocatedUnfairLock(initialState: 0)
         let session = try await makeSession(
-            client: FinishingASRStub(), retryCount: retryCount, provider: .stepfunBatch
+            client: FinishingASRStub(), retryCount: retryCount, recognitionMode: .batch
         )
 
         await session.abortInjection()
@@ -177,16 +186,23 @@ final class RecordingCancellationTests: XCTestCase {
         XCTAssertEqual(retryCount.withLock { $0 }, 1)
     }
 
-    private func makeSession(
+}
+
+/// Creates an isolated stop fixture without microphone, network, or text injection.
+private func makeSession(
         client: FinishingASRStub,
         retryCount: OSAllocatedUnfairLock<Int>,
         provider: ASRProvider = .stepfun,
+        recognitionMode: ASRRecognitionMode = .streaming,
         policy: ClipboardOutputPolicy = .cancelProcessed,
         uploadFailed: Bool = false,
         audioSender: Task<Void, Never>? = nil,
         retryResult: String? = nil
     ) async throws -> RecognitionSession {
-        let config = try XCTUnwrap(StepFunASRConfig(credentials: ["apiKey": "test-not-used"]))
+        let config = try XCTUnwrap(StepFunASRConfig(credentials: [
+            "apiKey": "test-not-used",
+            "recognitionMode": recognitionMode.rawValue,
+        ]))
         let session = RecognitionSession()
         await session.prepareRecordingStopForTesting(
             client: client, config: config, provider: provider, policy: policy,
@@ -197,8 +213,6 @@ final class RecordingCancellationTests: XCTestCase {
         }
         return session
     }
-}
-
 /// A provider that accepts endAudio but may omit its final event, matching the
 /// reported StepFun trace. No microphone, network, or credentials are used.
 private actor FinishingASRStub: SpeechRecognizer {

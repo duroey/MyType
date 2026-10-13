@@ -73,8 +73,8 @@ final class AgentLauncherSettingsTests: XCTestCase {
             "Open the selected desktop agent for a spoken project name",
         ] {
             mode.description = previous
-            XCTAssertEqual(mode.localizedDisplayDescription(for: .zh), "按事项名称查找并选择 Agent 会话")
-            XCTAssertEqual(mode.localizedDisplayDescription(for: .en), "Find and choose agent sessions by activity name")
+            XCTAssertEqual(mode.localizedDisplayDescription(for: .zh), "找回 Agent 会话或交接工作")
+            XCTAssertEqual(mode.localizedDisplayDescription(for: .en), "Find agent conversations or hand off work")
         }
         mode.description = "My own activity workflow"
         XCTAssertEqual(mode.localizedDisplayDescription(for: .zh), "My own activity workflow")

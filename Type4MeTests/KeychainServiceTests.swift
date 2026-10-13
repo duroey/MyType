@@ -325,6 +325,61 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(error, .unavailable(errSecNotAvailable))
     }
 
+    /// A failed secure read remains distinguishable from missing credentials.
+    func testCheckingLoadPreservesUnavailableKeychainError() throws {
+        try KeychainService.saveASRCredentials(for: .stepfun, values: ["apiKey": "test"])
+        KeychainService.secureReadErrorsForTesting["tf_asr_stepfun"] = .locked(errSecInteractionNotAllowed)
+        XCTAssertThrowsError(try KeychainService.loadASRConfigCheckingKeychain(for: .stepfun)) { error in
+            XCTAssertEqual(error as? KeychainReadError, .locked(errSecInteractionNotAllowed))
+        }
+    }
+
+    /// Old Type4Me credentials still load, and deletion cannot resurrect their fallback copy.
+    func testLegacyNamespaceFallbackAndDeletionStayIsolated() throws {
+        try KeychainService.seedLegacyGroupedValuesForTesting(
+            account: "tf_asr_stepfun", values: ["apiKey": "legacy-test"]
+        )
+        XCTAssertEqual(try KeychainService.loadASRCredentialsCheckingKeychain(for: .stepfun)?["apiKey"], "legacy-test")
+        try KeychainService.saveASRCredentials(for: .stepfun, values: [:])
+        XCTAssertNil(try KeychainService.loadASRCredentialsCheckingKeychain(for: .stepfun))
+    }
+
+    /// Moving plaintext secrets must preserve other secure fields already in the group.
+    func testSecureFieldMigrationMergesWithExistingKeys() throws {
+        try KeychainService.seedLegacyASRCredentialsForTesting(
+            storageKey: "tf_asr_stepfun",
+            plaintext: ["apiKey": "plaintext-standard", "recognitionMode": "streaming"],
+            secure: ["stepPlanApiKey": "existing-plan"]
+        )
+
+        KeychainService.migrateStoredCredentials()
+
+        let credentials = try XCTUnwrap(KeychainService.loadASRCredentialsCheckingKeychain(for: .stepfun))
+        XCTAssertEqual(credentials["apiKey"], "plaintext-standard")
+        XCTAssertEqual(credentials["stepPlanApiKey"], "existing-plan")
+        let stored = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: credentialsURL)) as? [String: Any]
+        )
+        XCTAssertNil((stored["tf_asr_stepfun"] as? [String: String])?["apiKey"])
+    }
+
+    /// A failed secure write must leave plaintext credentials available for the next migration.
+    func testSecureFieldMigrationDoesNotDropPlaintextWhenKeychainWriteFails() throws {
+        try KeychainService.seedLegacyASRCredentialsForTesting(
+            storageKey: "tf_asr_stepfun", plaintext: ["apiKey": "pending-standard"], secure: [:]
+        )
+        KeychainService.failNextSecureSaveAccountForTesting = "tf_asr_stepfun"
+
+        KeychainService.migrateStoredCredentials()
+
+        let stored = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: credentialsURL)) as? [String: Any]
+        )
+        XCTAssertEqual((stored["tf_asr_stepfun"] as? [String: String])?["apiKey"], "pending-standard")
+        KeychainService.migrateStoredCredentials()
+        XCTAssertEqual(KeychainService.loadSecureValuesForTesting(account: "tf_asr_stepfun")["apiKey"], "pending-standard")
+    }
+
     private func restoreUserDefault(key: String, value: Any?) {
         if let value {
             UserDefaults.standard.set(value, forKey: key)
