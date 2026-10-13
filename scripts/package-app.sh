@@ -401,8 +401,22 @@ else
     echo "Cloud variant: skipping model bundling."
 fi
 
-# Copy third-party licenses
-cp "$PROJECT_DIR/Type4Me/Resources/THIRD_PARTY_LICENSES.txt" "$APP_PATH/Contents/Resources/" 2>/dev/null || true
+# Include the product terms and preserved upstream notices in every distribution.
+# Missing notices are a packaging error, so these copies must not silently fail.
+for required_notice in \
+    "$PROJECT_DIR/LICENSE" \
+    "$PROJECT_DIR/Type4Me/Resources/THIRD_PARTY_LICENSES.txt" \
+    "$PROJECT_DIR/Type4Me/Resources/ThirdPartyNotices/Type4Me-LICENSE" \
+    "$PROJECT_DIR/Type4Me/Resources/ThirdPartyNotices/Orb-LICENSE"; do
+    if [ ! -s "$required_notice" ]; then
+        echo "ERROR: Required license notice is missing or empty: $required_notice"
+        exit 1
+    fi
+done
+cp "$PROJECT_DIR/LICENSE" "$APP_PATH/Contents/Resources/LICENSE"
+cp "$PROJECT_DIR/Type4Me/Resources/THIRD_PARTY_LICENSES.txt" "$APP_PATH/Contents/Resources/"
+mkdir -p "$APP_PATH/Contents/Resources/ThirdPartyNotices"
+cp "$PROJECT_DIR/Type4Me/Resources/ThirdPartyNotices/"* "$APP_PATH/Contents/Resources/ThirdPartyNotices/"
 
 # CloudDocs/Finder can attach provenance or FinderInfo xattrs to copied resources.
 # Developer ID signing rejects those as resource-fork detritus, so scrub before signing.

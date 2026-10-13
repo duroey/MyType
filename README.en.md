@@ -19,7 +19,7 @@ MyType uses `/Applications/MyType.app`, `com.mytype.app`, and `mytype://`; its d
   <a href="https://github.com/joewongjc/type4me/releases/latest"><img src="https://img.shields.io/github/v/release/joewongjc/type4me?label=release&color=131313" alt="Latest release" /></a>
   <a href="https://github.com/joewongjc/type4me/releases"><img src="https://img.shields.io/github/downloads/joewongjc/type4me/total?label=downloads&color=3B6FF0" alt="Downloads" /></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-555" alt="macOS 14+" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555" alt="MIT License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Proprietary%20%2B%20OSS-555" alt="Proprietary licensing with open-source components" /></a>
 </p>
 
 Type4Me is a free, open-source voice input app for macOS. Hold a hotkey and talk — text streams in at your cursor as you speak. The same hotkey workflow can polish what you said, translate it, ask AI about it, or turn it into a Mac action. You choose the speech engine, the LLM and the prompts; your history stays on your Mac and can be exported anytime.
@@ -113,4 +113,6 @@ Building from source, code signing and architecture are covered in [CONTRIBUTING
 
 ## License
 
-[MIT License](LICENSE)
+MyType uses a [proprietary commercial licensing notice](LICENSE). Original additions that the rights holders can license on new terms require separate authorization.
+Upstream Type4Me remains under the [MIT License](Type4Me/Resources/ThirdPartyNotices/Type4Me-LICENSE); other components retain their own licenses. See the [third-party notices](Type4Me/Resources/THIRD_PARTY_LICENSES.txt).
+Rights already granted for earlier releases and other material under MIT or another license are unaffected.

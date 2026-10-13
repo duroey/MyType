@@ -1,21 +1,66 @@
-MIT License
+MyType Commercial Licensing Notice
+专有商业授权声明
 
-Copyright (c) 2026 Type4Me Contributors
+This notice applies to versions of MyType distributed with this notice.
+本声明适用于随附本声明发布的 MyType 版本。
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Scope / 适用范围
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+MyType is distributed as a proprietary product containing open-source
+components. The proprietary terms below apply only to original, copyrightable
+MyType additions and modifications that the relevant rights holders are
+entitled to license on these terms (the "Proprietary Materials"). Copyright
+remains with the respective rights holders. No ownership of upstream or
+third-party material is claimed by this notice.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MyType 作为包含开源组件的专有产品发行。以下专有条款仅适用于相关权利人有权按本条款
+授权的 MyType 原创、受版权保护的新增内容及修改（“专有内容”）。版权归各自权利人
+所有；本声明不主张对上游或第三方内容的所有权。
+
+2. Separate authorization / 另行授权
+
+All rights in the Proprietary Materials are reserved. This notice does not
+grant a general public license to use, copy, modify, distribute, sublicense,
+or sell those materials. Such activities require separate authorization from
+the relevant rights holders, except where permitted by applicable law or by
+an existing license. Commercial, evaluation, and other end-user permissions
+are governed by the separate license supplied by the authorized publisher.
+This notice does not itself set a price, trial period, subscription, or
+support entitlement.
+
+专有内容保留所有权利。本声明不向公众普遍授予使用、复制、修改、分发、再许可或销售
+这些内容的权限。除适用法律或既有许可允许的情形外，上述行为须取得相关权利人的
+另行授权。商业使用、试用及其他最终用户权限，以有权发行者提供的独立授权为准。
+本声明本身不设定价格、试用期限、订阅或支持服务权益。
+
+3. Open-source and third-party components / 开源及第三方组件
+
+Type4Me code and other material received under the MIT License remain subject
+to that license. Its original notice is preserved, unchanged, at:
+Type4Me/Resources/ThirdPartyNotices/Type4Me-LICENSE
+
+Other components retain their respective licenses and copyright notices. See:
+Type4Me/Resources/THIRD_PARTY_LICENSES.txt
+Type4Me/Resources/ThirdPartyNotices/
+
+Application packages include these notices under Contents/Resources/.
+Additional bundled components, including AgentsView and CppJieba, have their
+own accompanying notices. Their license terms govern those components and
+take precedence over any inconsistent proprietary restriction in this notice.
+
+以 MIT 许可证取得的 Type4Me 代码及其他内容继续适用 MIT。原始版权及许可声明已在
+上述 Type4Me-LICENSE 文件中完整保留。其他组件继续适用各自的许可证和版权声明。
+应用包在 Contents/Resources/ 中携带相关声明；AgentsView、CppJieba 等随附组件亦保留
+自己的许可。组件自身的许可条款优先于本声明中任何与其冲突的专有限制。
+
+4. Existing grants / 既有授权
+
+This notice does not revoke, narrow, or replace rights already granted under
+MIT or another license for previously licensed material, including earlier
+MyType releases and contributions. A new proprietary distribution does not
+turn those existing grants into exclusive rights. Separately identified
+licensed material remains available under its existing terms.
+
+本声明不撤销、缩减或替换已经按 MIT 或其他许可证授出的权利，包括先前的 MyType
+版本及贡献。新的专有发行方式不会使这些既有授权变为独占权利；另有许可的内容继续
+适用其原有条款。

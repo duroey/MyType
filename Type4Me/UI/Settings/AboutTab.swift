@@ -27,7 +27,10 @@ struct AboutTab: View {
             SettingsDivider()
             SettingsRow(label: L("平台", "Platform"), value: "macOS 14+")
             SettingsDivider()
-            SettingsRow(label: L("许可证", "License"), value: "MIT")
+            SettingsRow(
+                label: L("许可证", "License"),
+                value: L("专有商业授权 · 含开源组件", "Proprietary · Includes open-source components")
+            )
 
             Spacer().frame(height: 24)
 

@@ -19,7 +19,7 @@ MyType 使用 `/Applications/MyType.app`、`com.mytype.app` 和 `mytype://`，�
   <a href="https://github.com/joewongjc/type4me/releases/latest"><img src="https://img.shields.io/github/v/release/joewongjc/type4me?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=131313" alt="最新版本" /></a>
   <a href="https://github.com/joewongjc/type4me/releases"><img src="https://img.shields.io/github/downloads/joewongjc/type4me/total?label=%E4%B8%8B%E8%BD%BD&color=3B6FF0" alt="下载量" /></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-555" alt="macOS 14+" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555" alt="MIT License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Proprietary%20%2B%20OSS-555" alt="专有商业授权，包含开源组件" /></a>
 </p>
 
 Type4Me 是一款免费开源的 macOS 语音输入法。按下快捷键说话，文字边说边出现在光标处；同一段话还可以一键润色、翻译、向 AI 提问，或者直接操作 Mac。识别引擎、大模型和 Prompt 都由你选，历史记录存在本机，随时可以导出。
@@ -113,4 +113,6 @@ Type4Me 是一款免费开源的 macOS 语音输入法。按下快捷键说话�
 
 ## 许可证
 
-[MIT License](LICENSE)
+MyType 采用[专有商业授权声明](LICENSE)，有权按新条款授权的原创新增部分须另行取得授权。
+上游 Type4Me 继续适用 [MIT 许可证](Type4Me/Resources/ThirdPartyNotices/Type4Me-LICENSE)，其他组件保留各自许可；参见[第三方声明](Type4Me/Resources/THIRD_PARTY_LICENSES.txt)。
+已经按 MIT 或其他许可证授出的旧版及相关内容，其既有权利不受本次调整影响。

@@ -5,6 +5,15 @@ mytype includes the following open-source software:
 
 ---
 
+Type4Me (upstream application)
+Copyright (c) 2026 Type4Me Contributors
+License: MIT
+Source: https://github.com/joewongjc/type4me
+Full license: ThirdPartyNotices/Type4Me-LICENSE
+MyType's proprietary licensing notice does not restrict rights granted by this license.
+
+---
+
 SenseVoice
 Copyright (c) FunAudioLLM, Alibaba Group
 License: MIT
@@ -76,4 +85,6 @@ Pinned commit: fbf6eb81ad85e1125ed62027769bcfefc01d3613
 
 ---
 
-Full license texts are available at the respective source repositories.
+Bundled full license texts are in ThirdPartyNotices/ and, when those components
+are included, AGENTSVIEW_LICENSE and Jieba/*_LICENSE. The respective source
+repositories provide further component license information.
