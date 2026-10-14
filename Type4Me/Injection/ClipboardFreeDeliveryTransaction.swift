@@ -34,7 +34,7 @@ final class ClipboardFreeDeliveryTransaction {
             guard target.isCurrent() else { return false }
             switch target.observation() {
             case .unchanged, .unavailable: return target.isCurrent()
-            case .inserted, .changed, .targetChanged: return false
+            case .inserted, .changed, .selectionChanged, .targetChanged: return false
             }
         }
         guard shouldDispatch() else {
@@ -63,7 +63,7 @@ final class ClipboardFreeDeliveryTransaction {
             switch finalObservation {
             case .inserted, .targetChanged:
                 return finish(dispatch: dispatch, observation: finalObservation, route: route)
-            case .unchanged, .unavailable, .changed:
+            case .unchanged, .unavailable, .changed, .selectionChanged:
                 // Editors may expose partial text while processing already queued events.
                 // Keep observing within the existing deadline; never send the text again.
                 guard attempt < polls, ProcessInfo.processInfo.systemUptime < deadline else {
@@ -75,14 +75,14 @@ final class ClipboardFreeDeliveryTransaction {
         return finish(dispatch: dispatch, observation: finalObservation, route: route)
     }
 
-    /// Preserves delivery evidence without treating missing or unchanged receipts as success.
+    /// Separates a completed send from verified insertion and observable delivery failures.
     ///
     /// Args:
     ///   dispatch: Whether the complete payload, part of it, or an ambiguous AX write was sent.
     ///   observation: Last bounded observation of the original destination.
     ///   route: Delivery method used, for diagnostics without text content.
     /// Returns:
-    ///   A distinct result for confirmed insertion, interrupted delivery, or missing evidence.
+    ///   Verified insertion, normal dispatch completion, or a failure requiring attention.
     private func finish(
         dispatch: TextDeliveryAttempt, observation: TextDeliveryObservation, route: String
     ) -> TextDeliveryResult {
@@ -91,10 +91,14 @@ final class ClipboardFreeDeliveryTransaction {
             result = .inserted
         } else if dispatch == .partiallyDispatched {
             result = .inputPartiallyDispatched
+        } else if dispatch == .dispatched, observation == .changed || observation == .unavailable {
+            // A missing exact receipt is not a delivery error. Keep this distinct from
+            // inserted so normal feedback never authorizes correction learning or retries.
+            result = .inputDispatched
         } else {
             switch observation {
             case .inserted: result = .inserted
-            case .unchanged: result = .inputUnchanged
+            case .unchanged, .selectionChanged: result = .inputUnchanged
             case .unavailable: result = .inputAttempted
             case .targetChanged: result = .inputTargetChanged
             case .changed: result = .inputChanged

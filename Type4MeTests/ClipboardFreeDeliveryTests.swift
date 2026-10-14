@@ -10,7 +10,7 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         XCTAssertTrue(TextInjectionEngine.mayInsertIntoOwnApp(targetPID: 123, ownPID: 123))
     }
 
-    /// Only confirmed insertion uses the normal completion label, in both product languages.
+    /// Complete dispatch has normal feedback while ambiguous writes retain their warning.
     func testNormalCompletionFeedbackInBothLanguages() {
         let previous = UserDefaults.standard.object(forKey: "tf_language")
         defer {
@@ -22,19 +22,78 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputAttempted).completionMessage,
                        "输入未确认")
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inserted).completionMessage, "已完成")
+        XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputDispatched).completionMessage, "已完成")
         UserDefaults.standard.set("en", forKey: "tf_language")
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputAttempted).completionMessage,
                        "Input unconfirmed")
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inserted).completionMessage, "Done")
+        XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputDispatched).completionMessage, "Done")
+        XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputDispatched), .inputDispatched)
+        XCTAssertFalse(InjectionOutcome.inputDispatched.requiresAttention)
         XCTAssertTrue(InjectionOutcome.inputAttempted.requiresAttention)
         XCTAssertTrue(InjectionOutcome.actionFailed("failure").requiresAttention)
         XCTAssertFalse(InjectionOutcome.inserted.requiresAttention)
+    }
+
+    /// A complete send is normal completion even when the editor cannot supply an exact receipt.
+    func testCompleteDispatchDoesNotRaiseFalseWarnings() {
+        let previous = UserDefaults.standard.object(forKey: "tf_language")
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: "tf_language") }
+            else { UserDefaults.standard.removeObject(forKey: "tf_language") }
+        }
+        for observation in [TextDeliveryObservation.changed, .unavailable] {
+            for useDirect in [false, true] {
+                let target = StubClipboardFreeTarget()
+                if useDirect { target.directResult = .dispatched }
+                else { target.unicodeResult = .dispatched }
+                target.observe = {
+                    let sent = useDirect ? target.directCalls > 0 : target.unicodeCalls > 0
+                    return sent ? observation : .unchanged
+                }
+                let result = ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target)
+                let outcome = TextInjectionEngine.deliveryOutcome(result)
+                XCTAssertNotEqual(outcome, .inserted)
+                XCTAssertFalse(outcome.requiresAttention)
+                UserDefaults.standard.set("zh", forKey: "tf_language")
+                XCTAssertEqual(outcome.completionMessage, "已完成")
+                UserDefaults.standard.set("en", forKey: "tf_language")
+                XCTAssertEqual(outcome.completionMessage, "Done")
+                XCTAssertEqual(target.unicodeCalls, 1)
+                XCTAssertEqual(target.directCalls, useDirect ? 1 : 0)
+            }
+        }
+    }
+
+    /// Caret movement alone is not evidence of text delivery and must keep recovery feedback.
+    func testCaretMovementWithoutTextStillWarns() {
+        let target = StubClipboardFreeTarget()
+        target.unicodeResult = .dispatched
+        let caretOnly = NativeTextDeliveryTarget.compareReceipt(
+            beforeValue: "before", beforeRange: NSRange(location: 6, length: 0),
+            expectedValue: "before new", insertedUTF16Length: 4,
+            currentValue: "before", currentRange: NSRange(location: 0, length: 0))
+        target.observe = { target.unicodeCalls > 0 ? caretOnly : .unchanged }
+        let result = ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target)
+        XCTAssertEqual(result, .inputUnchanged)
+        XCTAssertTrue(TextInjectionEngine.deliveryOutcome(result).requiresAttention)
+        XCTAssertEqual(target.unicodeCalls, 1)
+        XCTAssertEqual(target.directCalls, 0)
+    }
+
+    /// Moving the caret before dispatch cannot redirect input into a different selection.
+    func testSelectionChangeBeforeSendDoesNotDispatch() {
+        let target = StubClipboardFreeTarget()
+        target.unicodeResult = .dispatched
+        target.observe = { .selectionChanged }
+        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .notDelivered)
+        XCTAssertEqual(target.unicodeCalls + target.directCalls, 0)
     }
     /// Opaque receivers can consume queued text later without any clipboard dependency.
     func testOpaqueDeliveryDoesNotRetryAfterDispatch() {
         let target = StubClipboardFreeTarget()
         target.unicodeResult = .dispatched
-        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .inputAttempted)
+        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .inputDispatched)
         XCTAssertEqual(target.unicodeCalls, 1)
         XCTAssertEqual(target.directCalls, 0)
     }
@@ -61,7 +120,7 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
     func testUnchangedAndUnavailableReceiptsRemainDistinct() {
         for (observation, expected) in [
             (TextDeliveryObservation.unchanged, TextDeliveryResult.inputUnchanged),
-            (.unavailable, .inputAttempted),
+            (.unavailable, .inputDispatched),
         ] {
             let target = StubClipboardFreeTarget()
             target.unicodeResult = .dispatched
@@ -69,15 +128,15 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
             XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), expected)
             XCTAssertEqual(target.unicodeCalls, 1)
             XCTAssertEqual(target.directCalls, 0)
-            XCTAssertTrue(TextInjectionEngine.deliveryOutcome(expected).requiresAttention)
+            XCTAssertEqual(TextInjectionEngine.deliveryOutcome(expected).requiresAttention, expected == .inputUnchanged)
         }
     }
 
-    /// User changes after dispatch must retain their cause instead of looking like a missing receipt.
+    /// Losing the destination still warns, while editor text differences alone are not failures.
     func testFocusAndContentChangesAfterDispatchRemainDistinct() {
         for (observation, expected) in [
             (TextDeliveryObservation.targetChanged, TextDeliveryResult.inputTargetChanged),
-            (.changed, .inputChanged),
+            (.changed, .inputDispatched),
         ] {
             let target = StubClipboardFreeTarget()
             target.unicodeResult = .dispatched
@@ -100,11 +159,17 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
 
     /// A late AX timeout may already have applied its write, so uncertainty must survive receipt polling.
     func testAmbiguousDirectWriteDoesNotClaimSuccessOrRetry() {
-        let target = StubClipboardFreeTarget()
-        target.directResult = .uncertain
-        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .inputAttempted)
-        XCTAssertEqual(target.unicodeCalls, 1)
-        XCTAssertEqual(target.directCalls, 1)
+        for (observation, expected) in [(TextDeliveryObservation.unavailable, TextDeliveryResult.inputAttempted),
+                                         (.changed, .inputChanged)] {
+            let target = StubClipboardFreeTarget()
+            target.directResult = .uncertain
+            target.observe = { target.directCalls > 0 ? observation : .unchanged }
+            let result = ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target)
+            XCTAssertEqual(result, expected)
+            XCTAssertTrue(TextInjectionEngine.deliveryOutcome(result).requiresAttention)
+            XCTAssertEqual(target.unicodeCalls, 1)
+            XCTAssertEqual(target.directCalls, 1)
+        }
     }
 
     /// An explicit rejection is observable and cannot become a dispatched or completed result.

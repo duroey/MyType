@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-enum TextDeliveryObservation: Equatable { case inserted, unchanged, unavailable, changed, targetChanged }
+enum TextDeliveryObservation: Equatable { case inserted, unchanged, unavailable, changed, selectionChanged, targetChanged }
 enum TextDeliveryAttempt: Equatable {
     case unavailable, rejected, dispatched, partiallyDispatched, uncertain
 
@@ -15,7 +15,7 @@ enum TextDeliveryAttempt: Equatable {
 }
 enum TextDeliveryResult: Equatable {
     case inserted, pasteAttempted, clipboardOnly, clipboardChanged, clipboardWriteFailed
-    case inputAttempted, notDelivered
+    case inputDispatched, inputAttempted, notDelivered
     case inputUnchanged, inputTargetChanged, inputChanged, inputPartiallyDispatched, inputRejected
 }
 
@@ -147,7 +147,7 @@ final class ClipboardDeliveryTransaction {
             guard target.isCurrent(), ownsClipboard() else { return false }
             switch target.observation() {
             case .unchanged, .unavailable: return ownsClipboard()
-            case .inserted, .changed, .targetChanged: return false
+            case .inserted, .changed, .selectionChanged, .targetChanged: return false
             }
         }
         wait(configuration.pasteboardSettleSeconds)
@@ -185,7 +185,7 @@ final class ClipboardDeliveryTransaction {
                 guard attempt < maximumPolls, ProcessInfo.processInfo.systemUptime < deadline else { break }
                 wait(configuration.verificationPollIntervalSeconds)
                 continue
-            case .unavailable, .changed, .targetChanged:
+            case .unavailable, .changed, .selectionChanged, .targetChanged:
                 DebugFileLogger.log("injection: unconfirmed route=\(route) observation=\(observation)")
                 break
             }

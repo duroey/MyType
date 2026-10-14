@@ -140,11 +140,11 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget, ClipboardFreeTextDeliv
             guard !overflow else { return .unavailable }
             let expectedCaret = NSRange(location: caret, length: 0)
             if range == expectedCaret && range != beforeRange { return .inserted }
-            return range == beforeRange ? .unchanged : .changed
+            return range == beforeRange ? .unchanged : .selectionChanged
         }
         guard currentValue == beforeValue else { return .changed }
         guard let range = currentRange else { return .unavailable }
-        return range == beforeRange ? .unchanged : .changed
+        return range == beforeRange ? .unchanged : .selectionChanged
     }
 
     /// Invokes an enabled native Paste command without depending on its keyboard shortcut.

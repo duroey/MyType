@@ -83,20 +83,22 @@ enum InjectionOutcome: Sendable, Equatable {
     /// Cmd+V was sent to an AX-opaque editor, but insertion cannot be proven.
     /// The dictated result intentionally remains in the clipboard.
     case pasteAttemptedClipboardRetained
-    /// Text events were sent without modifying the clipboard; receipt is unavailable.
+    /// The full payload was dispatched; exact insertion remains unverified for editing/learning.
+    case inputDispatched
+    /// A write may have happened, but even complete dispatch could not be confirmed.
     case inputAttempted
     case copiedToClipboard
     case actionFailed(String)
     case notInserted
     case discarded
 
-    /// Provides concise completion feedback without treating a sent event as confirmed input.
+    /// Provides normal completion feedback for a finished send without upgrading its evidence.
     ///
     /// Returns:
-    ///   Confirmed completion, or the short fallback or error requiring attention.
+    ///   Completion of the input flow, or a short fallback or error requiring attention.
     var completionMessage: String {
         switch self {
-        case .inserted:
+        case .inserted, .inputDispatched:
             return L("已完成", "Done")
         case .inputAttempted:
             return L("输入未确认", "Input unconfirmed")
@@ -111,11 +113,11 @@ enum InjectionOutcome: Sendable, Equatable {
         }
     }
 
-    /// Keeps uncertain or failed input visible long enough for the user to notice.
+    /// Warns about failed or incomplete dispatch, not an editor's lack of an exact receipt.
     var requiresAttention: Bool {
         switch self {
         case .inputAttempted, .notInserted, .actionFailed: return true
-        case .inserted, .pasteAttemptedClipboardRetained, .copiedToClipboard, .discarded: return false
+        case .inserted, .inputDispatched, .pasteAttemptedClipboardRetained, .copiedToClipboard, .discarded: return false
         }
     }
 }

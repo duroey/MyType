@@ -1736,6 +1736,8 @@ final class AppState {
                 message = outcome.completionMessage
             case .inserted:
                 message = L("处理失败，已输出原文", "Processing failed; raw text output")
+            case .inputDispatched:
+                message = L("处理失败，已发送原文", "Processing failed; raw text sent")
             case .pasteAttemptedClipboardRetained:
                 message = L(
                     "处理失败，已尝试输入，原文已保留至剪贴板",

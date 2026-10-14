@@ -214,7 +214,7 @@ final class TextInjectionEngine: @unchecked Sendable {
     }
 
 
-    /// Maps delivery evidence to the existing bilingual feedback without claiming a sent event succeeded.
+    /// Maps delivery evidence while keeping complete dispatch distinct from verified insertion.
     static func deliveryOutcome(_ result: TextDeliveryResult) -> InjectionOutcome {
         switch result {
         case .inserted: return .inserted
@@ -224,6 +224,7 @@ final class TextInjectionEngine: @unchecked Sendable {
             return .actionFailed(L("剪贴板已变化，文本可从历史记录恢复", "Clipboard changed; recover the text from history"))
         case .clipboardWriteFailed:
             return .actionFailed(L("无法写入剪贴板，文本可从历史记录恢复", "Could not write to clipboard; recover the text from history"))
+        case .inputDispatched: return .inputDispatched
         case .inputAttempted: return .inputAttempted
         case .inputUnchanged:
             return .actionFailed(L("未检测到输入，已存历史", "No input observed; saved in history"))
