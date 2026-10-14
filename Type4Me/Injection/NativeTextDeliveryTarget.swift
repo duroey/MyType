@@ -10,6 +10,16 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
         case verifiableText
     }
 
+    enum FocusEvidence {
+        case matched, unknown, changed, blocked
+
+        /// Missing AX metadata does not prohibit normal paste into the same foreground app.
+        var permitsSystemPaste: Bool { self == .matched || self == .unknown }
+
+        /// Reading or writing a cached control requires positive evidence of its current focus.
+        var permitsControlAccess: Bool { self == .matched }
+    }
+
     private enum FocusLookup {
         case element(AXUIElement)
         case unavailable
@@ -66,26 +76,38 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
 
     /// Returns whether the original application and, when available, control still own focus.
     func isCurrent() -> Bool {
-        guard !blocked, sameApplicationIsFrontmost() else { return false }
+        focusEvidence().permitsSystemPaste
+    }
+
+    /// Distinguishes absent focus metadata from evidence that the user selected another destination.
+    private func focusEvidence() -> FocusEvidence {
+        guard !blocked else { return .blocked }
+        guard sameApplicationIsFrontmost() else { return .changed }
         switch currentFocus() {
         case .otherApplication:
-            return false
+            return .changed
         case .unavailable:
-            return focusedElement == nil && sameApplicationIsFrontmost()
+            return sameApplicationIsFrontmost() ? .unknown : .changed
         case .element(let current):
-            guard controlAccess(of: current) != .blocked else { return false }
-            return (focusedElement.map { CFEqual($0, current) } ?? true) && sameApplicationIsFrontmost()
+            guard controlAccess(of: current) != .blocked else { return .blocked }
+            guard sameApplicationIsFrontmost() else { return .changed }
+            guard let focusedElement else { return .unknown }
+            return CFEqual(focusedElement, current) ? .matched : .changed
         }
     }
 
     /// Compares the exact resulting field value, never a substring or another input control.
     func observation() -> TextDeliveryObservation {
-        guard isCurrent() else { return .targetChanged }
+        let evidence = focusEvidence()
+        guard evidence.permitsSystemPaste else { return .targetChanged }
+        guard evidence.permitsControlAccess else { return .unavailable }
         guard let element = focusedElement, let beforeValue, let beforeRange, let expectedValue,
               let value = boundedValue(of: element)
         else { return .unavailable }
         let range = selectedRange(of: element)
-        guard isCurrent() else { return .targetChanged }
+        let afterRead = focusEvidence()
+        guard afterRead.permitsSystemPaste else { return .targetChanged }
+        guard afterRead.permitsControlAccess else { return .unavailable }
         return Self.compareReceipt(
             beforeValue: beforeValue, beforeRange: beforeRange, expectedValue: expectedValue,
             insertedUTF16Length: text.utf16.count, currentValue: value, currentRange: range
@@ -144,36 +166,35 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
     /// Args:
     ///   shouldDispatch: Final clipboard ownership check immediately before the write.
     func insertDirectly(shouldDispatch: () -> Bool) -> TextDeliveryAttempt {
-        guard isCurrent(), let element = focusedElement, let beforeValue, let beforeRange,
+        guard focusEvidence().permitsControlAccess, let element = focusedElement, let beforeValue, let beforeRange,
               boundedValue(of: element) == beforeValue,
               selectedRange(of: element) == beforeRange
         else { return .unavailable }
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
               settable.boolValue, boundedValue(of: element) == beforeValue,
-              selectedRange(of: element) == beforeRange, isCurrent(), shouldDispatch()
+              selectedRange(of: element) == beforeRange, focusEvidence().permitsControlAccess, shouldDispatch()
         else { return .unavailable }
         let result = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString)
         return result == .attributeUnsupported ? .unavailable : .dispatched
     }
 
-    /// Posts one synthetic Command-V pair to the original application after checking focus.
+    /// Posts one Command-V pair through the system event stream used by the original working injector.
     ///
     /// Args:
     ///   shouldDispatch: Final clipboard ownership check before posting either key event.
     func pasteUsingShortcut(shouldDispatch: () -> Bool) -> Bool {
-        guard let source = CGEventSource(stateID: .privateState),
-              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false),
+        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false),
               isCurrent()
         else { return false }
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
         TextInjectionEngine.markAsSyntheticInput(keyDown)
         TextInjectionEngine.markAsSyntheticInput(keyUp)
-        guard shouldDispatch() else { return false }
-        keyDown.postToPid(application.processIdentifier)
-        keyUp.postToPid(application.processIdentifier)
+        guard sameApplicationIsFrontmost(), shouldDispatch() else { return false }
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
         return true
     }
 

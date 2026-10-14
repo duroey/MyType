@@ -3,6 +3,25 @@ import XCTest
 @testable import Type4Me
 
 final class ClipboardDeliveryTransactionTests: XCTestCase {
+    /// A no-op accessibility menu must not suppress a working system paste event.
+    func testSystemPasteRunsBeforeUnreliableAccessibilityCommands() {
+        let board = isolatedClipboard()
+        let target = StubDeliveryTarget()
+        var received: String?
+        target.menu = { .dispatched }
+        target.direct = { .dispatched }
+        target.shortcut = {
+            received = board.pasteboard.string(forType: .string)
+            return true
+        }
+        target.observe = { received == "new" ? .inserted : .unchanged }
+        XCTAssertEqual(ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
+            .deliver("new", to: target, restoreOriginal: true), .inserted)
+        XCTAssertEqual(received, "new")
+        XCTAssertEqual(target.shortcutCount, 1)
+        XCTAssertEqual(target.menuCount + target.directCount, 0)
+    }
+
     /// A delayed editor must still read this dictation, never the restored old clipboard.
     func testDelayedOpaquePasteKeepsNewText() {
         let board = isolatedClipboard()
@@ -18,11 +37,12 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
         XCTAssertEqual(target.shortcutCount, 1)
     }
 
-    /// An application menu can paste even when its keyboard shortcut does nothing.
+    /// A native menu remains a fallback when no keyboard event could be sent.
     func testNativeMenuBypassesBrokenShortcutAndRestoresOnlyAfterReceipt() {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
         var inserted = false
+        target.shortcut = { false }
         target.menu = {
             inserted = board.pasteboard.string(forType: .string) == "new"
             return .dispatched
@@ -32,7 +52,7 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
             .deliver("new", to: target, restoreOriginal: true)
         XCTAssertTrue(inserted)
         XCTAssertEqual(result, .inserted)
-        XCTAssertEqual(target.shortcutCount, 0)
+        XCTAssertEqual(target.shortcutCount, 1)
         XCTAssertEqual(board.pasteboard.string(forType: .string), "old clipboard")
     }
 
@@ -41,12 +61,13 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
         var inserted = false
+        target.shortcut = { false }
         target.direct = { inserted = true; return .dispatched }
         target.observe = { inserted ? .inserted : .unchanged }
         let result = ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
             .deliver("new", to: target, restoreOriginal: true)
         XCTAssertEqual(result, .inserted)
-        XCTAssertEqual(target.shortcutCount, 0)
+        XCTAssertEqual(target.shortcutCount, 1)
         XCTAssertEqual(board.pasteboard.string(forType: .string), "old clipboard")
     }
 
@@ -74,13 +95,14 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
     func testUnconfirmedMenuDoesNotFallThroughOrRestore() {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
+        target.shortcut = { false }
         target.menu = { .dispatched }
         target.observe = { .unchanged }
         let result = ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
             .deliver("new", to: target, restoreOriginal: true)
         XCTAssertEqual(result, .pasteAttempted)
         XCTAssertEqual(target.directCount, 0)
-        XCTAssertEqual(target.shortcutCount, 0)
+        XCTAssertEqual(target.shortcutCount, 1)
         XCTAssertEqual(board.pasteboard.string(forType: .string), "new")
     }
 
@@ -105,7 +127,7 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
         var inserted = false
-        target.menu = { inserted = true; _ = board.write("user copy", transient: false); return .dispatched }
+        target.shortcut = { inserted = true; _ = board.write("user copy", transient: false); return true }
         target.observe = { inserted ? .inserted : .unchanged }
         let result = ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
             .deliver("new", to: target, restoreOriginal: true)
@@ -142,7 +164,7 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
         var inserted = false
-        target.menu = { inserted = true; return .dispatched }
+        target.shortcut = { inserted = true; return true }
         target.observe = { inserted ? .inserted : .unchanged }
         XCTAssertEqual(ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
             .deliver("new", to: target, restoreOriginal: false), .inserted)
@@ -153,11 +175,13 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
     func testClipboardChangeDuringMenuDiscoveryStopsDispatch() {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
+        target.shortcut = { false }
         target.beforeMenuDispatch = { _ = board.write("other copy", transient: false) }
         target.menu = { XCTFail("Must not send the replaced clipboard"); return .dispatched }
         XCTAssertEqual(ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
             .deliver("new", to: target, restoreOriginal: true), .clipboardChanged)
-        XCTAssertEqual(target.directCount + target.shortcutCount, 0)
+        XCTAssertEqual(target.directCount, 0)
+        XCTAssertEqual(target.shortcutCount, 1)
         XCTAssertEqual(board.pasteboard.string(forType: .string), "other copy")
     }
 
@@ -176,11 +200,12 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
         let board = isolatedClipboard()
         let target = StubDeliveryTarget()
         var sent = false
-        target.menu = { sent = true; return .dispatched }
+        target.shortcut = { sent = true; return true }
         target.observe = { sent ? .changed : .unchanged }
         XCTAssertEqual(ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
             .deliver("new", to: target, restoreOriginal: true), .pasteAttempted)
-        XCTAssertEqual(target.directCount + target.shortcutCount, 0)
+        XCTAssertEqual(target.directCount + target.menuCount, 0)
+        XCTAssertEqual(target.shortcutCount, 1)
         XCTAssertEqual(board.pasteboard.string(forType: .string), "new")
     }
 
@@ -227,6 +252,15 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
 }
 
 final class NativeTextDeliveryPolicyTests: XCTestCase {
+    /// Missing AX focus evidence allows system paste but cannot authorize cached-control access.
+    func testUnknownFocusDoesNotBlockSystemPasteOrAuthorizeAXReadWrite() {
+        XCTAssertTrue(NativeTextDeliveryTarget.FocusEvidence.unknown.permitsSystemPaste)
+        XCTAssertFalse(NativeTextDeliveryTarget.FocusEvidence.unknown.permitsControlAccess)
+        XCTAssertTrue(NativeTextDeliveryTarget.FocusEvidence.matched.permitsControlAccess)
+        XCTAssertFalse(NativeTextDeliveryTarget.FocusEvidence.changed.permitsSystemPaste)
+        XCTAssertFalse(NativeTextDeliveryTarget.FocusEvidence.blocked.permitsSystemPaste)
+    }
+
     /// Paste is identified by its command meaning, independently of remapped shortcuts.
     func testMenuRequiresStandardPasteMeaning() {
         XCTAssertTrue(NativeTextDeliveryTarget.isStandardPasteMenuItem(role: "AXMenuItem", isEnabled: true, title: "Paste"))

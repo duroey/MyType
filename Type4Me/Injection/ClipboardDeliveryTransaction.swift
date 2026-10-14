@@ -125,24 +125,33 @@ final class ClipboardDeliveryTransaction {
             }
         }
         wait(configuration.pasteboardSettleSeconds)
-        guard shouldDispatch() else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
+        guard shouldDispatch() else {
+            DebugFileLogger.log("injection: preflight blocked current=\(target.isCurrent()) observation=\(target.observation()) ownsClipboard=\(ownsClipboard())")
+            return ownsClipboard() ? .clipboardOnly : .clipboardChanged
+        }
 
-        // Fall through only when no action was sent. A timeout after sending is not a retry signal.
-        var dispatched = target.pasteUsingMenu(shouldDispatch: shouldDispatch) == .dispatched
+        // The proven system event path must run before AX actions that may report success but do nothing.
+        // Fall through only when no action was sent. Unconfirmed dispatch is never a retry signal.
+        var route = "systemShortcut"
+        var dispatched = target.pasteUsingShortcut(shouldDispatch: shouldDispatch)
         if !dispatched {
             guard shouldDispatch() else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
+            route = "nativeMenu"
+            dispatched = target.pasteUsingMenu(shouldDispatch: shouldDispatch) == .dispatched
+        }
+        if !dispatched {
+            guard shouldDispatch() else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
+            route = "directAX"
             dispatched = target.insertDirectly(shouldDispatch: shouldDispatch) == .dispatched
         }
-        if !dispatched {
-            guard shouldDispatch() else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
-            dispatched = target.pasteUsingShortcut(shouldDispatch: shouldDispatch)
-        }
         guard dispatched else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
+        DebugFileLogger.log("injection: dispatched route=\(route)")
 
         let deadline = ProcessInfo.processInfo.systemUptime + configuration.verificationTimeoutSeconds
         let maximumPolls = Int(ceil(configuration.verificationTimeoutSeconds / configuration.verificationPollIntervalSeconds))
         for attempt in 0...maximumPolls {
-            switch target.observation() {
+            let observation = target.observation()
+            switch observation {
             case .inserted:
                 if let snapshot, ownsClipboard() { clipboard.restore(snapshot, changeCount: receipt.changeCount) }
                 return .inserted
@@ -151,6 +160,7 @@ final class ClipboardDeliveryTransaction {
                 wait(configuration.verificationPollIntervalSeconds)
                 continue
             case .unavailable, .changed, .targetChanged:
+                DebugFileLogger.log("injection: unconfirmed route=\(route) observation=\(observation)")
                 break
             }
             break
