@@ -25,7 +25,10 @@ struct AgentInboxView: View {
                     .measuringInboxHeight(.warning)
             }
             if store.items.isEmpty {
-                emptyState.measuringInboxHeight(.empty)
+                ScrollView {
+                    emptyState.measuringInboxHeight(.empty)
+                }
+                .scrollBounceBehavior(.basedOnSize)
             } else {
                 ScrollView {
                     VStack(spacing: layout.rowSpacing) {

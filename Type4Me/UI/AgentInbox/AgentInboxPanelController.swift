@@ -31,6 +31,7 @@ enum AgentInboxPresentation: Equatable {
 /// Shared sizing configuration for the native panel and its measured SwiftUI content.
 struct AgentInboxPanelLayout {
     var preferredWidth: CGFloat = 420
+    var minimumSize = NSSize(width: 320, height: 180)
     var maximumVisibleItems = 3
     var estimatedHeaderHeight: CGFloat = 88
     var estimatedRowHeight: CGFloat = 160
@@ -77,12 +78,17 @@ struct AgentInboxPanelLayout {
     ///   contentHeight: Measured content height, including header and list padding.
     ///   visibleFrame: Usable display area, excluding the menu bar and Dock.
     ///   currentFrame: Existing visible panel bounds, or nil for initial presentation.
+    ///   preferredSize: User-selected size, which takes priority over measured content.
     ///
     /// Returns:
     ///   A display-bounded frame anchored to the current or default upper-right corner.
-    func frame(contentHeight: CGFloat, visibleFrame: NSRect, currentFrame: NSRect? = nil) -> NSRect {
-        let width = min(preferredWidth, max(0, visibleFrame.width - screenInset * 2))
-        let height = min(max(0, contentHeight), max(0, visibleFrame.height - screenInset * 2))
+    func frame(
+        contentHeight: CGFloat, visibleFrame: NSRect, currentFrame: NSRect? = nil,
+        preferredSize: NSSize? = nil
+    ) -> NSRect {
+        let desiredSize = preferredSize ?? NSSize(width: preferredWidth, height: contentHeight)
+        let width = min(max(minimumSize.width, desiredSize.width), max(0, visibleFrame.width - screenInset * 2))
+        let height = min(max(minimumSize.height, desiredSize.height), max(0, visibleFrame.height - screenInset * 2))
         let right = min(max(currentFrame?.maxX ?? visibleFrame.maxX - screenInset,
                             visibleFrame.minX + screenInset + width), visibleFrame.maxX - screenInset)
         let top = min(max(currentFrame?.maxY ?? visibleFrame.maxY - screenInset,
@@ -103,16 +109,20 @@ private final class AgentInboxPanel: NSPanel {
 }
 
 @MainActor
-final class AgentInboxPanelController {
+final class AgentInboxPanelController: NSObject, NSWindowDelegate {
     static let shared = AgentInboxPanelController()
+    private static let preferredSizeKey = "tf_agentInboxPanelSize"
 
     private let layout: AgentInboxPanelLayout
+    private let defaults: UserDefaults
     private let storeProvider: @MainActor () -> AgentInboxStore
     private let presentOverride: ((AgentInboxPresentation) -> Void)?
     private let dismissOverride: (() -> Void)?
     private var panel: AgentInboxPanel?
     private var model: AgentInboxViewModel?
     private var contentHeight: CGFloat?
+    private var preferredSize: NSSize?
+    private var liveResizeStartSize: NSSize?
     private var storeObserver: AnyCancellable?
     private var navigationObserver: AnyCancellable?
     private(set) var presentation: AgentInboxPresentation?
@@ -121,19 +131,23 @@ final class AgentInboxPanelController {
     ///
     /// Args:
     ///   layout: Shared content sizing and screen margins.
+    ///   defaults: Stores only the size explicitly selected by dragging the panel.
     ///   storeProvider: Supplies the shared inbox only when native presentation needs it.
     ///   present: Optional window-free presentation observer for isolated checks.
     ///   dismiss: Optional window-free counterpart for explicit dismissal.
     init(
         layout: AgentInboxPanelLayout = AgentInboxPanelLayout(),
+        defaults: UserDefaults = .standard,
         storeProvider: @escaping @MainActor () -> AgentInboxStore = { AgentInboxStore.shared },
         present: ((AgentInboxPresentation) -> Void)? = nil,
         dismiss: (() -> Void)? = nil
     ) {
         self.layout = layout
+        self.defaults = defaults
         self.storeProvider = storeProvider
         presentOverride = present
         dismissOverride = dismiss
+        super.init()
     }
 
     /// Opens the persistent queue from its menu entry, allowing keyboard interaction.
@@ -171,10 +185,12 @@ final class AgentInboxPanelController {
         storeObserver = nil
         navigationObserver = nil
         close()
+        panel?.delegate = nil
         panel?.contentView = nil
         panel = nil
         model = nil
         contentHeight = nil
+        liveResizeStartSize = nil
     }
 
     /// Presents attention updates automatically, or keeps a manually opened queue visible.
@@ -209,7 +225,7 @@ final class AgentInboxPanelController {
         })
         let panel = AgentInboxPanel(
             contentRect: .zero,
-            styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
+            styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView, .resizable],
             backing: .buffered, defer: false
         )
         panel.isFloatingPanel = true
@@ -221,13 +237,15 @@ final class AgentInboxPanelController {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        preferredSize = loadPreferredSize()
         self.model = model
         self.panel = panel
         navigationObserver = model.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.reconcileVisibility() }
         contentHeight = layout.contentHeight(itemIDs: store.items.map(\.id), measurements: [:])
-        panel.contentView = NSHostingView(rootView: AgentInboxView(
+        let hosting = NSHostingView(rootView: AgentInboxView(
             store: store, model: model, layout: layout,
             onClose: { [weak self] in self?.close() },
             onContentHeightChange: { [weak self] height in
@@ -236,6 +254,45 @@ final class AgentInboxPanelController {
                 self.resizeToContent()
             }
         ))
+        // The panel owns its bounds; intrinsic SwiftUI sizes must not undo a user's resize.
+        hosting.sizingOptions = []
+        hosting.autoresizingMask = [.width, .height]
+        panel.contentView = hosting
+    }
+
+    /// Records native resize gestures without turning automatic layout into a saved preference.
+    ///
+    /// Args:
+    ///   notification: AppKit notification for the panel starting a live resize.
+    func windowWillStartLiveResize(_ notification: Notification) {
+        guard let panel, (notification.object as? NSWindow) === panel else { return }
+        liveResizeStartSize = panel.frame.size
+    }
+
+    /// Keeps the user's final dimensions across incoming messages, reopening, and app restarts.
+    ///
+    /// Args:
+    ///   notification: AppKit notification after the user releases a resize edge or corner.
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard let panel, (notification.object as? NSWindow) === panel else { return }
+        defer { liveResizeStartSize = nil }
+        guard let startSize = liveResizeStartSize, panel.frame.size != startSize else { return }
+        preferredSize = panel.frame.size
+        defaults.set([
+            "width": Double(panel.frame.width), "height": Double(panel.frame.height)
+        ], forKey: Self.preferredSizeKey)
+    }
+
+    /// Reads valid saved dimensions while preserving automatic sizing on first use.
+    ///
+    /// Returns:
+    ///   Positive finite dimensions, or nil when no usable user preference exists.
+    private func loadPreferredSize() -> NSSize? {
+        guard let stored = defaults.dictionary(forKey: Self.preferredSizeKey),
+              let width = stored["width"] as? Double,
+              let height = stored["height"] as? Double,
+              width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+        return NSSize(width: width, height: height)
     }
 
     /// Observes completed queue mutations without polling or reintroducing dismissal timers.
@@ -261,12 +318,19 @@ final class AgentInboxPanelController {
         }
     }
 
-    /// Applies measured height without activating, reordering, or revealing a hidden panel.
+    /// Applies automatic or user-selected size without fighting a live resize or revealing the panel.
     private func resizeToContent() {
-        guard let panel, let contentHeight,
+        guard let panel, !panel.inLiveResize, let contentHeight,
               let screen = (panel.isVisible ? panel.screen : nil) ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        let availableSize = NSSize(
+            width: max(0, screen.visibleFrame.width - layout.screenInset * 2),
+            height: max(0, screen.visibleFrame.height - layout.screenInset * 2)
+        )
+        panel.contentMinSize = NSSize(width: min(layout.minimumSize.width, availableSize.width),
+                                     height: min(layout.minimumSize.height, availableSize.height))
+        panel.contentMaxSize = availableSize
         let frame = layout.frame(contentHeight: contentHeight, visibleFrame: screen.visibleFrame,
-                                 currentFrame: panel.isVisible ? panel.frame : nil)
+                                 currentFrame: panel.isVisible ? panel.frame : nil, preferredSize: preferredSize)
         guard panel.frame != frame else { return }
         panel.setFrame(frame, display: panel.isVisible)
     }
