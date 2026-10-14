@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 enum AgentInboxPresentation: Equatable {
@@ -7,6 +8,24 @@ enum AgentInboxPresentation: Equatable {
     case needsResponse
 
     var requestsKeyboardFocus: Bool { self == .userRequested }
+
+    /// Hides an automatic notification only after every reason to keep reading is cleared.
+    ///
+    /// Args:
+    ///   items: Complete current queue after a store mutation has finished.
+    ///   storageError: Whether the queue still displays a persistence warning.
+    ///   isOpening: Whether native navigation is in progress.
+    ///   hasOpenFailure: Whether the user needs to see a navigation error.
+    ///
+    /// Returns:
+    ///   True for a quiet automatic panel; manually opened panels always stay visible.
+    func shouldHideWhenQuiet(
+        items: [AgentInboxItem], storageError: Bool = false,
+        isOpening: Bool = false, hasOpenFailure: Bool = false
+    ) -> Bool {
+        self != .userRequested && !storageError && !isOpening && !hasOpenFailure
+            && !items.contains(where: \.needsAttention)
+    }
 }
 
 /// Shared sizing configuration for the native panel and its measured SwiftUI content.
@@ -94,6 +113,8 @@ final class AgentInboxPanelController {
     private var panel: AgentInboxPanel?
     private var model: AgentInboxViewModel?
     private var contentHeight: CGFloat?
+    private var storeObserver: AnyCancellable?
+    private var navigationObserver: AnyCancellable?
     private(set) var presentation: AgentInboxPresentation?
 
     /// Creates a persistent queue without a window, timers, or global interaction observers.
@@ -138,7 +159,7 @@ final class AgentInboxPanelController {
         present(.needsResponse)
     }
 
-    /// Hides the queue only on explicit dismissal; stored native state is unchanged.
+    /// Hides the queue without modifying stored native state or pending requests.
     func close() {
         presentation = nil
         model?.resetPresentation()
@@ -147,6 +168,8 @@ final class AgentInboxPanelController {
 
     /// Releases the panel during application shutdown without consuming messages.
     func stop() {
+        storeObserver = nil
+        navigationObserver = nil
         close()
         panel?.contentView = nil
         panel = nil
@@ -154,12 +177,13 @@ final class AgentInboxPanelController {
         contentHeight = nil
     }
 
-    /// Presents the queue until the user explicitly closes it, including while all agents work.
+    /// Presents attention updates automatically, or keeps a manually opened queue visible.
     ///
     /// Args:
     ///   reason: Only a manual reveal may request keyboard focus.
     private func present(_ reason: AgentInboxPresentation) {
         if presentation != .userRequested { presentation = reason }
+        observeStoreIfNeeded()
         if let presentOverride {
             presentOverride(reason)
             return
@@ -199,6 +223,9 @@ final class AgentInboxPanelController {
         panel.isReleasedWhenClosed = false
         self.model = model
         self.panel = panel
+        navigationObserver = model.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reconcileVisibility() }
         contentHeight = layout.contentHeight(itemIDs: store.items.map(\.id), measurements: [:])
         panel.contentView = NSHostingView(rootView: AgentInboxView(
             store: store, model: model, layout: layout,
@@ -209,6 +236,29 @@ final class AgentInboxPanelController {
                 self.resizeToContent()
             }
         ))
+    }
+
+    /// Observes completed queue mutations without polling or reintroducing dismissal timers.
+    private func observeStoreIfNeeded() {
+        guard storeObserver == nil else { return }
+        storeObserver = storeProvider().objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reconcileVisibility() }
+    }
+
+    /// Reconciles the latest state after remove/append notifications settle on the main queue.
+    ///
+    /// Returns:
+    ///   Nothing. Quiet automatic presentations close without consuming or deleting any row.
+    private func reconcileVisibility() {
+        guard let presentation else { return }
+        let store = storeProvider()
+        if presentation.shouldHideWhenQuiet(
+            items: store.items, storageError: store.storageError,
+            isOpening: model?.openingID != nil, hasOpenFailure: model?.failure != nil
+        ) {
+            close()
+        }
     }
 
     /// Applies measured height without activating, reordering, or revealing a hidden panel.

@@ -101,8 +101,9 @@ final class AgentInboxUITests: XCTestCase {
     func testCompletionPresentationDoesNotRequestFocus() {
         var reasons: [AgentInboxPresentation] = []
         var dismissed = 0
+        let store = AgentInboxStore()
         let controller = AgentInboxPanelController(
-            storeProvider: { fatalError("Window-free tests must not load the live store") },
+            storeProvider: { store },
             present: { reasons.append($0) }, dismiss: { dismissed += 1 }
         )
         for status in [AgentInboxStatus.running, .waiting, .idle, .interrupted, .failed, .unknown] {
@@ -174,9 +175,37 @@ final class AgentInboxUITests: XCTestCase {
         XCTAssertNil(model.failure)
     }
 
-    /// Automatic notifications remain presented when attention is cleared or the queue becomes empty.
+    /// Quiet automatic panels hide without clearing workers, and fresh attention can reveal them again.
     @MainActor
-    func testAutomaticPresentationPersistsUntilExplicitClose() async {
+    func testAutomaticPresentationHidesWhenOnlyBackgroundWorkRemains() async {
+        let store = AgentInboxStore()
+        let completed = fixture(status: .completed)
+        store.apply(.init(session: completed.session, status: .completed, completionID: "unread-turn"))
+        let hidden = expectation(description: "Quiet notification closes")
+        hidden.assertForOverFulfill = true
+        var dismissals = 0
+        let controller = AgentInboxPanelController(
+            storeProvider: { store }, present: { _ in }, dismiss: { dismissals += 1; hidden.fulfill() }
+        )
+        controller.showCompletion(completed)
+        store.apply(.init(session: completed.session, status: .running))
+        await fulfillment(of: [hidden], timeout: 1)
+        XCTAssertNil(controller.presentation)
+        XCTAssertEqual(dismissals, 1)
+        XCTAssertEqual(store.items.count, 1)
+        XCTAssertEqual(store.items.first?.status, .running)
+        let request = AgentInboxRequest(id: "input", kind: .input, text: "请选择")
+        store.apply(.init(session: completed.session, status: .waiting, pendingRequests: [request]))
+        controller.showRequest(fixture(status: .waiting, pending: [request]))
+        await settlePublishedUpdates()
+        XCTAssertEqual(controller.presentation, .needsResponse)
+        XCTAssertEqual(controller.presentation?.requestsKeyboardFocus, false)
+        XCTAssertEqual(dismissals, 1)
+    }
+
+    /// User-opened queues remain visible through later automatic alerts, worker-only and empty states.
+    @MainActor
+    func testManualPresentationStaysVisibleWhenAttentionClears() async {
         let store = AgentInboxStore()
         let completed = fixture(status: .completed)
         store.apply(.init(session: completed.session, status: .completed, completionID: "unread-turn"))
@@ -185,22 +214,68 @@ final class AgentInboxUITests: XCTestCase {
             storeProvider: { store }, present: { _ in }, dismiss: { dismissals += 1 }
         )
         controller.showCompletion(completed)
+        controller.show()
+        controller.showCompletion(completed)
         store.apply(.init(session: completed.session, status: .running))
-        await Task.yield()
-        XCTAssertEqual(controller.presentation, .taskCompleted)
+        await settlePublishedUpdates()
+        XCTAssertEqual(controller.presentation, .userRequested)
         store.dismiss(completed.id)
-        await Task.yield()
-        XCTAssertEqual(controller.presentation, .taskCompleted)
+        await settlePublishedUpdates()
+        XCTAssertEqual(controller.presentation, .userRequested)
         XCTAssertEqual(dismissals, 0)
         controller.close()
-        XCTAssertNil(controller.presentation)
         XCTAssertEqual(dismissals, 1)
-        controller.showRequest(fixture(status: .waiting, pending: [
-            .init(id: "input", kind: .input, text: "请选择")
-        ]))
+    }
+
+    /// Transient remove/append publications cannot hide an automatic queue with remaining requests.
+    @MainActor
+    func testCompletedStoreMutationKeepsPendingAttentionVisible() async {
+        let store = AgentInboxStore()
+        let request = AgentInboxRequest(id: "approval", kind: .approval, text: "请批准")
+        let item = fixture(status: .running, pending: [request])
+        store.apply(.init(session: item.session, status: .running, pendingRequests: [request]))
+        var dismissals = 0
+        let controller = AgentInboxPanelController(
+            storeProvider: { store }, present: { _ in }, dismiss: { dismissals += 1 }
+        )
+        controller.showRequest(item)
+        store.apply(.init(session: item.session, status: .running, pendingRequests: [request], preview: "Updated detail"))
+        store.markRead(item.id)
+        await settlePublishedUpdates()
         XCTAssertEqual(controller.presentation, .needsResponse)
-        XCTAssertEqual(controller.presentation?.requestsKeyboardFocus, false)
-        controller.stop()
+        XCTAssertEqual(dismissals, 0)
+        XCTAssertEqual(store.items.first?.pendingRequests, [request])
+    }
+
+    /// Empty queues and only background work are quiet; requests, unread results and failures are not.
+    func testQuietPolicyPreservesAttentionAndNavigationFeedback() {
+        for reason in [AgentInboxPresentation.taskCompleted, .needsResponse] {
+            XCTAssertTrue(reason.shouldHideWhenQuiet(items: []))
+            for status in [AgentInboxStatus.running, .waiting] {
+                XCTAssertTrue(reason.shouldHideWhenQuiet(items: [fixture(status: status)]))
+            }
+            for status in [AgentInboxStatus.completed, .failed, .interrupted, .unknown, .idle] {
+                XCTAssertFalse(reason.shouldHideWhenQuiet(items: [fixture(status: status)]))
+            }
+            for kind in [AgentInboxRequest.Kind.input, .approval] {
+                var item = fixture(status: .running, pending: [.init(id: "request", kind: kind, text: "Review")])
+                item.isUnread = false
+                XCTAssertFalse(reason.shouldHideWhenQuiet(items: [item]))
+            }
+            XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], storageError: true))
+            XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], isOpening: true))
+            XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], hasOpenFailure: true))
+        }
+        XCTAssertFalse(AgentInboxPresentation.userRequested.shouldHideWhenQuiet(items: []))
+        XCTAssertFalse(AgentInboxPresentation.userRequested.shouldHideWhenQuiet(items: [fixture(status: .running)]))
+    }
+
+    /// Waits for already enqueued main-queue publications without a wall-clock delay or native window.
+    @MainActor
+    private func settlePublishedUpdates() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
     }
 
     /// Sizes one, two, and three messages naturally while excess messages use the same viewport.
