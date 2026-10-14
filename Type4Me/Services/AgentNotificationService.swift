@@ -7,7 +7,7 @@ final class AgentNotificationService {
     private var task: Task<Void, Never>?
     private var generation = UUID()
 
-    /// Restores the inbox and starts independent original-desktop notification streams.
+    /// Starts live desktop observers without restoring messages from a previous app lifetime.
     func start() {
         guard task == nil else { return }
         let token = UUID()
@@ -20,7 +20,6 @@ final class AgentNotificationService {
                 if self?.generation == token { self?.task = nil }
                 return
             }
-            await AgentInboxStore.shared.load()
             guard !Task.isCancelled, self?.generation == token else { return }
             let emit: @Sendable (AgentInboxUpdate) async -> Void = { [weak self] update in
                 guard !Task.isCancelled else { return }

@@ -13,17 +13,17 @@ enum AgentInboxPresentation: Equatable {
     ///
     /// Args:
     ///   items: Complete current queue after a store mutation has finished.
-    ///   storageError: Whether the queue still displays a persistence warning.
+    ///   configurationError: Whether invalid configuration prevents live monitoring.
     ///   isOpening: Whether native navigation is in progress.
     ///   hasOpenFailure: Whether the user needs to see a navigation error.
     ///
     /// Returns:
     ///   True for a quiet automatic panel; manually opened panels always stay visible.
     func shouldHideWhenQuiet(
-        items: [AgentInboxItem], storageError: Bool = false,
+        items: [AgentInboxItem], configurationError: Bool = false,
         isOpening: Bool = false, hasOpenFailure: Bool = false
     ) -> Bool {
-        self != .userRequested && !storageError && !isOpening && !hasOpenFailure
+        self != .userRequested && !configurationError && !isOpening && !hasOpenFailure
             && !items.contains(where: \.needsAttention)
     }
 }
@@ -363,10 +363,7 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
     private func createPanel() {
         let store = storeProvider()
         let model = AgentInboxViewModel(markRead: { [weak store] selected in
-            // Opening can overlap a fresh update; acknowledge only the snapshot that was selected.
-            guard store?.items.first(where: { $0.id == selected.id }) == selected else { return }
-            store?.markRead(selected.id)
-            // Native viewing evidence, not URL acceptance, removes completed messages.
+            store?.acknowledgeOpened(selected)
         })
         let panel = AgentInboxPanel(
             contentRect: .zero,
@@ -469,7 +466,7 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
         guard let presentation else { return }
         let store = storeProvider()
         if presentation.shouldHideWhenQuiet(
-            items: store.items, storageError: store.storageError,
+            items: store.items, configurationError: store.configurationError,
             isOpening: model?.openingID != nil, hasOpenFailure: model?.failure != nil
         ) {
             close()

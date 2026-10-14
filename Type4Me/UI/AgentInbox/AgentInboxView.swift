@@ -17,8 +17,8 @@ struct AgentInboxView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header.measuringInboxHeight(.header)
-            if store.storageError {
-                Text(copy(.storageFailed))
+            if store.configurationError {
+                Text(copy(.monitoringUnavailable))
                     .font(.system(size: 12)).foregroundStyle(TF.settingsAccentAmber)
                     .padding(.horizontal, TF.spacingLG).padding(.bottom, TF.spacingMD)
                     .fixedSize(horizontal: false, vertical: true)

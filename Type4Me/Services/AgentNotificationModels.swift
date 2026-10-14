@@ -74,7 +74,6 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
     var claudeReconcileIntervalSeconds: Double = 2
     var codexReadReconcileIntervalSeconds: Double = 2
     var maximumCodexReadRefreshes = 4
-    var persistenceDebounceSeconds: Double = 0.25
     var completionAlertDelaySeconds: Double = 2.5
     var viewingPollSeconds: Double = 0.25
     var viewingStableSeconds: Double = 1
@@ -96,7 +95,6 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
     var maximumInboxItems = 256
     var maximumPendingRequests = 20
     var maximumCompletionReceipts = 4_096
-    var maximumStoreBytes = 8_388_608
 
     /// Reads packaged limits, retaining defaults for an unpackaged development build.
     ///
@@ -125,7 +123,7 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
     ///   CocoaError: At least one configured bound is invalid.
     func validate() throws {
         let intervals = [discoveryIntervalSeconds, reconnectDelaySeconds, ioTimeoutSeconds,
-                         socketPollSeconds, claudeReconcileIntervalSeconds, persistenceDebounceSeconds,
+                         socketPollSeconds, claudeReconcileIntervalSeconds,
                          viewingPollSeconds, viewingStableSeconds, viewingEvidenceMaxAgeSeconds]
         guard intervals.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 300 }),
               discoveryIntervalSeconds >= 5, reconnectDelaySeconds >= 1,
@@ -148,8 +146,7 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
               (1_024...262_144).contains(maximumRegistryFileBytes),
               (1_024...8_388_608).contains(maximumTranscriptTailBytes),
               (1...512).contains(maximumInboxItems), (1...32).contains(maximumPendingRequests),
-              (1...8_192).contains(maximumCompletionReceipts),
-              (1_024...16_777_216).contains(maximumStoreBytes) else {
+              (1...8_192).contains(maximumCompletionReceipts) else {
             throw CocoaError(.propertyListReadCorrupt)
         }
     }

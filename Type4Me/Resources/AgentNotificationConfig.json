@@ -17,8 +17,6 @@
   "maximumInboxItems": 256,
   "maximumPendingRequests": 20,
   "maximumCompletionReceipts": 4096,
-  "maximumStoreBytes": 8388608,
-  "persistenceDebounceSeconds": 0.25,
   "maximumSubscriptionAttempts": 3,
   "codexSigningTeamIdentifier": "2DC432GLL2",
   "completionAlertDelaySeconds": 2.5,

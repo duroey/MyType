@@ -1,77 +1,39 @@
 import Combine
-import Darwin
 import Foundation
 
-/// A small persistent inbox; it never schedules or executes an agent task.
+/// A process-local inbox; it never restores history, schedules, or executes agent tasks.
 @MainActor
 final class AgentInboxStore: ObservableObject {
     private enum OrderingGroup: Int { case attention, active, history }
 
     static let shared: AgentInboxStore = {
         do {
-            return AgentInboxStore(fileURL: AppIdentity.appSupportDirectory()
-                .appendingPathComponent("agent-inbox", isDirectory: true).appendingPathComponent("state-v1.json"),
-                configuration: try .bundled())
+            return AgentInboxStore(configuration: try .bundled())
         } catch {
-            NSLog("[AgentInbox] Notification configuration is invalid; persistent inbox is disabled.")
+            NSLog("[AgentInbox] Notification configuration is invalid; monitoring is unavailable.")
             let store = AgentInboxStore()
-            store.storageError = true
+            store.configurationError = true
             return store
         }
     }()
 
     @Published private(set) var items: [AgentInboxItem] = []
-    @Published private(set) var storageError = false
+    @Published private(set) var configurationError = false
     var onCompletion: ((AgentInboxItem) -> Void)?
     var onRequest: ((AgentInboxItem) -> Void)?
 
     private let configuration: AgentNotificationConfiguration
-    private let persistence: AgentInboxPersistence?
     private var receipts: [String] = []
     private var dismissed: [String: AgentInboxItem] = [:]
     private var lastObserved: [String: Date] = [:]
-    private var writeTask: Task<Void, Never>?
-    private var persistenceBlocked = false
     private var completionAlerts: [String: (token: UUID, task: Task<Void, Never>)] = [:]
 
-    /// Creates an isolated inbox or uses the supplied private persistent file.
+    /// Creates an empty, memory-only inbox for this application lifetime.
     ///
     /// Args:
-    ///   fileURL: nil selects memory-only storage, useful for tests and previews.
-    ///   configuration: Bounds for retained visible messages and completion receipts.
-    init(fileURL: URL? = nil, configuration: AgentNotificationConfiguration = .init()) {
+    ///   configuration: Bounds for visible messages and in-memory completion receipts.
+    init(configuration: AgentNotificationConfiguration = .init()) {
         self.configuration = configuration
-        persistence = fileURL.map { AgentInboxPersistence(url: $0, maximumBytes: configuration.maximumStoreBytes) }
-    }
-
-    /// Restores messages quietly; persisted runtime states are unknown until revalidated.
-    ///
-    /// Existing unrecognized/corrupt files are preserved rather than overwritten.
-    func load() async {
-        guard let persistence else { return }
-        do {
-            guard let snapshot = try await persistence.read() else { return }
-            guard snapshot.version == AgentInboxSnapshot.currentVersion,
-                  snapshot.items.count <= configuration.maximumInboxItems,
-                  Set(snapshot.items.map(\.id)).count == snapshot.items.count,
-                  snapshot.dismissed.count <= configuration.maximumInboxItems,
-                  snapshot.receipts.count <= configuration.maximumCompletionReceipts else {
-                throw CocoaError(.propertyListReadCorrupt)
-            }
-            items = snapshot.items.map { item in
-                var copy = bounded(item)
-                copy.status = .unknown
-                return copy
-            }
-            sortItems()
-            // A hidden row stays hidden across a restart until new work is observed.
-            dismissed = Dictionary(snapshot.dismissed.map { ($0.id, bounded($0)) }, uniquingKeysWith: { _, last in last })
-            receipts = snapshot.receipts
-            storageError = false
-        } catch {
-            persistenceBlocked = true
-            storageError = true
-        }
     }
 
     /// Merges a native observation and pops only a newly verified successful completion.
@@ -88,14 +50,38 @@ final class AgentInboxStore: ObservableObject {
             return
         }
         let pending = update.pendingRequests ?? old?.pendingRequests ?? []
-        if update.status != .completed || !pending.isEmpty { cancelCompletionAlert(update.session.id) }
-        // A quiet idle baseline after reconnecting is not new work for a consumed completion.
-        if hidden?.status == .completed, update.status == .idle, pending.isEmpty {
+        if update.status == .idle, pending.isEmpty {
+            // A completion is a notification, not the agent's availability. Keep it unread
+            // until viewed, but never retain an idle worker as a queue entry.
+            if previous?.status == .completed, previous?.isUnread == true,
+               previous?.pendingRequests.isEmpty == true,
+               update.nativeHasUnreadTurn != false {
+                lastObserved[update.session.id] = update.observedAt
+                return
+            }
+            cancelCompletionAlert(update.session.id)
+            if let previous {
+                var idle = previous
+                idle.status = .idle
+                idle.pendingRequests = []
+                idle.isUnread = false
+                dismissed[idle.id] = idle
+                items.removeAll { $0.id == idle.id }
+            }
+            lastObserved[update.session.id] = update.observedAt
+            trimBookkeeping()
+            return
+        }
+        // Losing the connection cannot turn a known unread result into a roster status.
+        if update.status == .unknown, previous?.status == .completed,
+           previous?.isUnread == true, previous?.pendingRequests.isEmpty == true, pending.isEmpty {
             lastObserved[update.session.id] = update.observedAt
             return
         }
+        let status: AgentInboxStatus = update.status == .idle ? .waiting : update.status
+        if status != .completed || !pending.isEmpty { cancelCompletionAlert(update.session.id) }
         let preview = update.preview.isEmpty ? old?.preview ?? "" : update.preview
-        var next = bounded(AgentInboxItem(session: update.session, status: update.status,
+        var next = bounded(AgentInboxItem(session: update.session, status: status,
                                          pendingRequests: pending, preview: preview,
                                          updatedAt: update.observedAt, isUnread: old?.isUnread ?? false))
         let receipt = update.completionID.map { update.session.id + "|" + $0 }
@@ -122,7 +108,7 @@ final class AgentInboxStore: ObservableObject {
             return
         }
         // Quiet terminal baselines are history, not new inbox messages.
-        if old == nil, !newCompletion, pending.isEmpty,
+        if previous == nil, !newCompletion, pending.isEmpty,
            [.idle, .completed, .interrupted, .failed, .unknown].contains(update.status) { return }
         if previous == next, !newCompletion, update.nativeHasUnreadTurn != false {
             lastObserved[next.id] = update.observedAt
@@ -135,7 +121,6 @@ final class AgentInboxStore: ObservableObject {
         sortItems()
         items = Array(items.prefix(configuration.maximumInboxItems))
         trimBookkeeping()
-        persist()
         // Native read state consumes only this observed result, never an unanswered request.
         if update.nativeHasUnreadTurn == false, next.status == .completed, next.pendingRequests.isEmpty {
             dismiss(next.id)
@@ -205,7 +190,19 @@ final class AgentInboxStore: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].isUnread else { return }
         items[index].isUnread = false
         sortItems()
-        persist()
+    }
+
+    /// Consumes the opened notification without clearing newer work or unresolved requests.
+    ///
+    /// Args:
+    ///   selected: Exact row snapshot whose native conversation was successfully opened.
+    func acknowledgeOpened(_ selected: AgentInboxItem) {
+        guard items.first(where: { $0.id == selected.id }) == selected else { return }
+        if selected.pendingRequests.isEmpty, selected.status == .completed || selected.status == .idle {
+            dismiss(selected.id)
+        } else {
+            markRead(selected.id)
+        }
     }
 
     /// Hides one local row; fresh native activity can bring it back.
@@ -217,13 +214,9 @@ final class AgentInboxStore: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         dismissed[id] = items.remove(at: index)
         trimBookkeeping()
-        persist()
     }
 
-    /// Waits for queued persistence, allowing deterministic shutdown and tests.
-    func flush() async { await writeTask?.value }
-
-    /// Bounds persisted visible data while retaining the exact navigation identity.
+    /// Bounds retained visible data while keeping the exact navigation identity.
     ///
     /// Args:
     ///   item: Proposed inbox row.
@@ -316,91 +309,4 @@ final class AgentInboxStore: ObservableObject {
         for id in Array(completionAlerts.keys) where !visible.contains(id) { cancelCompletionAlert(id) }
     }
 
-    /// Serializes writes off the main actor and preserves unsupported existing files.
-    private func persist() {
-        guard let persistence, !persistenceBlocked else { return }
-        let snapshot = AgentInboxSnapshot(items: items, dismissed: Array(dismissed.values), receipts: receipts)
-        writeTask?.cancel()
-        let delay = configuration.persistenceDebounceSeconds
-        writeTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(delay))
-                try Task.checkCancellation()
-                try await persistence.write(snapshot)
-                self?.storageError = false
-            } catch is CancellationError {
-                // Superseded observations are coalesced into the newest pending snapshot.
-            } catch {
-                self?.storageError = true
-            }
-        }
-    }
-}
-
-private struct AgentInboxSnapshot: Codable, Sendable {
-    static let currentVersion = 1
-    var version = currentVersion
-    var items: [AgentInboxItem]
-    var dismissed: [AgentInboxItem]
-    var receipts: [String]
-}
-
-/// Serial, bounded file access; snapshots contain visible excerpts, never raw tool state.
-private actor AgentInboxPersistence {
-    let url: URL
-    let maximumBytes: Int
-
-    /// Creates a writer without touching the filesystem.
-    ///
-    /// Args:
-    ///   url: Private snapshot file inside the application's profile.
-    ///   maximumBytes: Maximum encoded or decoded bytes.
-    init(url: URL, maximumBytes: Int) { self.url = url; self.maximumBytes = maximumBytes }
-
-    /// Reads one bounded regular file without following a substituted symlink.
-    ///
-    /// Returns:
-    ///   Saved content, or nil if no inbox has been saved yet.
-    ///
-    /// Raises:
-    ///   Error: Unsafe file identity, invalid JSON, or exceeded size bound.
-    func read() throws -> AgentInboxSnapshot? {
-        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        if fd < 0, errno == ENOENT { return nil }
-        guard fd >= 0 else { throw CocoaError(.fileReadNoPermission) }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        defer { try? handle.close() }
-        var info = stat()
-        guard fstat(fd, &info) == 0, info.st_uid == getuid(), info.st_mode & S_IFMT == S_IFREG,
-              info.st_size <= maximumBytes else { throw CocoaError(.fileReadCorruptFile) }
-        let data = try handle.read(upToCount: maximumBytes + 1) ?? Data()
-        guard data.count <= maximumBytes else { throw CocoaError(.fileReadTooLarge) }
-        return try JSONDecoder().decode(AgentInboxSnapshot.self, from: data)
-    }
-
-    /// Atomically installs a private snapshot using an exclusively created 0600 file.
-    ///
-    /// Args:
-    ///   snapshot: Bounded semantic inbox state.
-    ///
-    /// Raises:
-    ///   Error: Encoding, permission, write, or rename failure.
-    func write(_ snapshot: AgentInboxSnapshot) throws {
-        let data = try JSONEncoder().encode(snapshot)
-        guard data.count <= maximumBytes else { throw CocoaError(.fileWriteOutOfSpace) }
-        let parent = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        guard AgentHandoffDeliveryService.isOwnedItem(parent, kind: S_IFDIR, privatePermissions: false) else {
-            throw CocoaError(.fileWriteNoPermission)
-        }
-        let temporary = parent.appendingPathComponent(".inbox-\(UUID().uuidString).tmp")
-        let fd = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
-        guard fd >= 0 else { throw CocoaError(.fileWriteNoPermission) }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        defer { try? handle.close(); try? FileManager.default.removeItem(at: temporary) }
-        try handle.write(contentsOf: data)
-        try handle.synchronize()
-        guard Darwin.rename(temporary.path, url.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
-    }
 }

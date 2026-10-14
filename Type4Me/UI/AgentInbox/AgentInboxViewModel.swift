@@ -4,7 +4,7 @@ import Combine
 enum AgentInboxCopy {
     enum Label: CaseIterable {
         case title, close, emptyTitle, emptyDetail, unread, open, opening
-        case openFailed, cannotOpen, storageFailed, dismiss, dismissHint, showInbox, entryDetail
+        case openFailed, cannotOpen, monitoringUnavailable, dismiss, dismissHint, showInbox, entryDetail
         case running, waiting, idle, completed, interrupted, failed, unknown, input, approval
     }
 
@@ -30,7 +30,7 @@ enum AgentInboxCopy {
         case .opening: values = ("正在打开会话…", "Opening conversation…")
         case .openFailed: values = ("会话未能打开，请检查对应应用后重试。", "Could not open this conversation. Check its app and try again.")
         case .cannotOpen: values = ("暂时无法定位原会话，请到对应应用查看。", "This conversation cannot be opened directly yet. Check its app.")
-        case .storageFailed: values = ("消息记录暂未保存，重启后可能无法保留。", "Updates could not be saved and may not survive a restart.")
+        case .monitoringUnavailable: values = ("消息监听暂不可用，请检查应用配置。", "Live updates are unavailable. Check the app configuration.")
         case .dismiss: values = ("从队列移除", "Remove from inbox")
         case .dismissHint: values = ("仅隐藏这条消息，不会结束会话或批准操作。", "Hides this update without stopping the conversation or approving anything.")
         case .running: values = ("正在运行", "Working")
@@ -150,7 +150,7 @@ final class AgentInboxViewModel: ObservableObject {
     /// Invalidates pending presentation callbacks when the panel is explicitly closed.
     ///
     /// Returns:
-    ///   Nothing. Native sessions and persisted queue items remain unchanged.
+    ///   Nothing. Native sessions and in-memory queue items remain unchanged.
     func resetPresentation() {
         generation &+= 1
         openingID = nil

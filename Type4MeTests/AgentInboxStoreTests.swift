@@ -29,6 +29,59 @@ final class AgentInboxStoreTests: XCTestCase {
             transcriptPath: "/private/history.jsonl")
     }
 
+    /// Idle baselines and workers returning to idle do not leave roster entries behind.
+    func testIdleWithoutRequestsNeverRemainsInInbox() {
+        let store = immediateStore()
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        XCTAssertTrue(store.items.isEmpty)
+        store.apply(.init(session: session(), status: .running, pendingRequests: []))
+        XCTAssertEqual(store.items.count, 1)
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        XCTAssertTrue(store.items.isEmpty)
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        XCTAssertTrue(store.items.isEmpty)
+        store.apply(.init(session: session(), status: .running, pendingRequests: []))
+        XCTAssertEqual(store.items.count, 1)
+    }
+
+    /// Runtime idle cannot erase or relabel an unread, independently verified completion.
+    func testIdlePreservesCompletedNotificationUntilItIsRead() {
+        let store = immediateStore()
+        store.apply(.init(session: session(), status: .completed, completionID: "turn"))
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        XCTAssertEqual(store.items.first?.status, .completed)
+        XCTAssertEqual(store.items.first?.isUnread, true)
+        store.markRead(session().id)
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        XCTAssertTrue(store.items.isEmpty)
+    }
+
+    /// Pending requests take priority over idle, and clear only after authoritative resolution.
+    func testIdleDoesNotRemoveUnansweredRequests() {
+        let store = immediateStore()
+        let request = AgentInboxRequest(id: "approval", kind: .approval, text: "Approve?")
+        store.apply(.init(session: session(), status: .idle, pendingRequests: [request]))
+        XCTAssertEqual(store.items.first?.status, .waiting)
+        XCTAssertEqual(store.items.first?.pendingRequests, [request])
+        store.apply(.init(session: session(), status: .idle))
+        XCTAssertEqual(store.items.first?.pendingRequests, [request])
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        XCTAssertTrue(store.items.isEmpty)
+    }
+
+    /// A completed turn containing a question is not a completion notification to preserve.
+    func testResolvedQuestionDoesNotSurviveAnIdleOrUnknownUpdate() {
+        for status in [AgentInboxStatus.idle, .unknown] {
+            let store = immediateStore()
+            let request = AgentInboxRequest(id: "question", kind: .input, text: "Choose one")
+            store.apply(.init(session: session(), status: .completed, pendingRequests: [request],
+                              completionID: "question-turn"))
+            store.apply(.init(session: session(), status: status, pendingRequests: []))
+            XCTAssertFalse(store.items.contains { !$0.pendingRequests.isEmpty })
+            if status == .idle { XCTAssertTrue(store.items.isEmpty) }
+        }
+    }
+
     /// Verifies history snapshots and failed/interrupted turns never produce completion popups.
     func testOnlyFreshSuccessfulCompletionPopsOnce() {
         let store = immediateStore()
@@ -308,50 +361,80 @@ final class AgentInboxStoreTests: XCTestCase {
         XCTAssertEqual(store.items.first?.updatedAt, date.addingTimeInterval(5))
     }
 
-    /// Verifies restart deduplication and private storage retain only bounded visible excerpts.
-    ///
-    /// Raises:
-    ///   Error: The isolated temporary snapshot could not be read or removed.
-    func testPersistenceIsPrivateAndCompletionDoesNotReplay() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appendingPathComponent("inbox.json")
-        let store = AgentInboxStore(fileURL: file)
-        store.apply(.init(session: session(), status: .completed, preview: "visible answer", completionID: "turn-1"))
-        await store.flush()
-        XCTAssertFalse(store.storageError)
-        let mode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
-        XCTAssertEqual(mode, 0o600)
-        let encoded = try String(contentsOf: file, encoding: .utf8)
-        XCTAssertFalse(encoded.contains("private search context"))
-        XCTAssertFalse(encoded.contains("/private/history"))
-        let restored = AgentInboxStore(fileURL: file)
-        await restored.load()
-        XCTAssertEqual(restored.items.first?.status, .unknown)
+    /// A new app lifetime has no old messages, but immediately accepts live work and requests.
+    func testNewInboxStartsEmptyAndAcceptsCurrentActivity() {
+        let previous = immediateStore()
+        previous.apply(.init(session: session(), status: .completed, completionID: "old-turn"))
+        previous.dismiss(session().id)
+        let store = immediateStore()
+        XCTAssertTrue(store.items.isEmpty)
         var popups = 0
-        restored.onCompletion = { _ in popups += 1 }
-        restored.apply(.init(session: session(), status: .completed, completionID: "turn-1"))
+        store.onCompletion = { _ in popups += 1 }
+        store.apply(.init(session: session(), status: .completed, preview: "Historical answer"))
+        store.apply(.init(session: session(id: "idle"), status: .idle))
+        XCTAssertTrue(store.items.isEmpty)
+        store.apply(.init(session: session(), status: .running))
+        let request = AgentInboxRequest(id: "current-question", kind: .input, text: "Choose one")
+        store.apply(.init(session: session(.claudeCode), status: .waiting, pendingRequests: [request]))
+        XCTAssertEqual(store.items.count, 2)
         XCTAssertEqual(popups, 0)
-        await restored.flush()
+        store.apply(.init(session: session(), status: .completed, completionID: "new-turn"))
+        XCTAssertEqual(popups, 1)
     }
 
-    /// Verifies future formats are preserved on disk while the inbox remains usable in memory.
-    ///
-    /// Raises:
-    ///   Error: The isolated unsupported file could not be created or checked.
-    func testUnsupportedStoreIsNotOverwritten() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appendingPathComponent("inbox.json")
-        let original = Data("{\"version\":99,\"items\":[],\"dismissed\":[],\"receipts\":[]}".utf8)
-        try original.write(to: file)
-        let store = AgentInboxStore(fileURL: file)
-        await store.load()
+    /// Opening a result consumes only that row and quiet refreshes cannot bring it back.
+    func testOpeningCompletionRemovesItUntilNewWorkArrives() throws {
+        let store = immediateStore()
+        let other = session(.claudeCode)
+        store.apply(.init(session: other, status: .running))
+        store.apply(.init(session: session(), status: .completed, completionID: "turn"))
+        let selected = try XCTUnwrap(store.items.first(where: { $0.id == session().id }))
+        store.acknowledgeOpened(selected)
+        XCTAssertEqual(store.items.map(\.id), [other.id])
+        store.apply(.init(session: session(), status: .idle, pendingRequests: []))
+        store.apply(.init(session: session(), status: .completed, preview: "Refreshed old answer"))
+        store.apply(.init(session: session(), status: .completed, completionID: "turn"))
+        XCTAssertEqual(store.items.map(\.id), [other.id])
         store.apply(.init(session: session(), status: .running))
-        await store.flush()
-        XCTAssertTrue(store.storageError)
-        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertEqual(store.items.count, 2)
+    }
+
+    /// Opening current work does not resolve a question or an approval on the user's behalf.
+    func testOpeningKeepsActiveWorkAndOutstandingRequests() throws {
+        for status in [AgentInboxStatus.running, .waiting, .completed, .idle] {
+            let store = immediateStore()
+            let requests: [AgentInboxRequest] = status == .running ? [] : [
+                .init(id: "approval", kind: .approval, text: "Approve?")
+            ]
+            store.apply(.init(session: session(), status: status, pendingRequests: requests))
+            let selected = try XCTUnwrap(store.items.first)
+            store.acknowledgeOpened(selected)
+            XCTAssertEqual(store.items.count, 1)
+            XCTAssertEqual(store.items.first?.pendingRequests, requests)
+            XCTAssertEqual(store.items.first?.isUnread, false)
+        }
+    }
+
+    /// A later update during native navigation cannot be consumed by the earlier click.
+    func testOpeningOldSnapshotPreservesNewerWork() throws {
+        let store = immediateStore()
+        store.apply(.init(session: session(), status: .completed, completionID: "first"))
+        let selected = try XCTUnwrap(store.items.first)
+        store.apply(.init(session: session(), status: .completed, completionID: "second"))
+        let newer = store.items.first
+        store.acknowledgeOpened(selected)
+        XCTAssertEqual(store.items.first, newer)
+        XCTAssertEqual(store.items.first?.isUnread, true)
+    }
+
+    /// In-memory rows retain only the metadata needed to navigate and display a bounded preview.
+    func testInMemoryRowsDoNotKeepSearchContextOrTranscriptPaths() throws {
+        let store = immediateStore()
+        store.apply(.init(session: session(), status: .running))
+        let item = try XCTUnwrap(store.items.first)
+        XCTAssertNil(item.session.workspacePath)
+        XCTAssertNil(item.session.transcriptPath)
+        XCTAssertTrue(item.session.matchTexts.isEmpty)
     }
 
     /// Verifies default safety bounds are valid and invalid loops are rejected.

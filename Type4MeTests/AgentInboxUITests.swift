@@ -136,7 +136,7 @@ final class AgentInboxUITests: XCTestCase {
         let controller = AgentInboxPanelController(
             storeProvider: { store }, present: { _ in isPresented = true }, dismiss: { isPresented = false }
         )
-        let model = AgentInboxViewModel(opener: { _ in }, markRead: { store.markRead($0.id) })
+        let model = AgentInboxViewModel(opener: { _ in }, markRead: { store.acknowledgeOpened($0) })
         controller.show()
         await model.open(selected)
         XCTAssertTrue(isPresented)
@@ -262,7 +262,7 @@ final class AgentInboxUITests: XCTestCase {
                 item.isUnread = false
                 XCTAssertFalse(reason.shouldHideWhenQuiet(items: [item]))
             }
-            XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], storageError: true))
+            XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], configurationError: true))
             XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], isOpening: true))
             XCTAssertFalse(reason.shouldHideWhenQuiet(items: [], hasOpenFailure: true))
         }
