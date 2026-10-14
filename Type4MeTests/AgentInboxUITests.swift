@@ -307,11 +307,6 @@ final class AgentInboxUITests: XCTestCase {
         XCTAssertEqual(layout.contentHeight(itemIDs: ["a"], measurements: english)
                        - layout.contentHeight(itemIDs: ["a"], measurements: chinese), 75)
         XCTAssertEqual(layout.contentHeight(itemIDs: ["a"], measurements: chinese), 190 + layout.listBottomInset)
-        for language in [AppLanguage.zh, .en, .zh] {
-            XCTAssertEqual(AgentInboxCopy.text(.subtitle, language: language), language == .zh
-                           ? "需要你看的在上，正在工作的在下。"
-                           : "Updates needing attention come first, followed by ongoing work.")
-        }
     }
 
     /// Resizing holds the top-right anchor and stays within even a smaller secondary display.

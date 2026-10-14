@@ -63,20 +63,17 @@ struct AgentInboxView: View {
 
     private var header: some View {
         HStack(alignment: .top, spacing: TF.spacingMD) {
-            VStack(alignment: .leading, spacing: TF.spacingXS) {
-                HStack(spacing: TF.spacingSM) {
-                    Text(copy(.title)).font(.system(size: 19, weight: .semibold))
-                    let unreadCount = store.items.filter(\.isUnread).count
-                    if unreadCount > 0 {
-                        Text(String(unreadCount))
-                            .font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                            .foregroundStyle(TF.settingsTextSecondary)
-                            .padding(.horizontal, TF.spacingSM).padding(.vertical, TF.spacingXS)
-                            .background(TF.settingsCardAlt, in: Capsule())
-                            .accessibilityLabel("\(copy(.unread)): \(unreadCount)")
-                    }
+            HStack(spacing: TF.spacingSM) {
+                Text(copy(.title)).font(.system(size: 19, weight: .semibold))
+                let unreadCount = store.items.filter(\.isUnread).count
+                if unreadCount > 0 {
+                    Text(String(unreadCount))
+                        .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .padding(.horizontal, TF.spacingSM).padding(.vertical, TF.spacingXS)
+                        .background(TF.settingsCardAlt, in: Capsule())
+                        .accessibilityLabel("\(copy(.unread)): \(unreadCount)")
                 }
-                Text(copy(.subtitle)).font(.system(size: 12)).foregroundStyle(TF.settingsTextSecondary)
             }
             Spacer(minLength: 0)
             Button(action: onClose) {

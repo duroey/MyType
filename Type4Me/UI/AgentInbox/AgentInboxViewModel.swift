@@ -3,7 +3,7 @@ import Combine
 
 enum AgentInboxCopy {
     enum Label: CaseIterable {
-        case title, subtitle, close, emptyTitle, emptyDetail, unread, open, opening
+        case title, close, emptyTitle, emptyDetail, unread, open, opening
         case openFailed, cannotOpen, storageFailed, dismiss, dismissHint, showInbox, entryDetail
         case running, waiting, idle, completed, interrupted, failed, unknown, input, approval
     }
@@ -20,7 +20,6 @@ enum AgentInboxCopy {
         let values: (String, String)
         switch label {
         case .title: values = ("Agent 消息", "Agent inbox")
-        case .subtitle: values = ("需要你看的在上，正在工作的在下。", "Updates needing attention come first, followed by ongoing work.")
         case .showInbox: values = ("打开消息队列", "Open agent inbox")
         case .entryDetail: values = ("查看 Agent 进度、完成消息和待办请求", "View agent progress, results, and requests")
         case .close: values = ("收起消息队列", "Hide inbox")
