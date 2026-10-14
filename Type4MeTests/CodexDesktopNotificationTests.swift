@@ -315,8 +315,8 @@ final class CodexDesktopNotificationTests: XCTestCase {
         }
     }
 
-    /// An asynchronous question remains outstanding after its turn completes or another assistant turn starts.
-    func testAsyncQuestionSurvivesCompletionUntilLaterUserInput() throws {
+    /// An asynchronous question survives completion and ordinary chat until an explicit answer arrives.
+    func testAsyncQuestionSurvivesCompletionAndOrdinaryChat() throws {
         var reducer = CodexInboxStateReducer()
         let question: [String: Any] = ["type": "agentMessage", "id": "question-1", "text": "Which language?",
                                        "delivery": "async", "phase": "final_answer",
@@ -326,7 +326,7 @@ final class CodexDesktopNotificationTests: XCTestCase {
             ["op": "replace", "path": ["turns", 0, "status"], "value": "completed"],
         ]), ownerID: ownerID, session: session())
         XCTAssertEqual(completed.status, .completed)
-        XCTAssertEqual(completed.pendingRequests?.map(\.id), ["async:question-1"])
+        XCTAssertEqual(completed.pendingRequests?.map(\.id), ["async:question-1:0"])
         XCTAssertEqual(completed.completionID, "turn-1")
         let nextTurn = turn(id: "turn-2", status: "inProgress", time: 2, items: [])
         let assistantOnly = try reducer.accept(packet: patches(base: 2, next: 3, values: [
@@ -336,7 +336,193 @@ final class CodexDesktopNotificationTests: XCTestCase {
         let replied = try reducer.accept(packet: patches(base: 3, next: 4, values: [
             ["op": "add", "path": ["turns", 1, "items", 0], "value": ["type": "userMessage", "id": "reply", "content": []]],
         ]), ownerID: ownerID, session: session())
-        XCTAssertEqual(replied.pendingRequests, [])
+        XCTAssertEqual(replied.pendingRequests?.count, 1)
+    }
+
+    /// Card submission can update an existing steering item without adding a userMessage.
+    func testAcceptedSteeringReplyClearsTheQuestion() throws {
+        var reducer = CodexInboxStateReducer()
+        let reply = try questionReply(sourceID: "question-1", indexes: [0])
+        let pending = try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress", items: [
+            asyncQuestion(), ["type": "steeringUserMessage", "id": "reply", "status": "pending", "input": reply],
+        ])], active: true), ownerID: ownerID, session: session())
+        XCTAssertEqual(pending.pendingRequests?.count, 1)
+        let accepted = try reducer.accept(packet: patches(base: 1, next: 2, values: [
+            ["op": "replace", "path": ["turns", 0, "items", 1, "status"], "value": "accepted"],
+        ]), ownerID: ownerID, session: session())
+        XCTAssertEqual(accepted.pendingRequests, [])
+        XCTAssertEqual(accepted.status, .running)
+    }
+
+    /// Partial card answers remove only the matching question, not its unanswered siblings.
+    func testPartialCardReplyKeepsUnansweredQuestions() throws {
+        var reducer = CodexInboxStateReducer()
+        let reply = try questionReply(sourceID: "question-1", indexes: [0])
+        let update = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [
+            asyncQuestion(count: 2), ["type": "userMessage", "id": "reply", "content": reply],
+        ])]), ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests?.map(\.id), ["async:question-1:1"])
+    }
+
+    /// A full snapshot already containing an accepted reply must not resurrect an answered card.
+    func testSnapshotWithAcceptedReplyHasNoOutstandingQuestion() throws {
+        var reducer = CodexInboxStateReducer()
+        let update = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [
+            asyncQuestion(), ["type": "steeringUserMessage", "id": "reply", "status": "accepted",
+                              "input": try questionReply(sourceID: "question-1", indexes: [0])],
+        ])]), ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests, [])
+    }
+
+    /// Pagination can expose the answer before its source card; both orders survive reconnects.
+    func testAnswerReceiptSurvivesPartialHistoryAndRevisionInvalidation() throws {
+        for includesQuestion in [false, true] {
+            var reducer = CodexInboxStateReducer()
+            var items: [[String: Any]] = includesQuestion ? [asyncQuestion()] : []
+            items.append(["type": "steeringUserMessage", "id": "reply", "status": "accepted",
+                          "input": try questionReply(sourceID: "question-1", indexes: [0])])
+            _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: items)]),
+                                   ownerID: ownerID, session: session())
+            reducer.invalidateRevision()
+            let recovered = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [asyncQuestion()])]),
+                                                ownerID: ownerID, session: session())
+            XCTAssertEqual(recovered.pendingRequests, [])
+        }
+    }
+
+    /// Invalid IDs cannot consume the bounded receipt cache and resurrect a real answered card.
+    func testInvalidReplyIdentitiesCannotEvictAcceptedReceipt() throws {
+        let oversized = String(repeating: "x", count: AgentSessionMetadataValidation.maximumIdentifierCharacters + 1)
+        let invalidIDs: [Any] = ["question-1", ["other", "question-1", 0],
+                                ["request_user_input_async", "", 0], ["request_user_input_async", oversized, 0],
+                                ["request_user_input_async", "question-1", -1],
+                                ["request_user_input_async", "question-1", true],
+                                ["request_user_input_async", "question-1", 0.5]]
+        for invalid in invalidIDs {
+            var configuration = AgentNotificationConfiguration()
+            configuration.maximumCompletionReceipts = 1
+            var reducer = CodexInboxStateReducer(configuration: configuration)
+            let identity: String
+            if let value = invalid as? String { identity = value }
+            else { identity = String(decoding: try JSONSerialization.data(withJSONObject: invalid), as: UTF8.self) }
+            let body = try JSONSerialization.data(withJSONObject: ["questionItemId": identity, "question": "Q", "answer": "A"])
+            let invalidText = "<send_user_message_question_reply>" + String(decoding: body, as: UTF8.self)
+                + "</send_user_message_question_reply>"
+            _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [
+                ["type": "userMessage", "id": "valid", "content": try questionReply(sourceID: "question-1", indexes: [0])],
+                ["type": "userMessage", "id": "invalid", "content": [["type": "text", "text": invalidText]]],
+            ])]), ownerID: ownerID, session: session())
+            reducer.invalidateRevision()
+            let recovered = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [asyncQuestion()])]),
+                                                ownerID: ownerID, session: session())
+            XCTAssertEqual(recovered.pendingRequests, [])
+        }
+    }
+
+    /// Replaying old history must not push the newest answer out of a full receipt cache.
+    func testHistoryReplayKeepsMostRecentAcceptedReceipt() throws {
+        var configuration = AgentNotificationConfiguration()
+        configuration.maximumCompletionReceipts = 1
+        var reducer = CodexInboxStateReducer(configuration: configuration)
+        let items: [[String: Any]] = [
+            asyncQuestion(id: "older"),
+            ["type": "userMessage", "id": "first", "content": try questionReply(sourceID: "older", indexes: [0])],
+            asyncQuestion(id: "newer"),
+            ["type": "userMessage", "id": "second", "content": try questionReply(sourceID: "newer", indexes: [0])],
+        ]
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: items)]),
+                               ownerID: ownerID, session: session())
+        _ = try reducer.accept(packet: patches(base: 1, next: 2, values: []), ownerID: ownerID, session: session())
+        reducer.invalidateRevision()
+        let recovered = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [asyncQuestion(id: "newer")])]),
+                                            ownerID: ownerID, session: session())
+        XCTAssertEqual(recovered.pendingRequests, [])
+    }
+
+    /// Pending or failed submissions are not accepted answers even when their text is valid.
+    func testUnacceptedSteeringDoesNotClearQuestions() throws {
+        for status in [nil, "pending", "failed"] as [String?] {
+            var reducer = CodexInboxStateReducer()
+            var reply: [String: Any] = ["type": "steeringUserMessage", "id": "reply",
+                                       "input": try questionReply(sourceID: "question-1", indexes: [0])]
+            if let status { reply["status"] = status }
+            let update = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [asyncQuestion(), reply])]),
+                                            ownerID: ownerID, session: session())
+            XCTAssertEqual(update.pendingRequests?.count, 1)
+        }
+    }
+
+    /// Only the native single-text envelope and exact question identity can resolve a card.
+    func testMalformedOrUnrelatedRepliesDoNotClearQuestions() throws {
+        let valid = try questionReply(sourceID: "question-1", indexes: [0])
+        let validText = valid[0]["text"] as! String
+        let rejected: [[[String: Any]]] = [
+            valid + [["type": "text", "text": "extra"]],
+            [["type": "image", "text": validText]],
+            [["type": "text", "text": "prefix " + validText]],
+            [["type": "text", "text": validText + " suffix"]],
+            [["type": "text", "text": validText.replacingOccurrences(of: "\"answer\":\"A\"", with: "\"answer\":null")]],
+            [["type": "text", "text": validText.replacingOccurrences(of: "\"answer\":\"A\"", with: "\"other\":\"A\"")]],
+            [["type": "text", "text": "<send_user_message_question_reply>[]</send_user_message_question_reply>"]],
+            [["type": "text", "text": "<send_user_message_question_reply>{</send_user_message_question_reply>"]],
+            try questionReply(sourceID: "other-card", indexes: [0]),
+            try questionReply(sourceID: "question-1", indexes: [1]),
+            [["type": "text", "text": "<send_user_message_question_reply>{\"questionItemId\":\"question-1\",\"question\":\"Q\",\"answer\":\"A\"}</send_user_message_question_reply>"]],
+        ]
+        for content in rejected {
+            var reducer = CodexInboxStateReducer()
+            let update = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [
+                asyncQuestion(), ["type": "userMessage", "id": "reply", "content": content],
+            ])]), ownerID: ownerID, session: session())
+            XCTAssertEqual(update.pendingRequests?.count, 1)
+        }
+    }
+
+    /// The native parser also permits a single reply object, empty strings and outer whitespace.
+    func testSingleReplyObjectMatchesNativeParser() throws {
+        var reducer = CodexInboxStateReducer()
+        let identity = try JSONSerialization.data(withJSONObject: ["request_user_input_async", "question-1", 0])
+        let object = try JSONSerialization.data(withJSONObject: [
+            "questionItemId": String(decoding: identity, as: UTF8.self), "question": "", "answer": "",
+        ])
+        let text = " \n<send_user_message_question_reply>" + String(decoding: object, as: UTF8.self)
+            + "</send_user_message_question_reply>\n "
+        let update = try reducer.accept(packet: snapshot(turns: [turn(status: "completed", items: [
+            ["type": "userMessage", "id": "reply", "content": [["type": "text", "text": text]]], asyncQuestion(),
+        ])]), ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests, [])
+    }
+
+    /// Completing one card must clear inbox attention only when no other input or approval remains.
+    @MainActor
+    func testAcceptedAnswersReconcileInboxWithoutClearingOtherRequests() throws {
+        let inbox = AgentInboxStore()
+        var reducer = CodexInboxStateReducer()
+        let approval: [String: Any] = ["id": 42, "method": "item/commandExecution/requestApproval",
+                                      "params": ["threadId": sessionID, "reason": "Fixture approval"]]
+        inbox.apply(try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress", items: [
+            asyncQuestion(count: 2), asyncQuestion(id: "other-card"),
+        ])], requests: [approval], active: true), ownerID: ownerID, session: session()))
+        let opened = try XCTUnwrap(inbox.items.first)
+        inbox.acknowledgeOpened(opened)
+        XCTAssertEqual(inbox.items.first?.pendingRequests.count, 4)
+        for index in 0..<2 {
+            let reply: [String: Any] = ["type": "steeringUserMessage", "id": "reply-\(index)", "status": "accepted",
+                                       "input": try questionReply(sourceID: "question-1", indexes: [index])]
+            inbox.apply(try reducer.accept(packet: patches(base: index + 1, next: index + 2, values: [
+                ["op": "add", "path": ["turns", 0, "items", index + 2], "value": reply],
+            ]), ownerID: ownerID, session: session()))
+            XCTAssertEqual(inbox.items.first?.pendingRequests.count, 3 - index)
+            XCTAssertTrue(inbox.items.first?.needsAttention == true)
+        }
+        let reply = try questionReply(sourceID: "other-card", indexes: [0])
+        inbox.apply(try reducer.accept(packet: patches(base: 3, next: 4, values: [
+            ["op": "replace", "path": ["requests"], "value": []],
+            ["op": "add", "path": ["turns", 0, "items", 4], "value": ["type": "userMessage", "id": "last", "content": reply]],
+        ]), ownerID: ownerID, session: session()))
+        XCTAssertEqual(inbox.items.first?.status, .running)
+        XCTAssertEqual(inbox.items.first?.pendingRequests, [])
+        XCTAssertFalse(inbox.items.first?.needsAttention ?? true)
     }
 
     /// Blocking request removal is authoritative; no tool execution details enter the visible preview.
@@ -515,6 +701,23 @@ final class CodexDesktopNotificationTests: XCTestCase {
     private func session() -> AgentSessionDescriptor {
         .init(sessionID: sessionID, application: .codex, title: "Fixture", workspacePath: nil,
               updatedAt: 1, matchTexts: [], openCapability: .codexDeepLink)
+    }
+
+    /// Builds the native asynchronous card shape using only synthetic visible questions.
+    private func asyncQuestion(id: String = "question-1", count: Int = 1) -> [String: Any] {
+        ["type": "agentMessage", "id": id, "delivery": "async", "text": "Choose options",
+         "questions": (0..<count).map { ["title": "Question \($0)", "options": ["A", "B"]] }]
+    }
+
+    /// Encodes the desktop's structured answer envelope without interacting with a real session.
+    private func questionReply(sourceID: String, indexes: [Int]) throws -> [[String: Any]] {
+        let replies = try indexes.map { index -> [String: String] in
+            let identity = try JSONSerialization.data(withJSONObject: ["request_user_input_async", sourceID, index])
+            return ["questionItemId": String(decoding: identity, as: UTF8.self), "question": "Fixture?", "answer": "A"]
+        }
+        let body = try JSONSerialization.data(withJSONObject: replies)
+        return [["type": "text", "text": "<send_user_message_question_reply>\n"
+                 + String(decoding: body, as: UTF8.self) + "\n</send_user_message_question_reply>"]]
     }
 
     /// Builds one minimal native turn with ordered visible and tool items.

@@ -315,6 +315,13 @@ struct CodexInboxStateReducer {
     private var readCompletedTurnID: String?
     private var lastProjectedStatus: AgentInboxStatus?
     private var outstanding: [String: (request: AgentInboxRequest, position: Position)] = [:]
+    private var answeredQuestionIDs: [String] = []
+
+    private struct QuestionReply: Decodable {
+        let questionItemId: String
+        let question: String
+        let answer: String
+    }
 
     private struct Position: Comparable {
         let time: Double
@@ -351,7 +358,7 @@ struct CodexInboxStateReducer {
         return id
     }
 
-    /// Invalidates stale patch state while retaining unresolved asynchronous questions.
+    /// Invalidates stale patch state while retaining questions and their accepted answer receipts.
     mutating func invalidateRevision() {
         state = nil; revision = nil; estimatedBytes = 0; turnStatuses = [:]
         confirmedCompletedTurnID = nil; readCompletedTurnID = nil
@@ -495,7 +502,6 @@ struct CodexInboxStateReducer {
             let left = $0["turnStartedAtMs"] as? Double ?? 0, right = $1["turnStartedAtMs"] as? Double ?? 0
             return left == right ? ($0["turnId"] as? String ?? "") < ($1["turnId"] as? String ?? "") : left < right
         }
-        var lastUser: Position?
         var preview = ""
         var completion: String?
         var newStatuses: [String: String] = [:]
@@ -508,21 +514,47 @@ struct CodexInboxStateReducer {
             }
             for (index, item) in (turn["items"] as? [[String: Any]] ?? []).enumerated() {
                 let position = Position(time: turn["turnStartedAtMs"] as? Double ?? 0, turnID: turnID, itemIndex: index)
-                if item["type"] as? String == "userMessage" { lastUser = position }
                 guard item["type"] as? String == "agentMessage" else { continue }
                 if let text = item["text"] as? String, !text.isEmpty { preview = String(text.prefix(configuration.maximumPreviewCharacters)) }
                 if item["delivery"] as? String == "async", let questions = item["questions"] as? [[String: Any]],
-                   !questions.isEmpty, let id = item["id"] as? String {
-                    let text = (item["text"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                        ?? questions.compactMap { $0["title"] as? String }.joined(separator: "\n")
-                    outstanding[id] = (.init(id: "async:" + id, kind: .input,
-                                            text: String(text.prefix(configuration.maximumPreviewCharacters))), position)
+                   !questions.isEmpty, let id = item["id"] as? String,
+                   !id.isEmpty, id.count <= AgentSessionMetadataValidation.maximumIdentifierCharacters {
+                    for (questionIndex, question) in questions.enumerated() {
+                        guard let identity = Self.questionIdentity(sourceID: id, index: questionIndex) else { continue }
+                        let text = (question["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                            ?? item["text"] as? String ?? ""
+                        outstanding[identity] = (.init(id: "async:\(id):\(questionIndex)", kind: .input,
+                            text: String(text.prefix(configuration.maximumPreviewCharacters))), position)
+                    }
                 }
             }
         }
-        if let lastUser { outstanding = outstanding.filter { !($0.value.position < lastUser) } }
+        // A card response can become an accepted steering item without a new userMessage.
+        // Gather every question first, then match exact native IDs so item order, partial
+        // answers and subsequent history snapshots cannot clear or resurrect other questions.
+        var answered = Set(answeredQuestionIDs)
+        for turn in turns {
+            for item in turn["items"] as? [[String: Any]] ?? [] {
+                for identity in acceptedAnswerIDs(in: item) {
+                    answered.insert(identity)
+                    answeredQuestionIDs.append(identity)
+                }
+            }
+        }
+        // Refresh chronological order on replay so older answers cannot evict newer receipts.
+        var recentAnswers: [String] = []
+        var retainedAnswers = Set<String>()
+        for identity in answeredQuestionIDs.reversed() {
+            guard retainedAnswers.insert(identity).inserted else { continue }
+            recentAnswers.append(identity)
+            if recentAnswers.count >= configuration.maximumCompletionReceipts { break }
+        }
+        answeredQuestionIDs = recentAnswers.reversed()
+        outstanding = outstanding.filter { !answered.contains($0.key) }
         // Bound retained question state even if the native history contains repeated unanswered prompts.
-        outstanding = Dictionary(uniqueKeysWithValues: outstanding.sorted { $0.value.position > $1.value.position }
+        outstanding = Dictionary(uniqueKeysWithValues: outstanding.sorted {
+            $0.value.position == $1.value.position ? $0.key < $1.key : $0.value.position > $1.value.position
+        }
             .prefix(configuration.maximumPendingRequests).map { ($0.key, $0.value) })
         var requests = (state["requests"] as? [[String: Any]] ?? []).compactMap { request -> AgentInboxRequest? in
             guard let method = request["method"] as? String, let id = request["id"],
@@ -542,7 +574,9 @@ struct CodexInboxStateReducer {
                          text: String(text.prefix(configuration.maximumPreviewCharacters)))
         }
         let hasBlockingRequest = !requests.isEmpty
-        requests += outstanding.values.sorted { $0.position < $1.position }.map(\.request)
+        requests += outstanding.sorted {
+            $0.value.position == $1.value.position ? $0.key < $1.key : $0.value.position < $1.value.position
+        }.map(\.value.request)
         let runtime = state["threadRuntimeStatus"] as? [String: Any] ?? [:]
         let latest = turns.last?["status"] as? String
         let flags = runtime["activeFlags"] as? [String] ?? []
@@ -587,6 +621,66 @@ struct CodexInboxStateReducer {
         return .init(session: session, status: status,
                      pendingRequests: Array(requests.prefix(configuration.maximumPendingRequests)), preview: preview,
                      completionID: completion, nativeHasUnreadTurn: resolvedReadState)
+    }
+
+    /// Creates the exact composite ID used by native asynchronous question cards.
+    ///
+    /// Args:
+    ///   sourceID: Agent message owning the questions.
+    ///   index: Zero-based question position within that message.
+    /// Returns:
+    ///   JavaScript-compatible JSON identity, or nil if it cannot be represented.
+    private static func questionIdentity(sourceID: String, index: Int) -> String? {
+        guard let bytes = try? JSONSerialization.data(
+            withJSONObject: ["request_user_input_async", sourceID, index], options: [.withoutEscapingSlashes]
+        ) else { return nil }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    /// Bounds retained answer identities even when the source question has not loaded yet.
+    ///
+    /// Args:
+    ///   identity: Exact ID read from an accepted reply.
+    /// Returns:
+    ///   Whether this is a canonical native question ID with a bounded source and valid index.
+    private static func isNativeQuestionIdentity(_ identity: String) -> Bool {
+        guard let components = try? JSONSerialization.jsonObject(with: Data(identity.utf8)) as? [Any],
+              components.count == 3, components[0] as? String == "request_user_input_async",
+              let sourceID = components[1] as? String, !sourceID.isEmpty,
+              sourceID.count <= AgentSessionMetadataValidation.maximumIdentifierCharacters,
+              let index = components[2] as? Int, index >= 0 else { return false }
+        return identity == questionIdentity(sourceID: sourceID, index: index)
+    }
+
+    /// Reads only accepted native card-answer envelopes, never ordinary chat or tool output.
+    ///
+    /// Args:
+    ///   item: Visible user message or a locally submitted steering message.
+    /// Returns:
+    ///   Exact answered question IDs; malformed, unsent and failed responses return no IDs.
+    private func acceptedAnswerIDs(in item: [String: Any]) -> [String] {
+        let content: [[String: Any]]?
+        switch item["type"] as? String {
+        case "userMessage": content = item["content"] as? [[String: Any]]
+        case "steeringUserMessage":
+            guard item["status"] as? String == "accepted" else { return [] }
+            content = item["input"] as? [[String: Any]]
+        default: return []
+        }
+        guard let content, content.count == 1, content[0]["type"] as? String == "text",
+              let raw = content[0]["text"] as? String,
+              raw.utf8.count <= configuration.maximumFrameBytes else { return [] }
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let opening = "<send_user_message_question_reply>"
+        let closing = "</send_user_message_question_reply>"
+        guard text.hasPrefix(opening), text.hasSuffix(closing) else { return [] }
+        let payload = Data(text.dropFirst(opening.count).dropLast(closing.count).utf8)
+        let decoder = JSONDecoder()
+        if let replies = try? decoder.decode([QuestionReply].self, from: payload), !replies.isEmpty {
+            return replies.map(\.questionItemId).filter(Self.isNativeQuestionIdentity)
+        }
+        return (try? decoder.decode(QuestionReply.self, from: payload))
+            .map { [$0.questionItemId].filter(Self.isNativeQuestionIdentity) } ?? []
     }
 }
 
