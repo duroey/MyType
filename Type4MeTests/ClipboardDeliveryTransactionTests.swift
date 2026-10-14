@@ -106,6 +106,20 @@ final class ClipboardDeliveryTransactionTests: XCTestCase {
         XCTAssertEqual(board.pasteboard.string(forType: .string), "new")
     }
 
+    /// Shared attempt states must not turn an uncertain or partial menu action into a second write.
+    func testUncertainOrPartialDispatchCannotFallThroughToDirectInsertion() {
+        for attempt in [TextDeliveryAttempt.uncertain, .partiallyDispatched] {
+            let board = isolatedClipboard()
+            let target = StubDeliveryTarget()
+            target.shortcut = { false }
+            target.menu = { attempt }
+            XCTAssertEqual(ClipboardDeliveryTransaction(clipboard: board, wait: { _ in })
+                .deliver("new", to: target, restoreOriginal: true), .pasteAttempted)
+            XCTAssertEqual(target.menuCount, 1)
+            XCTAssertEqual(target.directCount, 0)
+        }
+    }
+
     /// Clipboard interference before dispatch cannot cause the wrong text to be pasted.
     func testClipboardChangedBeforeDispatchDoesNotPaste() {
         let board = isolatedClipboard()

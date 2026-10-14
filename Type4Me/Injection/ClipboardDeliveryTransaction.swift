@@ -2,10 +2,21 @@ import AppKit
 import Foundation
 
 enum TextDeliveryObservation: Equatable { case inserted, unchanged, unavailable, changed, targetChanged }
-enum TextDeliveryAttempt { case unavailable, dispatched }
+enum TextDeliveryAttempt: Equatable {
+    case unavailable, rejected, dispatched, partiallyDispatched, uncertain
+
+    /// Prevents a second delivery after any possible write, including an AX timeout.
+    var mayHaveDispatched: Bool {
+        switch self {
+        case .unavailable, .rejected: return false
+        case .dispatched, .partiallyDispatched, .uncertain: return true
+        }
+    }
+}
 enum TextDeliveryResult: Equatable {
     case inserted, pasteAttempted, clipboardOnly, clipboardChanged, clipboardWriteFailed
     case inputAttempted, notDelivered
+    case inputUnchanged, inputTargetChanged, inputChanged, inputPartiallyDispatched, inputRejected
 }
 
 protocol TextDeliveryTarget {
@@ -152,12 +163,12 @@ final class ClipboardDeliveryTransaction {
         if !dispatched {
             guard shouldDispatch() else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
             route = "nativeMenu"
-            dispatched = target.pasteUsingMenu(shouldDispatch: shouldDispatch) == .dispatched
+            dispatched = target.pasteUsingMenu(shouldDispatch: shouldDispatch).mayHaveDispatched
         }
         if !dispatched {
             guard shouldDispatch() else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
             route = "directAX"
-            dispatched = target.insertDirectly(shouldDispatch: shouldDispatch) == .dispatched
+            dispatched = target.insertDirectly(shouldDispatch: shouldDispatch).mayHaveDispatched
         }
         guard dispatched else { return ownsClipboard() ? .clipboardOnly : .clipboardChanged }
         DebugFileLogger.log("injection: dispatched route=\(route)")

@@ -90,15 +90,16 @@ enum InjectionOutcome: Sendable, Equatable {
     case notInserted
     case discarded
 
-    /// Provides concise completion feedback while preserving detailed delivery outcomes.
+    /// Provides concise completion feedback without treating a sent event as confirmed input.
     ///
     /// Returns:
-    ///   Processing completion for ordinary dispatch, or the actionable fallback or error.
+    ///   Confirmed completion, or the short fallback or error requiring attention.
     var completionMessage: String {
         switch self {
-        case .inserted, .inputAttempted:
-            // Opaque editors need no routine warning; the outcome still records missing receipt evidence.
+        case .inserted:
             return L("已完成", "Done")
+        case .inputAttempted:
+            return L("输入未确认", "Input unconfirmed")
         case .pasteAttemptedClipboardRetained, .copiedToClipboard:
             return L("已复制到剪贴板", "Copied to clipboard")
         case .actionFailed(let message):
@@ -107,6 +108,14 @@ enum InjectionOutcome: Sendable, Equatable {
             return L("未找到可输入的位置", "No editable field found")
         case .discarded:
             return L("已取消", "Cancelled")
+        }
+    }
+
+    /// Keeps uncertain or failed input visible long enough for the user to notice.
+    var requiresAttention: Bool {
+        switch self {
+        case .inputAttempted, .notInserted, .actionFailed: return true
+        case .inserted, .pasteAttemptedClipboardRetained, .copiedToClipboard, .discarded: return false
         }
     }
 }

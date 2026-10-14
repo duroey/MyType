@@ -1742,12 +1742,16 @@ final class AppState {
                     "Processing failed; paste attempted, raw text kept in clipboard"
                 )
             case .inputAttempted:
-                message = L("处理失败，原文已发送；可在历史中查看", "Processing failed; raw text sent. Available in history")
+                message = L("处理失败，输入未确认；已存历史", "Processing failed; input unconfirmed. Saved in history")
             }
             showDone(message: message, delay: .seconds(2.0))
         } else {
-            feedbackKind = .standard
-            showDone(message: outcome.completionMessage)
+            feedbackKind = outcome.requiresAttention ? .warning : .standard
+            if outcome.requiresAttention {
+                showDone(message: outcome.completionMessage, delay: .seconds(2.0))
+            } else {
+                showDone(message: outcome.completionMessage)
+            }
         }
         if shouldRevealSuppressedFinalization {
             onShowPanel?()

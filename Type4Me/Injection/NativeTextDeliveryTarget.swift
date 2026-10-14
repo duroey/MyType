@@ -46,6 +46,7 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget, ClipboardFreeTextDeliv
         self.application = application
         self.text = text
         self.configuration = configuration
+        defer { logTargetDiagnostics() }
         focusSnapshot = FocusedInputResolver.resolve(configuration: configuration)
         guard focusSnapshot?.application.processIdentifier == application.processIdentifier,
               ownsKeyboardFocus() else {
@@ -174,12 +175,34 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget, ClipboardFreeTextDeliv
               selectedRange(of: element) == beforeRange
         else { return .unavailable }
         var settable = DarwinBoolean(false)
-        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
+        let capabilityResult = AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable)
+        DebugFileLogger.log("injection: directAX capability result=\(capabilityResult.rawValue) selectedTextSettable=\(settable.boolValue)")
+        guard capabilityResult == .success,
               settable.boolValue, boundedValue(of: element) == beforeValue,
               selectedRange(of: element) == beforeRange, focusEvidence().permitsControlAccess, shouldDispatch()
         else { return .unavailable }
         let result = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString)
-        return result == .attributeUnsupported ? .unavailable : .dispatched
+        let attempt = Self.classifyAXWrite(result)
+        DebugFileLogger.log("injection: directAX write result=\(result.rawValue) dispatch=\(attempt)")
+        return attempt
+    }
+
+    /// Distinguishes explicit AX rejection from a write whose effects are unknown.
+    ///
+    /// Args:
+    ///   error: Result returned by the selected-text setter.
+    /// Returns:
+    ///   A successful call, a definitive rejection, or an ambiguous call that must not be retried.
+    static func classifyAXWrite(_ error: AXError) -> TextDeliveryAttempt {
+        switch error {
+        case .success: return .dispatched
+        case .attributeUnsupported, .actionUnsupported, .parameterizedAttributeUnsupported,
+             .illegalArgument, .invalidUIElement, .apiDisabled, .notImplemented:
+            return .rejected
+        default:
+            // In particular, cannotComplete can be a timed-out write that arrives later.
+            return .uncertain
+        }
     }
 
     /// Sends Unicode text events without a Paste command or clipboard access.
@@ -187,17 +210,25 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget, ClipboardFreeTextDeliv
     /// Args:
     ///   shouldDispatch: Final unchanged-input check before the first event.
     /// Returns:
-    ///   Dispatched once any event was posted, including partial delivery after focus loss.
+    ///   Whether all events were sent, delivery stopped partway, or nothing was sent.
     func insertUsingUnicode(shouldDispatch: () -> Bool) -> TextDeliveryAttempt {
         guard !text.isEmpty, Self.permitsUnicodeEvents(text), text.utf16.count <= configuration.maximumValueUTF16Length,
               CGPreflightPostEventAccess(), isCurrent(), shouldDispatch() else { return .unavailable }
-        var dispatched = false
+        var sentChunks = 0
+        let chunks = Self.unicodeChunks(text, maximumUTF16Length: configuration.unicodeChunkUTF16Length)
+        var stopReason = "complete"
+        defer {
+            DebugFileLogger.log("injection: unicode chunks=\(sentChunks)/\(chunks.count) stop=\(stopReason)")
+        }
         let deadline = ProcessInfo.processInfo.systemUptime + configuration.maximumUnicodeDeliverySeconds
-        for chunk in Self.unicodeChunks(text, maximumUTF16Length: configuration.unicodeChunkUTF16Length) {
+        for chunk in chunks {
             guard ProcessInfo.processInfo.systemUptime < deadline,
                   let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
-            else { return dispatched ? .dispatched : .unavailable }
+            else {
+                stopReason = "deadlineOrEventUnavailable"
+                return sentChunks > 0 ? .partiallyDispatched : .unavailable
+            }
             for event in [down, up] {
                 event.flags = []
                 chunk.withUnsafeBufferPointer { buffer in
@@ -205,14 +236,29 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget, ClipboardFreeTextDeliv
                 }
                 TextInjectionEngine.markAsSyntheticInput(event)
             }
-            guard ownsKeyboardFocus(), dispatched || shouldDispatch() else { return dispatched ? .dispatched : .unavailable }
+            guard ownsKeyboardFocus(), sentChunks > 0 || shouldDispatch() else {
+                stopReason = "focusOrPreflightChanged"
+                return sentChunks > 0 ? .partiallyDispatched : .unavailable
+            }
             // Pin queued events to the original process so a later application switch cannot receive them.
             down.postToPid(application.processIdentifier)
             up.postToPid(application.processIdentifier)
-            dispatched = true
+            sentChunks += 1
             Thread.sleep(forTimeInterval: configuration.unicodeChunkIntervalSeconds)
         }
-        return dispatched ? .dispatched : .unavailable
+        return sentChunks > 0 ? .dispatched : .unavailable
+    }
+
+    /// Records only target capabilities and identifiers, never input values or selected text.
+    private func logTargetDiagnostics() {
+        let role = focusedElement.flatMap { attribute(kAXRoleAttribute as CFString, from: $0) as? String }
+        let proof = focusSnapshot.map { String(describing: $0.proof) } ?? "none"
+        DebugFileLogger.log(
+            "injection: target bundle=\(application.bundleIdentifier ?? "unknown") pid=\(application.processIdentifier) "
+                + "proof=\(proof) role=\(role ?? "unavailable") blocked=\(blocked) "
+                + "receiptValueCaptured=\(beforeValue != nil) receiptRangeCaptured=\(beforeRange != nil) "
+                + "unicodeAllowed=\(Self.permitsUnicodeEvents(text))"
+        )
     }
 
     /// Keeps Return, Tab and other control characters out of synthetic keyboard events.

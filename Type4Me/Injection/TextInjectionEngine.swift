@@ -225,6 +225,16 @@ final class TextInjectionEngine: @unchecked Sendable {
         case .clipboardWriteFailed:
             return .actionFailed(L("无法写入剪贴板，文本可从历史记录恢复", "Could not write to clipboard; recover the text from history"))
         case .inputAttempted: return .inputAttempted
+        case .inputUnchanged:
+            return .actionFailed(L("未检测到输入，已存历史", "No input observed; saved in history"))
+        case .inputTargetChanged:
+            return .actionFailed(L("输入位置已变，已存历史", "Input target changed; saved in history"))
+        case .inputChanged:
+            return .actionFailed(L("输入内容已变，请核对", "Input changed; please check"))
+        case .inputPartiallyDispatched:
+            return .actionFailed(L("输入中断，已存历史", "Input interrupted; saved in history"))
+        case .inputRejected:
+            return .actionFailed(L("无法输入，已存历史", "Could not insert; saved in history"))
         case .notDelivered: return .notInserted
         }
     }
