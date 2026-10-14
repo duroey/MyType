@@ -1,0 +1,10 @@
+{
+  "pasteboardSettleSeconds": 0.03,
+  "verificationTimeoutSeconds": 0.8,
+  "verificationPollIntervalSeconds": 0.04,
+  "accessibilityTimeoutSeconds": 0.05,
+  "maximumValueUTF16Length": 100000,
+  "maximumMenuNodes": 128,
+  "maximumMenuDepth": 4,
+  "maximumMenuSearchSeconds": 0.2
+}

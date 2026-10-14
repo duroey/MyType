@@ -21,8 +21,7 @@ final class TextInjectionEngine: @unchecked Sendable {
     enum ClipboardRetention: Sendable, Equatable {
         /// Keep the dictated result in the system clipboard after the paste attempt.
         case retainResult
-        /// Restore the clipboard captured before the paste attempt, including
-        /// when injection falls safe to a plain copy.
+        /// Restore the previous clipboard only after insertion is verified.
         case restoreOriginal
     }
     typealias ClipboardSnapshot = Type4Me.ClipboardSnapshot
@@ -93,19 +92,10 @@ final class TextInjectionEngine: @unchecked Sendable {
         var hasFocusedElement: Bool = false
     }
 
-    private struct PendingClipboardRestore {
-        let snapshot: ClipboardSnapshot
-        let changeCount: Int
-    }
-
     /// Whether this engine should retain the dictated result or restore the
     /// clipboard that existed before injection.
     var clipboardRetention: ClipboardRetention = .restoreOriginal
-    private var pendingClipboardRestore: PendingClipboardRestore?
-
-    /// Inject text into the currently focused input field.
-    /// Returns the outcome as soon as the paste is dispatched.
-    /// Call ``finishClipboardRestore()`` afterward to restore the original clipboard.
+    /// Injects text once and returns a verified or explicitly unconfirmed outcome.
     func inject(_ text: String) -> InjectionOutcome {
         guard !text.isEmpty else { return .inserted }
         return injectViaClipboard(text, trackingMetadata: nil).outcome
@@ -134,39 +124,25 @@ final class TextInjectionEngine: @unchecked Sendable {
         )
     }
 
-    /// Restore the clipboard that was saved before injection.
-    /// Safe to call even if there's nothing to restore.
-    func finishClipboardRestore() {
-        guard let pending = pendingClipboardRestore else { return }
-        pendingClipboardRestore = nil
-        // Electron apps (VS Code, Slack, Notion, Feishu) may need 200-500ms
-        // to read the clipboard after Cmd+V.
-        usleep(300_000)
-        pending.snapshot.restore(expectedChangeCount: pending.changeCount)
+    /// Copies text atomically with its marker and verifies the pasteboard write.
+    @discardableResult
+    func copyToClipboard(_ text: String, transient: Bool = false) -> Bool {
+        let succeeded = SystemTextDeliveryClipboard().write(text, transient: transient) != nil
+        if !succeeded { DebugFileLogger.log("injection: clipboard write could not be verified") }
+        return succeeded
     }
 
-    /// Copy text to the system clipboard (used at session end).
-    func copyToClipboard(_ text: String, transient: Bool = false) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        if transient {
-            pb.setData(Data(), forType: PasteboardHistoryPolicy.transientType)
-        }
-    }
-
+    /// Delivers to the original input, with optional authorized correction-learning snapshots.
     private func injectViaClipboard(
         _ text: String,
         trackingMetadata: (sourceText: String, sourceRecordID: String, modeID: UUID)?,
         authorizeCapture: (String?) -> Bool = { _ in false }
     ) -> TrackedInjectionResult {
         let shouldRestoreClipboard = Self.shouldRestoreClipboard(retention: clipboardRetention)
-        let savedClipboard = shouldRestoreClipboard ? ClipboardSnapshot.capture() : nil
-
-        let deliveryTarget = Self.resolveDeliveryTarget(
-            frontmost: NSWorkspace.shared.frontmostApplication
-        )
-        guard case .app = deliveryTarget else {
+        let readFrontmost = { NSWorkspace.shared.frontmostApplication }
+        let frontmost = Thread.isMainThread ? readFrontmost() : DispatchQueue.main.sync(execute: readFrontmost)
+        let deliveryTarget = Self.resolveDeliveryTarget(frontmost: frontmost)
+        guard case .app(let application) = deliveryTarget else {
             // Type4Me itself is frontmost (e.g. Settings → About → Report an Issue).
             // Insert in-process into our own focused text view instead of posting
             // Cmd+V, so we never paste into another app and never touch the clipboard.
@@ -174,47 +150,41 @@ final class TextInjectionEngine: @unchecked Sendable {
                 if !shouldRestoreClipboard {
                     copyToClipboard(text, transient: false)
                 }
-                pendingClipboardRestore = nil
                 DebugFileLogger.log("injection: inserted into Type4Me's own focused text view")
                 return TrackedInjectionResult(outcome: .inserted, observationContext: nil)
             }
             // Delivery fallback: no valid external target application. Always preserve the
             // dictated text in the system clipboard so the user's speech is never lost.
-            copyToClipboard(text, transient: false)
-            pendingClipboardRestore = nil
+            let copied = copyToClipboard(text, transient: false)
             DebugFileLogger.log("injection fallback: no valid external target app; copied to clipboard")
-            return TrackedInjectionResult(outcome: .copiedToClipboard, observationContext: nil)
+            return TrackedInjectionResult(
+                outcome: Self.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed),
+                observationContext: nil
+            )
         }
 
+        let configuration: TextDeliveryConfiguration
+        do { configuration = try .bundled() }
+        catch {
+            DebugFileLogger.log("injection: invalid delivery configuration; automatic delivery skipped")
+            let copied = copyToClipboard(text)
+            return TrackedInjectionResult(
+                outcome: Self.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed), observationContext: nil
+            )
+        }
         let before = trackingMetadata != nil
             ? captureFocusedElementSnapshot(isPrePaste: true, authorize: authorizeCapture)
             : nil
 
-        copyToClipboard(text, transient: shouldRestoreClipboard)
-        let postWriteChangeCount = NSPasteboard.general.changeCount
-        usleep(50_000)
+        let target = NativeTextDeliveryTarget(application: application, text: text, configuration: configuration)
+        let result = ClipboardDeliveryTransaction(configuration: configuration)
+            .deliver(text, to: target, restoreOriginal: shouldRestoreClipboard)
+        let outcome = Self.deliveryOutcome(result)
+        DebugFileLogger.log("injection: delivery result=\(result)")
 
-        guard simulatePaste() else {
-            // Delivery fallback: paste event creation failed. Always preserve text in the clipboard.
-            copyToClipboard(text, transient: false)
-            pendingClipboardRestore = nil
-            DebugFileLogger.log("injection fallback: paste event creation failed; copied to clipboard")
-            return TrackedInjectionResult(outcome: .copiedToClipboard, observationContext: nil)
-        }
-        usleep(100_000)
-
-        let after = trackingMetadata != nil
+        let after = trackingMetadata != nil && outcome == .inserted
             ? captureFocusedElementSnapshot(isPrePaste: false, authorize: authorizeCapture)
             : nil
-        let outcome: InjectionOutcome = .inserted
-
-        if let savedClipboard {
-            pendingClipboardRestore = PendingClipboardRestore(
-                snapshot: savedClipboard, changeCount: postWriteChangeCount
-            )
-        } else {
-            pendingClipboardRestore = nil
-        }
 
         let context = trackingMetadata.flatMap { metadata in
             makeObservationContext(
@@ -235,21 +205,17 @@ final class TextInjectionEngine: @unchecked Sendable {
     }
 
 
-    private func simulatePaste() -> Bool {
-        let vKeyCode: CGKeyCode = 9 // 'v'
-
-        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: vKeyCode, keyDown: false)
-        else { return false }
-
-        keyDown.flags = .maskCommand
-        keyUp.flags = .maskCommand
-        Self.markAsSyntheticInput(keyDown)
-        Self.markAsSyntheticInput(keyUp)
-
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-        return true
+    /// Maps delivery evidence to the existing bilingual feedback without claiming a sent event succeeded.
+    static func deliveryOutcome(_ result: TextDeliveryResult) -> InjectionOutcome {
+        switch result {
+        case .inserted: return .inserted
+        case .pasteAttempted: return .pasteAttemptedClipboardRetained
+        case .clipboardOnly: return .copiedToClipboard
+        case .clipboardChanged:
+            return .actionFailed(L("剪贴板已变化，文本可从历史记录恢复", "Clipboard changed; recover the text from history"))
+        case .clipboardWriteFailed:
+            return .actionFailed(L("无法写入剪贴板，文本可从历史记录恢复", "Could not write to clipboard; recover the text from history"))
+        }
     }
 
     private func enableEnhancedAX(for app: NSRunningApplication) {

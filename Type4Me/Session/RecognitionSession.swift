@@ -3332,10 +3332,10 @@ actor RecognitionSession {
             let injectLog = "stop: injecting method=clipboard len=\(finalText.count) +\(ContinuousClock.now - stopT0)"
             let injectionResult: TrackedInjectionResult
             if wasCancelled, retainsClipboardResult {
-                engine.copyToClipboard(finalText)
+                let copied = engine.copyToClipboard(finalText)
                 DebugFileLogger.log("stop: cancelled result retained in clipboard & history")
                 injectionResult = TrackedInjectionResult(
-                    outcome: .copiedToClipboard,
+                    outcome: TextInjectionEngine.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed),
                     observationContext: nil
                 )
             } else if wasCancelled {
@@ -3381,19 +3381,14 @@ actor RecognitionSession {
                     // Fail-safe: the intended target is gone or never became
                     // frontmost, so pasting now could leak the dictated text
                     // into the wrong app. Retain it in the clipboard instead.
-                    engine.copyToClipboard(finalText)
+                    let copied = engine.copyToClipboard(finalText)
                     let reason = plan == .failSafeClipboard ? "target terminated" : "target focus unconfirmed"
                     DebugFileLogger.log("stop: \(reason); retained in clipboard, paste skipped")
                     injectionResult = TrackedInjectionResult(
-                        outcome: .copiedToClipboard,
+                        outcome: TextInjectionEngine.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed),
                         observationContext: nil
                     )
                 }
-            }
-            // Restoring policies must restore even when there was no editable
-            // destination, otherwise a failed paste leaks dictated text.
-            if !retainsClipboardResult && !wasCancelled {
-                engine.finishClipboardRestore()
             }
 
             guard sessionGeneration == myGeneration, state != .idle else {
@@ -3765,9 +3760,6 @@ actor RecognitionSession {
             ? .retainResult
             : .restoreOriginal
         _ = engine.inject(text)
-        if !retainsClipboardResult {
-            engine.finishClipboardRestore()
-        }
     }
 
     private func saveRecoveryHistory(status: String, finalText: String) async {
