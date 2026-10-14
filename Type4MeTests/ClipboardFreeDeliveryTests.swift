@@ -9,19 +9,20 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         XCTAssertTrue(TextInjectionEngine.mayInsertIntoOwnApp(targetPID: 123, ownPID: 123))
     }
 
-    /// Unconfirmed feedback neither claims a successful insertion nor mentions auto-copying.
-    func testUnconfirmedFeedbackInBothLanguages() {
+    /// Routine completion stays concise without changing unconfirmed delivery into a verified receipt.
+    func testNormalCompletionFeedbackInBothLanguages() {
         let previous = UserDefaults.standard.object(forKey: "tf_language")
         defer {
             if let previous { UserDefaults.standard.set(previous, forKey: "tf_language") }
             else { UserDefaults.standard.removeObject(forKey: "tf_language") }
         }
+        XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputAttempted), .inputAttempted)
         UserDefaults.standard.set("zh", forKey: "tf_language")
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputAttempted).completionMessage,
-                       "文字已发送，未能确认输入；可在历史中查看")
+                       "已完成")
         UserDefaults.standard.set("en", forKey: "tf_language")
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.inputAttempted).completionMessage,
-                       "Text sent; insertion unconfirmed. Available in history")
+                       "Done")
     }
     /// Opaque receivers can consume queued text later without any clipboard dependency.
     func testOpaqueDeliveryDoesNotRetryAfterDispatch() {

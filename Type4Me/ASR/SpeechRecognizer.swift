@@ -90,19 +90,17 @@ enum InjectionOutcome: Sendable, Equatable {
     case notInserted
     case discarded
 
+    /// Provides concise completion feedback while preserving detailed delivery outcomes.
+    ///
+    /// Returns:
+    ///   Processing completion for ordinary dispatch, or the actionable fallback or error.
     var completionMessage: String {
         switch self {
-        case .inserted:
+        case .inserted, .inputAttempted:
+            // Opaque editors need no routine warning; the outcome still records missing receipt evidence.
             return L("已完成", "Done")
-        case .pasteAttemptedClipboardRetained:
-            return L(
-                "已尝试输入，文本已保留到剪贴板",
-                "Paste attempted; text kept in clipboard"
-            )
-        case .inputAttempted:
-            return L("文字已发送，未能确认输入；可在历史中查看", "Text sent; insertion unconfirmed. Available in history")
-        case .copiedToClipboard:
-            return L("已粘贴到剪贴板", "Copied to clipboard")
+        case .pasteAttemptedClipboardRetained, .copiedToClipboard:
+            return L("已复制到剪贴板", "Copied to clipboard")
         case .actionFailed(let message):
             return message
         case .notInserted:

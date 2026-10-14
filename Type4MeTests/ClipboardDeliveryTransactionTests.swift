@@ -317,7 +317,7 @@ final class NativeTextDeliveryPolicyTests: XCTestCase {
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.clipboardWriteFailed).completionMessage,
             "Could not write to clipboard; recover the text from history")
         XCTAssertEqual(TextInjectionEngine.deliveryOutcome(.pasteAttempted).completionMessage,
-            "Paste attempted; text kept in clipboard")
+            "Copied to clipboard")
     }
 }
 
