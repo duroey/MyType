@@ -198,13 +198,13 @@ actor AgentIntentClassifier {
     /// Raises:
     ///   AgentIntentClassifierError: The complete operation exceeds its deadline.
     ///   CancellationError: The caller is cancelled, even if its worker is still blocked.
-    nonisolated static func withDeadline(
+    nonisolated static func withDeadline<Value: Sendable>(
         _ deadline: ContinuousClock.Instant,
-        operation: @escaping @Sendable () async throws -> AgentIntentDecision
-    ) async throws -> AgentIntentDecision {
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
         try Task.checkCancellation()
         guard ContinuousClock.now < deadline else { throw AgentIntentClassifierError.timedOut }
-        let gate = AgentIntentCompletionGate()
+        let gate = AgentIntentCompletionGate<Value>()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 guard gate.install(continuation) else { return }
@@ -255,6 +255,68 @@ actor AgentIntentClassifier {
         let key = try loadCredentialWithoutInteraction()
         try Task.checkCancellation()
         let request = try Self.request(text: transcript, apiKey: key, configuration: settings)
+        let body = try await performRequest(request, configuration: settings)
+        return try Self.decodeResponse(body, configuration: settings)
+    }
+
+    /// Sends bounded typed questions through the same credential and transport boundary.
+    ///
+    /// Args:
+    ///   payload: JSON encoded by the handoff suggestion service, without credentials.
+    ///   maximumRequestBytes: Explicit bound needed for a finite candidate list.
+    ///
+    /// Returns:
+    ///   A bounded response body, whose application schema the caller must validate.
+    ///
+    /// Raises:
+    ///   Error: Invalid input, credential access, cancellation or transport failure.
+    nonisolated func requestJSON(_ payload: Data, maximumRequestBytes: Int) async throws -> Data {
+        var settings = try configuration ?? Configuration.bundled()
+        settings.maximumRequestBytes = maximumRequestBytes
+        _ = try settings.validatedEndpoint()
+        guard payload.count <= maximumRequestBytes,
+              let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              object["model"] as? String == settings.model else {
+            throw AgentIntentClassifierError.invalidConfiguration
+        }
+        let configuration = settings
+        let deadline = ContinuousClock.now.advanced(by: .seconds(settings.overallTimeoutSeconds))
+        return try await Self.withDeadline(deadline) {
+            try await self.performJSONRequest(payload, configuration: configuration)
+        }
+    }
+
+    /// Adds a non-interactive credential only after the payload and endpoint are validated.
+    ///
+    /// Args:
+    ///   payload: Bounded JSON payload for the pinned service.
+    ///   configuration: Validated transport limits.
+    ///
+    /// Returns:
+    ///   The service response without exposing the credential to the caller.
+    ///
+    /// Raises:
+    ///   Error: Credential, transport or cancellation failure.
+    private func performJSONRequest(_ payload: Data, configuration: Configuration) async throws -> Data {
+        try Task.checkCancellation()
+        let key = try loadCredentialWithoutInteraction()
+        try Task.checkCancellation()
+        let request = try Self.authenticatedRequest(payload, apiKey: key, configuration: configuration)
+        return try await performRequest(request, configuration: configuration)
+    }
+
+    /// Reads one bounded response while preserving cancellation and redirect protections.
+    ///
+    /// Args:
+    ///   request: Authenticated request to the pinned endpoint.
+    ///   configuration: Transport and response limits.
+    ///
+    /// Returns:
+    ///   Bounded JSON bytes for independent schema validation.
+    ///
+    /// Raises:
+    ///   Error: HTTP, size, cancellation or transport failure.
+    private func performRequest(_ request: URLRequest, configuration settings: Configuration) async throws -> Data {
         let transport = transportSession(configuration: settings)
         do {
             let (bytes, response) = try await transport.bytes(for: request)
@@ -282,7 +344,7 @@ actor AgentIntentClassifier {
                     body.append(byte)
                 }
                 try Task.checkCancellation()
-                return try Self.decodeResponse(body, configuration: settings)
+                return body
             } onCancel: {
                 bytes.task.cancel()
             }
@@ -312,19 +374,37 @@ actor AgentIntentClassifier {
     /// Raises:
     ///   AgentIntentClassifierError: Input, credential or configuration is invalid.
     nonisolated static func request(text: String, apiKey: String, configuration: Configuration) throws -> URLRequest {
-        let endpoint = try configuration.validatedEndpoint()
         let transcript = try validatedInput(text, configuration: configuration)
-        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty, key.utf8.count <= 4_096,
-              key.unicodeScalars.allSatisfy({ $0.value > 0x20 && $0.value < 0x7F }) else {
-            throw AgentIntentClassifierError.missingCredential
-        }
         let payload: [String: Any] = [
             "model": configuration.model,
             "state": ["entrypoint": "agent_hotkey", "user_explicitly_pressed_agent_hotkey": true, "utterance": transcript],
             "questions": ["route": ["type": "choice", "instructions": configuration.instructions, "criteria": configuration.criteria]],
         ]
         let body = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        return try authenticatedRequest(body, apiKey: apiKey, configuration: configuration)
+    }
+
+    /// Authenticates JSON only for the fixed endpoint and rejects header control characters.
+    ///
+    /// Args:
+    ///   body: Serialized, bounded request payload.
+    ///   apiKey: Credential read through the application's non-interactive boundary.
+    ///   configuration: Validated endpoint and resource limits.
+    ///
+    /// Returns:
+    ///   An authenticated JSON POST request with no redirect authorization.
+    ///
+    /// Raises:
+    ///   AgentIntentClassifierError: Endpoint, credential or body validation failed.
+    private nonisolated static func authenticatedRequest(
+        _ body: Data, apiKey: String, configuration: Configuration
+    ) throws -> URLRequest {
+        let endpoint = try configuration.validatedEndpoint()
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, key.utf8.count <= 4_096,
+              key.unicodeScalars.allSatisfy({ $0.value > 0x20 && $0.value < 0x7F }) else {
+            throw AgentIntentClassifierError.missingCredential
+        }
         guard body.count <= configuration.maximumRequestBytes else {
             throw AgentIntentClassifierError.inputTooLong
         }
@@ -455,10 +535,10 @@ actor AgentIntentClassifier {
 }
 
 /// Resolves one caller exactly once while allowing non-cooperative work to finish later.
-private final class AgentIntentCompletionGate: @unchecked Sendable {
+private final class AgentIntentCompletionGate<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<AgentIntentDecision, Error>?
-    private var terminalResult: Result<AgentIntentDecision, Error>?
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var terminalResult: Result<Value, Error>?
     private var tasks: [Task<Void, Never>] = []
 
     /// Registers a caller or immediately delivers cancellation that arrived before registration.
@@ -468,7 +548,7 @@ private final class AgentIntentCompletionGate: @unchecked Sendable {
     ///
     /// Returns:
     ///   Whether worker and timer tasks should be created.
-    func install(_ continuation: CheckedContinuation<AgentIntentDecision, Error>) -> Bool {
+    func install(_ continuation: CheckedContinuation<Value, Error>) -> Bool {
         lock.lock()
         if let result = terminalResult {
             lock.unlock()
@@ -496,7 +576,7 @@ private final class AgentIntentCompletionGate: @unchecked Sendable {
     ///
     /// Args:
     ///   result: Worker completion, overall timeout or caller cancellation.
-    func finish(_ result: Result<AgentIntentDecision, Error>) {
+    func finish(_ result: Result<Value, Error>) {
         lock.lock()
         guard terminalResult == nil else {
             lock.unlock()

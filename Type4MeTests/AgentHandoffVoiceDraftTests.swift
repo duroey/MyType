@@ -118,8 +118,8 @@ final class AgentHandoffVoiceDraftTests: XCTestCase {
     func testVoiceDraftHintFollowsLanguageChanges() {
         for language in [AppLanguage.zh, .en, .zh] {
             XCTAssertEqual(AgentHandoffCopy.text(.voiceInstructionHint, language: language), language == .zh
-                ? "已带入本次语音要求。请选择来源和接收会话，核对后再发送。"
-                : "Your voice request is included. Choose the source and receiving conversations, then review before sending.")
+                ? "已根据语音建议来源和接收会话，可更换；确认后才会发送。"
+                : "Conversations are suggested from your voice request. You can change them; nothing is sent until you confirm.")
         }
     }
 

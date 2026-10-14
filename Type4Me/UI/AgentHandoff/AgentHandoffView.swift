@@ -11,6 +11,8 @@ enum AgentHandoffCopy {
         case catalogFailed, historyFailed, deliveryFailed, launchFailed, catalogPartial
         case claudeMustBeOpen, filePermission, historyPrivacy, queued, delivered, deliveryNotice
         case previewLimited, sameSession, missingInstruction, voiceInstructionHint
+        case findingSuggestions, suggested, manuallySelected, changeSelection, hideChoices
+        case similarCandidates, suggestionsUnavailable, missingSuggestion, suggestionMatch
     }
 
     /// Renders interface labels using the currently observed language.
@@ -40,7 +42,7 @@ enum AgentHandoffCopy {
         case .loadingHistory: copy = ("正在更新并读取历史…", "Updating and loading history…")
         case .instruction: copy = ("接下来做什么", "What should happen next?")
         case .instructionHint: copy = ("写下接收会话需要继续完成的工作。", "Describe the work the receiving conversation should continue.")
-        case .send: copy = ("发送历史并继续", "Send history and continue")
+        case .send: copy = ("确认交接", "Confirm handoff")
         case .sending: copy = ("正在发送…", "Sending…")
         case .openTarget: copy = ("打开接收会话", "Open receiving conversation")
         case .openingTarget: copy = ("正在打开…", "Opening…")
@@ -58,7 +60,16 @@ enum AgentHandoffCopy {
         case .previewLimited: copy = ("这里只展示历史开头，发送时包含完整历史。", "Only the beginning is shown here. Delivery includes the full history.")
         case .sameSession: copy = ("来源和接收会话需要不同。", "Choose different source and receiving conversations.")
         case .missingInstruction: copy = ("请填写下一步要做的工作。", "Describe the next task before sending.")
-        case .voiceInstructionHint: copy = ("已带入本次语音要求。请选择来源和接收会话，核对后再发送。", "Your voice request is included. Choose the source and receiving conversations, then review before sending.")
+        case .voiceInstructionHint: copy = ("已根据语音建议来源和接收会话，可更换；确认后才会发送。", "Conversations are suggested from your voice request. You can change them; nothing is sent until you confirm.")
+        case .findingSuggestions: copy = ("正在查找来源和接收会话…", "Finding source and receiving conversations…")
+        case .suggested: copy = ("建议会话", "Suggested conversation")
+        case .manuallySelected: copy = ("你选择的会话", "Your selection")
+        case .changeSelection: copy = ("更换会话", "Change conversation")
+        case .hideChoices: copy = ("收起候选", "Hide alternatives")
+        case .similarCandidates: copy = ("还有相近的会话，请核对两端；需要时可更换。", "There are similar conversations. Review both selections and change them if needed.")
+        case .suggestionsUnavailable: copy = ("暂时无法完成建议排序，请核对候选或自行选择。", "Suggestions could not be ranked. Review the candidates or choose conversations yourself.")
+        case .missingSuggestion: copy = ("没有找到合适的建议，可从下方选择会话。", "No suitable suggestion was found. Choose a conversation below.")
+        case .suggestionMatch: copy = ("相关对话", "Matching conversation text")
         }
         return language == .zh ? copy.0 : copy.1
     }
@@ -124,13 +135,20 @@ final class AgentHandoffViewModel {
     typealias Sender = @Sendable (AgentHandoffHistory, AgentSessionDescriptor, String) async throws -> AgentHandoffDeliveryReceipt
     typealias Opener = @Sendable (AgentSessionDescriptor) async throws -> Void
     typealias Discarder = @Sendable (AgentHandoffHistory) async -> Void
+    typealias Suggester = @Sendable (String, [AgentSessionDescriptor]) async throws -> AgentHandoffSuggestion
 
     private let catalogLoader: CatalogLoader
     private let historyLoader: HistoryLoader
     private let sender: Sender
     private let opener: Opener
     private let discarder: Discarder
+    private let suggester: Suggester
     private var generation = 0
+    private var historyGeneration = 0
+    private var suggestionTask: Task<AgentHandoffSuggestion, Error>?
+    private var historyTask: Task<Void, Never>?
+    private var sourceWasManuallySelected = false
+    private var targetWasManuallySelected = false
     private var deliveredRequest: DeliveredRequest?
     private var historyWasSubmitted = false
 
@@ -143,6 +161,13 @@ final class AgentHandoffViewModel {
     private(set) var failure: AgentHandoffUIFailure?
     private(set) var operation = AgentHandoffUIOperation.idle
     private(set) var voiceInstruction: String?
+    private(set) var isSuggesting = false
+    private(set) var sourceCandidates: [AgentHandoffSuggestionCandidate] = []
+    private(set) var targetCandidates: [AgentHandoffSuggestionCandidate] = []
+    private(set) var suggestionNotice: AgentHandoffSuggestionNotice?
+    private(set) var suggestionFailed = false
+    private(set) var sourceWasSuggested = false
+    private(set) var targetWasSuggested = false
     var sourceFilter = ""
     var targetFilter = ""
     var instruction = "" {
@@ -166,6 +191,7 @@ final class AgentHandoffViewModel {
     ///   sender: Native message delivery implementation.
     ///   opener: Exact existing-chat desktop navigation.
     ///   discarder: Removes only application-owned snapshots that have never been submitted.
+    ///   suggester: Finds and ranks native source and receiving conversations without sending.
     init(
         catalogLoader: @escaping CatalogLoader = { try AgentSessionCatalog.shared.loadSessions() },
         historyLoader: @escaping HistoryLoader = { try await AgentHandoffHistoryService.shared.load(source: $0) },
@@ -173,13 +199,15 @@ final class AgentHandoffViewModel {
         opener: @escaping Opener = {
             try await AgentDesktopLauncherService.shared.open(application: $0.application, sessionID: $0.sessionID)
         },
-        discarder: @escaping Discarder = { await AgentHandoffHistoryService.shared.discardUnsent($0) }
+        discarder: @escaping Discarder = { await AgentHandoffHistoryService.shared.discardUnsent($0) },
+        suggester: @escaping Suggester = { try await AgentHandoffSuggestionService.shared.suggest($0, sessions: $1) }
     ) {
         self.catalogLoader = catalogLoader
         self.historyLoader = historyLoader
         self.sender = sender
         self.opener = opener
         self.discarder = discarder
+        self.suggester = suggester
     }
 
     var source: AgentSessionDescriptor? { sessions.first { $0.id == sourceID } }
@@ -187,29 +215,37 @@ final class AgentHandoffViewModel {
     var isBusy: Bool { operation != .idle }
     var isSending: Bool { operation == .sending }
     var canSend: Bool {
-        guard !isBusy, let history, let source, let target,
+        guard !isBusy, !isSuggesting, let history, let source, let target,
               history.source.id == source.id, source.id != target.id,
               !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         return deliveredRequest != request(history: history, target: target, instruction: instruction)
     }
 
-    /// Starts a separate voice draft without reusing a previous draft's conversation selections.
+    /// Starts a separate voice draft and invalidates work associated with an older request.
     ///
     /// Args:
-    ///   text: The original recognized voice request, preserved without rewriting.
+    ///   text: Original recognized request, preserved as the editable instruction.
     ///
     /// Returns:
-    ///   Whether the draft was accepted. Active delivery or navigation keeps its existing state.
+    ///   Whether the draft was accepted. Active delivery or navigation remains unchanged.
     @discardableResult
     func beginVoiceDraft(_ text: String) -> Bool {
         guard !isSending, operation != .openingTarget,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        generation &+= 1
+        invalidatePendingWork()
         discardCurrentPreview()
         sourceID = nil
         targetID = nil
         sourceFilter = ""
         targetFilter = ""
+        sourceWasManuallySelected = false
+        targetWasManuallySelected = false
+        sourceWasSuggested = false
+        targetWasSuggested = false
+        sourceCandidates = []
+        targetCandidates = []
+        suggestionNotice = nil
+        suggestionFailed = false
         receipt = nil
         failure = nil
         deliveredRequest = nil
@@ -219,39 +255,47 @@ final class AgentHandoffViewModel {
         return true
     }
 
-    /// Chooses a source and invalidates every preview tied to a previous selection.
+    /// Keeps a manual source selection authoritative and prepares its history automatically.
     ///
     /// Args:
-    ///   id: Native catalog identity of the selected source, or nil.
+    ///   id: Native source identity, or nil to clear the selected source.
     func selectSource(_ id: String?) {
-        guard !isSending, sourceID != id else { return }
-        generation &+= 1
-        sourceID = id
-        if targetID == id { targetID = nil }
+        guard !isSending, operation != .openingTarget else { return }
+        sourceWasManuallySelected = true
+        sourceWasSuggested = false
+        let validID = sessions.contains { $0.id == id } ? id : nil
+        guard sourceID != validID else { return }
+        invalidateHistoryLoad()
+        sourceID = validID
+        if targetID == validID { targetID = nil; targetWasSuggested = false }
         discardCurrentPreview()
         receipt = nil
         failure = nil
-        operation = .idle
+        startHistoryLoading()
     }
 
-    /// Chooses a receiver without implying an automatic send or desktop launch.
+    /// Keeps a manual receiver selection authoritative without sending or opening a conversation.
     ///
     /// Args:
-    ///   id: Native catalog identity of the receiver, or nil.
+    ///   id: Native receiving identity, or nil to clear the selected receiver.
     func selectTarget(_ id: String?) {
-        guard !isSending, targetID != id else { return }
-        targetID = id
+        guard !isSending, operation != .openingTarget else { return }
+        targetWasManuallySelected = true
+        targetWasSuggested = false
+        let validID = id != sourceID && sessions.contains { $0.id == id } ? id : nil
+        guard targetID != validID else { return }
+        targetID = validID
         receipt = nil
         failure = nil
     }
 
-    /// Refreshes native metadata while preserving still-valid user selections.
+    /// Refreshes metadata, suggests both ends of a voice draft, and prepares its selected history.
     ///
     /// Returns:
-    ///   Nothing. Newer selections prevent stale responses from replacing the list.
+    ///   Nothing. New drafts, catalog refreshes, or window closure invalidate every late result.
     func refreshSessions() async {
-        guard !isBusy else { return }
-        generation &+= 1
+        guard !isSending, operation != .openingTarget, !Task.isCancelled else { return }
+        invalidatePendingWork()
         let token = generation
         let previousSource = source
         let previousTarget = target
@@ -260,52 +304,183 @@ final class AgentHandoffViewModel {
         do {
             let loader = catalogLoader
             let result = try await Task.detached(priority: .userInitiated) { try loader() }.value
-            guard generation == token else { return }
+            guard generation == token, !Task.isCancelled else { return }
             sessions = result.sessions
             unavailableApplications = result.unavailableApplications
-            if source == nil { sourceID = nil }
-            if target == nil { targetID = nil }
+            if source == nil { sourceID = nil; sourceWasSuggested = false }
+            if target == nil { targetID = nil; targetWasSuggested = false }
             if source != previousSource { discardCurrentPreview(); receipt = nil }
             if target != previousTarget { receipt = nil }
         } catch {
-            guard generation == token else { return }
+            guard generation == token, !Task.isCancelled else { return }
+            operation = .idle
             failure = AgentHandoffUIFailure(label: .catalogFailed, underlying: error)
+            return
         }
-        if generation == token { operation = .idle }
+        operation = .idle
+        if let voiceInstruction {
+            await suggestConversations(voiceInstruction, generation: token)
+        }
+        guard generation == token, !Task.isCancelled else { return }
+        if history == nil { await loadHistory() }
     }
 
-    /// Loads history only for the source explicitly chosen by the user.
+    /// Loads or joins the selected source's preview without ever submitting it.
+    ///
+    /// Args:
+    ///   forceReload: Whether an explicit reload should replace an already prepared snapshot.
     ///
     /// Returns:
-    ///   Nothing. Selection changes invalidate late history responses.
-    func loadHistory() async {
-        guard !isBusy, let source else { return }
-        generation &+= 1
-        let token = generation
-        operation = .loadingHistory
+    ///   Nothing. Source changes cancel pending loads and discard stale snapshots.
+    func loadHistory(forceReload: Bool = false) async {
+        guard !isSending, operation != .openingTarget, operation != .loadingSessions else { return }
+        if let historyTask { await historyTask.value; return }
+        if !forceReload, let history, history.source.id == sourceID { return }
+        invalidateHistoryLoad()
         discardCurrentPreview()
         receipt = nil
         failure = nil
-        do {
-            let result = try await historyLoader(source)
-            guard generation == token, sourceID == source.id else {
-                await discarder(result)
-                return
-            }
-            guard result.source.id == source.id else {
-                await discarder(result)
-                guard generation == token, sourceID == source.id else { return }
-                failure = AgentHandoffUIFailure(label: .historyFailed, underlying: nil)
-                operation = .idle
-                return
-            }
-            history = result
-            historyWasSubmitted = false
-        } catch {
-            guard generation == token else { return }
-            failure = AgentHandoffUIFailure(label: .historyFailed, underlying: error)
+        startHistoryLoading()
+        await historyTask?.value
+    }
+
+    /// Ranks both sides independently while preserving each side the user has already changed.
+    ///
+    /// Args:
+    ///   text: Original voice request used only for finding candidates.
+    ///   token: Draft and catalog generation that must still be active on completion.
+    private func suggestConversations(_ text: String, generation token: Int) async {
+        isSuggesting = true
+        suggestionFailed = false
+        suggestionNotice = nil
+        sourceCandidates = []
+        targetCandidates = []
+        let suggester = suggester
+        let catalog = sessions
+        let task = Task {
+            try Task.checkCancellation()
+            return try await suggester(text, catalog)
         }
-        if generation == token { operation = .idle }
+        suggestionTask = task
+        do {
+            let result = try await task.value
+            guard generation == token, !Task.isCancelled else { return }
+            sourceCandidates = validCandidates(result.sources)
+            targetCandidates = validCandidates(result.targets)
+            suggestionNotice = result.notice
+            if !sourceWasManuallySelected {
+                let proposed = sourceCandidates.first { $0.session.id == result.sourceID }?.session.id
+                // A manually chosen receiver takes precedence over an overlapping suggested source.
+                let chosen = targetWasManuallySelected && proposed == targetID ? nil : proposed
+                if sourceID != chosen {
+                    invalidateHistoryLoad()
+                    discardCurrentPreview()
+                    sourceID = chosen
+                    receipt = nil
+                }
+                sourceWasSuggested = chosen != nil
+            }
+            if !targetWasManuallySelected {
+                let proposed = targetCandidates.first { $0.session.id == result.targetID }?.session.id
+                targetID = proposed != sourceID ? proposed : nil
+                targetWasSuggested = targetID != nil
+                receipt = nil
+            }
+        } catch {
+            guard generation == token, !Task.isCancelled else { return }
+            suggestionFailed = true
+        }
+        guard generation == token else { return }
+        suggestionTask = nil
+        isSuggesting = false
+    }
+
+    /// Keeps suggestion evidence tied to the current native catalog, with no duplicate identities.
+    ///
+    /// Args:
+    ///   candidates: Ranked metadata and visible snippets returned by the suggestion service.
+    ///
+    /// Returns:
+    ///   Candidates whose identities remain in the loaded native catalog.
+    private func validCandidates(_ candidates: [AgentHandoffSuggestionCandidate]) -> [AgentHandoffSuggestionCandidate] {
+        let validIDs = Set(sessions.map(\.id))
+        var seen = Set<String>()
+        return candidates.filter { validIDs.contains($0.session.id) && seen.insert($0.session.id).inserted }
+    }
+
+    /// Starts exactly one preview operation for the currently selected source.
+    ///
+    /// Returns:
+    ///   Nothing. Results can update the draft only while both source and generation still match.
+    private func startHistoryLoading() {
+        guard operation != .loadingSessions, !isSending, operation != .openingTarget,
+              let source, historyTask == nil else { return }
+        let token = historyGeneration
+        let draft = generation
+        operation = .loadingHistory
+        historyTask = Task { [weak self] in
+            guard let self, !Task.isCancelled, generation == draft, historyGeneration == token else { return }
+            do {
+                let result = try await historyLoader(source)
+                guard generation == draft, historyGeneration == token, sourceID == source.id,
+                      !Task.isCancelled else {
+                    await discarder(result)
+                    return
+                }
+                guard result.source.id == source.id else {
+                    await discarder(result)
+                    guard generation == draft, historyGeneration == token else { return }
+                    failure = AgentHandoffUIFailure(label: .historyFailed, underlying: nil)
+                    operation = .idle
+                    historyTask = nil
+                    return
+                }
+                history = result
+                historyWasSubmitted = false
+            } catch {
+                guard generation == draft, historyGeneration == token, !Task.isCancelled else { return }
+                failure = AgentHandoffUIFailure(label: .historyFailed, underlying: error)
+            }
+            guard generation == draft, historyGeneration == token else { return }
+            operation = .idle
+            historyTask = nil
+        }
+    }
+
+    /// Invalidates only source history so a manual source change does not cancel receiver suggestions.
+    private func invalidateHistoryLoad() {
+        historyGeneration &+= 1
+        historyTask?.cancel()
+        historyTask = nil
+        if operation == .loadingHistory { operation = .idle }
+    }
+
+    /// Cancels pending suggestions and previews before a new draft, catalog, or closed window.
+    private func invalidatePendingWork() {
+        generation &+= 1
+        suggestionTask?.cancel()
+        suggestionTask = nil
+        isSuggesting = false
+        invalidateHistoryLoad()
+    }
+
+    /// Lists suggested conversations first while keeping every catalog conversation available.
+    ///
+    /// Args:
+    ///   isSource: Whether to use source or receiver suggestion order.
+    ///   query: Optional user-entered title filter.
+    ///
+    /// Returns:
+    ///   Ranked native sessions, followed by the remaining catalog in its original order.
+    func choices(isSource: Bool, query: String) -> [AgentSessionDescriptor] {
+        let candidates = isSource ? sourceCandidates : targetCandidates
+        let order = Dictionary(uniqueKeysWithValues: candidates.enumerated().map { ($1.session.id, $0) })
+        let ranked = sessions.enumerated().sorted { lhs, rhs in
+            let left = order[lhs.element.id] ?? candidates.count + lhs.offset
+            let right = order[rhs.element.id] ?? candidates.count + rhs.offset
+            return left < right
+        }.map(\.element)
+        return Self.filtered(ranked, query: query)
     }
 
     /// Delivers one reviewed history snapshot after the user explicitly requests it.
@@ -335,7 +510,7 @@ final class AgentHandoffViewModel {
     /// Returns:
     ///   Nothing. Sending remains a separate user action.
     func openTarget() async {
-        guard !isBusy, let target, target.canOpenExistingConversation else { return }
+        guard !isBusy, !isSuggesting, let target, target.canOpenExistingConversation else { return }
         let token = generation
         operation = .openingTarget
         failure = nil
@@ -354,7 +529,7 @@ final class AgentHandoffViewModel {
     /// Returns:
     ///   Nothing. Pending loads are invalidated and their late results are discarded separately.
     func clearUnsentPreview() {
-        generation &+= 1
+        invalidatePendingWork()
         discardCurrentPreview()
         if !isSending { operation = .idle }
     }
@@ -408,6 +583,8 @@ struct AgentHandoffView: View {
     private static let maximumPreviewCharacters = 8000
     @State private var model: AgentHandoffViewModel
     @State private var showsPreview = false
+    @State private var showsSourceChoices = false
+    @State private var showsTargetChoices = false
     @AppStorage("tf_language") private var languageRaw = AppLanguage.systemDefault
     @AppStorage(SettingsTheme.storageKey) private var themeRaw = SettingsTheme.defaultValue.rawValue
 
@@ -424,6 +601,12 @@ struct AgentHandoffView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: TF.spacingXL) {
             header
+            if model.isSuggesting {
+                HStack(spacing: TF.spacingSM) {
+                    ProgressView().controlSize(.small)
+                    Text(copy(.findingSuggestions)).font(.system(size: 12)).foregroundStyle(TF.settingsTextSecondary)
+                }
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: TF.spacingXL) {
                     HStack(alignment: .top, spacing: TF.spacingXL) {
@@ -444,7 +627,6 @@ struct AgentHandoffView: View {
         .background(AgentHandoffWindowAppearance(theme: SettingsTheme.resolve(themeRaw), title: copy(.title)))
         .foregroundStyle(TF.settingsText)
         .preferredColorScheme(SettingsTheme.resolve(themeRaw).colorScheme)
-        .task { await model.refreshSessions() }
         .onDisappear { model.clearUnsentPreview() }
     }
 
@@ -462,69 +644,115 @@ struct AgentHandoffView: View {
         }
     }
 
-    /// Builds a title-filtered native session list with explicit selection.
+    /// Shows the selected conversation above an optional list of suggested and other sessions.
     ///
     /// Args:
-    ///   isSource: Whether this column chooses the history source or receiver.
+    ///   isSource: Whether the column chooses the history source or receiver.
     ///
     /// Returns:
-    ///   A column sharing MyType's settings typography and palette.
+    ///   A reviewable selection using MyType's existing settings typography and palette.
     private func sessionColumn(isSource: Bool) -> some View {
         let query = isSource ? model.sourceFilter : model.targetFilter
-        let sessions = AgentHandoffViewModel.filtered(model.sessions, query: query)
-        let selectedID = isSource ? model.sourceID : model.targetID
+        let sessions = model.choices(isSource: isSource, query: query)
+        let selected = isSource ? model.source : model.target
+        let showChoices = selected == nil || (isSource ? showsSourceChoices : showsTargetChoices)
         return VStack(alignment: .leading, spacing: TF.spacingSM) {
-            Text(copy(isSource ? .source : .target)).font(.system(size: 15, weight: .semibold))
-            TextField(copy(.findTitle), text: isSource ? $model.sourceFilter : $model.targetFilter)
-                .textFieldStyle(.roundedBorder)
-                .disabled(model.isSending)
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: TF.spacingXS) {
-                    if sessions.isEmpty {
-                        Text(copy(model.operation == .loadingSessions ? .loadingSessions :
-                                    (model.sessions.isEmpty ? .noSessions : .noMatches)))
-                            .font(.system(size: 12)).foregroundStyle(TF.settingsTextSecondary)
-                            .padding(TF.spacingLG).frame(maxWidth: .infinity, alignment: .leading)
+            HStack {
+                Text(copy(isSource ? .source : .target)).font(.system(size: 15, weight: .semibold))
+                Spacer()
+                if selected != nil {
+                    Button(copy(showChoices ? .hideChoices : .changeSelection)) {
+                        if isSource { showsSourceChoices.toggle() } else { showsTargetChoices.toggle() }
                     }
-                    ForEach(sessions) { session in
-                        Button {
-                            if isSource { model.selectSource(session.id) } else { model.selectTarget(session.id) }
-                        } label: {
-                            HStack(alignment: .top, spacing: TF.spacingSM) {
-                                Image(systemName: selectedID == session.id ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(selectedID == session.id ? TF.settingsNavActive : TF.settingsTextTertiary)
-                                    .padding(.top, 2)
-                                VStack(alignment: .leading, spacing: TF.spacingXS) {
-                                    Text(AgentSessionDescriptor.displayTitle(session.title, language: language))
-                                        .font(.system(size: 13, weight: .medium)).lineLimit(2)
-                                        .foregroundStyle(TF.settingsText)
-                                    HStack {
-                                        Text(session.application.displayName)
-                                        Spacer(minLength: TF.spacingSM)
-                                        Text(AgentHandoffCopy.timestamp(Date(timeIntervalSince1970: session.updatedAt), language: language))
-                                    }
-                                    .font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
-                                    Text(String(session.sessionID.suffix(8)))
-                                        .font(.system(size: 10)).foregroundStyle(TF.settingsTextTertiary)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                            .padding(TF.spacingMD)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(selectedID == session.id ? TF.settingsSidebarActive : Color.clear,
-                                        in: RoundedRectangle(cornerRadius: TF.cornerSM))
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.isSending || (!isSource && session.id == model.sourceID))
-                    }
+                    .disabled(model.isSending)
                 }
-                .padding(TF.spacingXS)
             }
-            .frame(height: 200)
-            .background(TF.settingsSidebar, in: RoundedRectangle(cornerRadius: TF.cornerMD))
-            Text(copy(isSource ? .chooseSource : .chooseTarget))
-                .font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
+            if let selected {
+                VStack(alignment: .leading, spacing: TF.spacingSM) {
+                    Text(copy((isSource ? model.sourceWasSuggested : model.targetWasSuggested) ? .suggested : .manuallySelected))
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(TF.settingsNavActive)
+                    sessionDetails(selected, isSource: isSource)
+                }
+                .padding(TF.spacingMD)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(TF.settingsSidebarActive, in: RoundedRectangle(cornerRadius: TF.cornerMD))
+            } else if model.voiceInstruction != nil, !model.isSuggesting, model.operation != .loadingSessions {
+                Text(copy(.missingSuggestion)).font(.system(size: 12)).foregroundStyle(TF.settingsTextSecondary)
+            }
+            if showChoices {
+                TextField(copy(.findTitle), text: isSource ? $model.sourceFilter : $model.targetFilter)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(model.isSending)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: TF.spacingXS) {
+                        if sessions.isEmpty {
+                            Text(copy(model.operation == .loadingSessions ? .loadingSessions :
+                                        (model.sessions.isEmpty ? .noSessions : .noMatches)))
+                                .font(.system(size: 12)).foregroundStyle(TF.settingsTextSecondary)
+                                .padding(TF.spacingLG).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        ForEach(sessions) { session in
+                            Button {
+                                if isSource {
+                                    model.selectSource(session.id)
+                                    showsSourceChoices = false
+                                } else {
+                                    model.selectTarget(session.id)
+                                    showsTargetChoices = false
+                                }
+                            } label: {
+                                HStack(alignment: .top, spacing: TF.spacingSM) {
+                                    Image(systemName: selected?.id == session.id ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(selected?.id == session.id ? TF.settingsNavActive : TF.settingsTextTertiary)
+                                        .padding(.top, 2)
+                                    sessionDetails(session, isSource: isSource)
+                                }
+                                .padding(TF.spacingMD)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(selected?.id == session.id ? TF.settingsSidebarActive : Color.clear,
+                                            in: RoundedRectangle(cornerRadius: TF.cornerSM))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(model.isSending || (!isSource && session.id == model.sourceID))
+                        }
+                    }
+                    .padding(TF.spacingXS)
+                }
+                .frame(height: 200)
+                .background(TF.settingsSidebar, in: RoundedRectangle(cornerRadius: TF.cornerMD))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Renders title, app, activity time, and matching visible text for review before confirmation.
+    ///
+    /// Args:
+    ///   session: Exact catalog conversation to describe.
+    ///   isSource: Which suggestion list supplies the matching text.
+    ///
+    /// Returns:
+    ///   User-facing context without translating titles or original conversation snippets.
+    private func sessionDetails(_ session: AgentSessionDescriptor, isSource: Bool) -> some View {
+        let candidates = isSource ? model.sourceCandidates : model.targetCandidates
+        let candidate = candidates.first { $0.session.id == session.id }
+        return VStack(alignment: .leading, spacing: TF.spacingXS) {
+            Text(AgentSessionDescriptor.displayTitle(session.title, language: language))
+                .font(.system(size: 13, weight: .medium)).lineLimit(2).foregroundStyle(TF.settingsText)
+            HStack {
+                Text(session.application.displayName)
+                Spacer(minLength: TF.spacingSM)
+                Text(AgentHandoffCopy.timestamp(Date(timeIntervalSince1970: session.updatedAt), language: language))
+            }
+            .font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
+            if let candidate, !candidate.snippet.isEmpty {
+                Text(candidate.snippet).font(.system(size: 12)).lineLimit(3)
+                    .foregroundStyle(TF.settingsTextSecondary)
+                    .accessibilityLabel(copy(.suggestionMatch) + ": " + candidate.snippet)
+            }
+            Text(String(session.sessionID.suffix(8)))
+                .font(.system(size: 10)).foregroundStyle(TF.settingsTextTertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -534,7 +762,7 @@ struct AgentHandoffView: View {
             HStack {
                 Text(copy(.history)).font(.system(size: 15, weight: .semibold))
                 Spacer()
-                Button { Task { await model.loadHistory() } } label: {
+                Button { Task { await model.loadHistory(forceReload: true) } } label: {
                     if model.operation == .loadingHistory {
                         HStack { ProgressView().controlSize(.small); Text(copy(.loadingHistory)) }
                     } else {
@@ -583,6 +811,17 @@ struct AgentHandoffView: View {
 
     @ViewBuilder
     private var feedback: some View {
+        if model.suggestionFailed {
+            Label(copy(.suggestionsUnavailable), systemImage: "exclamationmark.circle")
+                .font(.system(size: 12)).foregroundStyle(TF.settingsAccentAmber)
+        } else if let notice = model.suggestionNotice {
+            switch notice {
+            case .ambiguous:
+                Text(copy(.similarCandidates)).font(.system(size: 12)).foregroundStyle(TF.settingsTextSecondary)
+            case .rankingUnavailable:
+                Text(copy(.suggestionsUnavailable)).font(.system(size: 12)).foregroundStyle(TF.settingsAccentAmber)
+            }
+        }
         if !model.unavailableApplications.isEmpty {
             Text(copy(.catalogPartial) + ": " + model.unavailableApplications.map(\.displayName).joined(separator: ", "))
                 .font(.system(size: 12)).foregroundStyle(TF.settingsAccentAmber)
@@ -613,7 +852,7 @@ struct AgentHandoffView: View {
             Button { Task { await model.openTarget() } } label: {
                 Text(copy(model.operation == .openingTarget ? .openingTarget : .openTarget))
             }
-            .disabled(model.isBusy || model.target?.canOpenExistingConversation != true)
+            .disabled(model.isBusy || model.isSuggesting || model.target?.canOpenExistingConversation != true)
             Button { Task { await model.send() } } label: {
                 HStack {
                     if model.isSending { ProgressView().controlSize(.small) }

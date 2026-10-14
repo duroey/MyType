@@ -15,7 +15,7 @@ final class AgentHandoffUITests: XCTestCase {
             }
             XCTAssertTrue(AgentHandoffCopy.snapshot(history, language: language).contains("2"))
             XCTAssertEqual(AgentHandoffCopy.text(.send, language: language),
-                           language == .zh ? "发送历史并继续" : "Send history and continue")
+                           language == .zh ? "确认交接" : "Confirm handoff")
             XCTAssertEqual(history.source.title, "MyType 体验包")
             XCTAssertEqual(history.markdown, "用户：保留原始中文\n助手：下一步继续")
         }
@@ -57,10 +57,11 @@ final class AgentHandoffUITests: XCTestCase {
         let first = session(number: 1)
         let second = session(number: 2)
         let gate = HandoffHistoryGate()
+        let secondSnapshot = history(source: second)
         let discards = HandoffDiscardRecords()
         let model = AgentHandoffViewModel(
             catalogLoader: { AgentSessionCatalogSnapshot(sessions: [first, second], unavailableApplications: []) },
-            historyLoader: { _ in await gate.load() },
+            historyLoader: { source in source.id == first.id ? await gate.load() : secondSnapshot },
             discarder: { await discards.discard($0) }
         )
         await model.refreshSessions()
@@ -70,8 +71,9 @@ final class AgentHandoffUITests: XCTestCase {
         model.selectSource(second.id)
         await gate.resolve(history(source: first))
         await load.value
+        await model.loadHistory()
         XCTAssertEqual(model.sourceID, second.id)
-        XCTAssertNil(model.history)
+        XCTAssertEqual(model.history?.source.id, second.id)
         XCTAssertEqual(model.operation, .idle)
         XCTAssertFalse(model.canSend)
         let discardedSources = await discards.sourceIDs
@@ -147,6 +149,35 @@ final class AgentHandoffUITests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+    /// Verifies selecting the same receiver again preserves its accepted delivery evidence.
+    ///
+    /// Returns:
+    ///   Nothing. The receipt remains visible and unchanged delivery remains blocked.
+    @MainActor
+    func testReselectingReceiverKeepsAcceptedReceipt() async {
+        let source = session(number: 1)
+        let target = session(number: 2)
+        let snapshot = history(source: source)
+        let model = AgentHandoffViewModel(
+            catalogLoader: { AgentSessionCatalogSnapshot(sessions: [source, target], unavailableApplications: []) },
+            historyLoader: { _ in snapshot },
+            sender: { _, target, _ in
+                AgentHandoffDeliveryReceipt(route: .codexQueue, messageID: "accepted-fixture", target: target,
+                                            usesHistoryFile: true)
+            },
+            discarder: { _ in }
+        )
+        await model.refreshSessions()
+        model.selectSource(source.id)
+        model.selectTarget(target.id)
+        model.instruction = "继续工作"
+        await model.loadHistory()
+        await model.send()
+        model.selectTarget(target.id)
+        XCTAssertEqual(model.receipt?.messageID, "accepted-fixture")
+        XCTAssertFalse(model.canSend)
+    }
+
     /// Verifies abandoned previews are reclaimed after changing the source or closing the window.
     ///
     /// Returns:
@@ -185,18 +216,24 @@ final class AgentHandoffUITests: XCTestCase {
         let first = session(number: 1)
         let second = session(number: 2)
         let snapshot = history(source: first)
+        let nextSnapshot = history(source: second)
+        let snapshots = [first.id: snapshot, second.id: nextSnapshot]
         for accepted in [true, false] {
             let reclaimed = expectation(description: "Submitted snapshot must be preserved")
             reclaimed.isInverted = true
+            let unusedReclaimed = expectation(description: "New unused preview is reclaimed")
             let model = AgentHandoffViewModel(
                 catalogLoader: { AgentSessionCatalogSnapshot(sessions: [first, second], unavailableApplications: []) },
-                historyLoader: { _ in snapshot },
+                historyLoader: { snapshots[$0.id]! },
                 sender: { _, target, _ in
                     guard accepted else { throw AgentHandoffDeliveryError.deliveryUncertain }
                     return AgentHandoffDeliveryReceipt(route: .codexQueue, messageID: UUID().uuidString,
                                                        target: target, usesHistoryFile: true)
                 },
-                discarder: { _ in reclaimed.fulfill() }
+                discarder: {
+                    if $0.fileURL == snapshot.fileURL { reclaimed.fulfill() }
+                    if $0.fileURL == nextSnapshot.fileURL { unusedReclaimed.fulfill() }
+                }
             )
             await model.refreshSessions()
             model.selectSource(first.id)
@@ -206,8 +243,11 @@ final class AgentHandoffUITests: XCTestCase {
             await model.send()
             model.clearUnsentPreview()
             model.selectSource(second.id)
+            await model.loadHistory()
+            XCTAssertEqual(model.history?.source.id, second.id)
+            model.clearUnsentPreview()
             XCTAssertNil(model.history)
-            await fulfillment(of: [reclaimed], timeout: 0.1)
+            await fulfillment(of: [unusedReclaimed, reclaimed], timeout: 0.1)
         }
     }
 
@@ -238,7 +278,7 @@ final class AgentHandoffUITests: XCTestCase {
     private func history(source: AgentSessionDescriptor) -> AgentHandoffHistory {
         AgentHandoffHistory(source: source, markdown: "用户：保留原始中文\n助手：下一步继续", messageCount: 2,
                             snapshotDate: Date(timeIntervalSince1970: 1_000),
-                            fileURL: URL(fileURLWithPath: "/synthetic-fixture/history.md"))
+                            fileURL: URL(fileURLWithPath: "/synthetic-fixture/\(source.sessionID)/history.md"))
     }
 }
 

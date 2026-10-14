@@ -8,11 +8,12 @@ final class AgentHandoffWindowController: NSObject, NSWindowDelegate {
 
     private let model = AgentHandoffViewModel()
     private var handoffWindow: NSWindow?
+    private var preparationTask: Task<Void, Never>?
 
-    /// Opens the existing handoff workflow without submitting history or choosing conversations.
+    /// Opens an editable handoff draft, preparing suggestions without submitting history.
     ///
     /// Args:
-    ///   voiceInstruction: Optional original voice request used to start a new, unselected draft.
+    ///   voiceInstruction: Optional original voice request used to suggest both conversation selections.
     ///
     /// Returns:
     ///   Whether the request was accepted. A voice request cannot replace an active delivery.
@@ -24,7 +25,11 @@ final class AgentHandoffWindowController: NSObject, NSWindowDelegate {
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
-        Task { await model.refreshSessions() }
+        preparationTask?.cancel()
+        preparationTask = Task { [model] in
+            guard !Task.isCancelled else { return }
+            await model.refreshSessions()
+        }
         return true
     }
 
@@ -54,6 +59,8 @@ final class AgentHandoffWindowController: NSObject, NSWindowDelegate {
     /// Args:
     ///   notification: The native close event for this controller's handoff window.
     func windowWillClose(_ notification: Notification) {
+        preparationTask?.cancel()
+        preparationTask = nil
         model.clearUnsentPreview()
     }
 }

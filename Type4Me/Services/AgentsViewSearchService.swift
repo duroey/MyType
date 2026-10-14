@@ -197,11 +197,54 @@ actor AgentsViewSearchService {
     ///   CancellationError: The owning routing task was replaced or cancelled.
     func search(_ query: String) async throws -> [AgentsViewSearchHit] {
         try Task.checkCancellation()
-        let configuration = try settings.get()
+        return try await search(query, agent: nil, configuration: settings.get())
+    }
+
+    /// Retrieves a finite wider pool for handoff suggestions without changing normal wake search.
+    ///
+    /// Args:
+    ///   query: Role-specific text derived from the user's original request.
+    ///   agent: Optional explicit provider constraint, either codex or claude.
+    ///   maximumResults: Maximum message hits requested before local session aggregation.
+    ///   maximumResponseBytes: Byte limit for the wider response.
+    ///
+    /// Returns:
+    ///   Distinct session leads after the bounded backend hit limit.
+    ///
+    /// Raises:
+    ///   Error: Invalid bounds, configuration, cancellation or search failure.
+    func searchForHandoff(
+        _ query: String, agent: String?, maximumResults: Int, maximumResponseBytes: Int
+    ) async throws -> [AgentsViewSearchHit] {
+        guard (1...500).contains(maximumResults), (1...4_194_304).contains(maximumResponseBytes) else {
+            throw AgentsViewSearchError.invalidConfiguration
+        }
+        var configuration = try settings.get()
+        configuration.maximumResults = maximumResults
+        configuration.maximumResponseBytes = maximumResponseBytes
+        return try await search(query, agent: agent, configuration: configuration)
+    }
+
+    /// Executes one local read using caller-specific bounds and no redirect or proxy forwarding.
+    ///
+    /// Args:
+    ///   query: Search text, kept on the loopback service.
+    ///   agent: Optional validated provider filter.
+    ///   configuration: Transport and result bounds.
+    ///
+    /// Returns:
+    ///   Sanitized, session-deduplicated search leads.
+    ///
+    /// Raises:
+    ///   Error: Validation, cancellation or transport failure.
+    private func search(
+        _ query: String, agent: String?, configuration: Configuration
+    ) async throws -> [AgentsViewSearchHit] {
+        try Task.checkCancellation()
         let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return [] }
         guard value.count <= configuration.maximumQueryCharacters else { throw AgentsViewSearchError.queryTooLong }
-        let request = try Self.request(query: value, configuration: configuration)
+        let request = try Self.request(query: value, configuration: configuration, agent: agent)
         let transport = URLSessionConfiguration.ephemeral
         transport.connectionProxyDictionary = [:]
         transport.urlCache = nil
@@ -258,13 +301,16 @@ actor AgentsViewSearchService {
     /// Args:
     ///   query: Validated user request.
     ///   configuration: Endpoint, deadline and result bounds.
+    ///   agent: Optional provider allowlist constraint for one handoff role.
     ///
     /// Returns:
     ///   An HTTP GET request with explicit semantic-search consent for the local index.
     ///
     /// Raises:
     ///   AgentsViewSearchError: The endpoint is not a numeric loopback root URL.
-    nonisolated static func request(query: String, configuration: Configuration) throws -> URLRequest {
+    nonisolated static func request(
+        query: String, configuration: Configuration, agent: String? = nil
+    ) throws -> URLRequest {
         let endpoint = try configuration.validatedEndpoint()
         guard query.count <= configuration.maximumQueryCharacters else { throw AgentsViewSearchError.queryTooLong }
         guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
@@ -277,6 +323,10 @@ actor AgentsViewSearchService {
             URLQueryItem(name: "include_one_shot", value: "true"), URLQueryItem(name: "exclude_system", value: "true"),
             URLQueryItem(name: "limit", value: String(configuration.maximumResults)),
         ]
+        if let agent {
+            guard ["codex", "claude"].contains(agent) else { throw AgentsViewSearchError.invalidConfiguration }
+            components.queryItems?.append(URLQueryItem(name: "agent", value: agent))
+        }
         // Go's query decoder treats literal plus signs as spaces; preserve the user's text.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let url = components.url else { throw AgentsViewSearchError.invalidConfiguration }
