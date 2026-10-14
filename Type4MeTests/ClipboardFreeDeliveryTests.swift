@@ -141,6 +141,37 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         XCTAssertEqual(target.directCalls, 1)
     }
 
+    /// An editor can expose intermediate text before the queued input is fully rendered.
+    func testIntermediateContentChangeWaitsForExactReceiptWithoutRetry() {
+        let target = StubClipboardFreeTarget()
+        target.unicodeResult = .dispatched
+        var pollsWaited = 0
+        target.observe = {
+            if target.unicodeCalls == 0 { return .unchanged }
+            return pollsWaited >= 2 ? .inserted : .changed
+        }
+        let result = ClipboardFreeDeliveryTransaction(wait: { _ in pollsWaited += 1 }).deliver(to: target)
+        XCTAssertEqual(result, .inserted)
+        XCTAssertEqual(pollsWaited, 2)
+        XCTAssertEqual(target.unicodeCalls, 1)
+        XCTAssertEqual(target.directCalls, 0)
+    }
+
+    /// Waiting for an intermediate value must stop when the user leaves the original field.
+    func testIntermediateContentDoesNotHideLaterFocusChange() {
+        let target = StubClipboardFreeTarget()
+        target.unicodeResult = .dispatched
+        var waited = false
+        target.observe = {
+            if target.unicodeCalls == 0 { return .unchanged }
+            return waited ? .targetChanged : .changed
+        }
+        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in waited = true }).deliver(to: target),
+                       .inputTargetChanged)
+        XCTAssertEqual(target.unicodeCalls, 1)
+        XCTAssertEqual(target.directCalls, 0)
+    }
+
     /// Distinct failure causes keep short, localized recovery feedback instead of a normal completion.
     func testFailureFeedbackInBothLanguages() {
         let previous = UserDefaults.standard.object(forKey: "tf_language")

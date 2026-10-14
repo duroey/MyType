@@ -61,9 +61,11 @@ final class ClipboardFreeDeliveryTransaction {
         for attempt in 0...polls {
             finalObservation = target.observation()
             switch finalObservation {
-            case .inserted, .changed, .targetChanged:
+            case .inserted, .targetChanged:
                 return finish(dispatch: dispatch, observation: finalObservation, route: route)
-            case .unchanged, .unavailable:
+            case .unchanged, .unavailable, .changed:
+                // Editors may expose partial text while processing already queued events.
+                // Keep observing within the existing deadline; never send the text again.
                 guard attempt < polls, ProcessInfo.processInfo.systemUptime < deadline else {
                     return finish(dispatch: dispatch, observation: finalObservation, route: route)
                 }
