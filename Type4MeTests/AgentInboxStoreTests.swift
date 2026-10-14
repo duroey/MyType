@@ -148,6 +148,154 @@ final class AgentInboxStoreTests: XCTestCase {
         XCTAssertEqual(store.items.count, 1)
     }
 
+    /// Keeps newer attention ahead of active work, regardless of the worker's recent state.
+    func testAttentionSortsAheadOfWorkersAndReadHistory() {
+        let store = immediateStore()
+        let question = AgentInboxRequest(id: "question", kind: .input, text: "Which option?")
+        let approval = AgentInboxRequest(id: "approval", kind: .approval, text: "Approve?")
+        store.apply(.init(session: session(id: "question"), status: .waiting, pendingRequests: [question],
+                          observedAt: Date(timeIntervalSince1970: 100)))
+        store.markRead(session(id: "question").id)
+        store.apply(.init(session: session(id: "approval"), status: .running, pendingRequests: [approval],
+                          nativeHasUnreadTurn: false, observedAt: Date(timeIntervalSince1970: 110)))
+        for (id, status, time): (String, AgentInboxStatus, TimeInterval) in [
+            ("failed", .failed, 120), ("interrupted", .interrupted, 130)
+        ] {
+            store.apply(.init(session: session(id: id), status: .running,
+                              observedAt: Date(timeIntervalSince1970: time - 1)))
+            store.apply(.init(session: session(id: id), status: status,
+                              observedAt: Date(timeIntervalSince1970: time)))
+        }
+        for (id, time): (String, TimeInterval) in [("idle", 140), ("unknown", 150), ("completed", 160), ("read", 170)] {
+            store.apply(.init(session: session(id: id), status: .completed, completionID: "turn",
+                              observedAt: Date(timeIntervalSince1970: time)))
+        }
+        store.apply(.init(session: session(id: "idle"), status: .idle,
+                          observedAt: Date(timeIntervalSince1970: 180)))
+        store.apply(.init(session: session(id: "unknown"), status: .unknown,
+                          observedAt: Date(timeIntervalSince1970: 190)))
+        store.markRead(session(id: "read").id)
+        store.apply(.init(session: session(id: "worker"), status: .running,
+                          observedAt: Date(timeIntervalSince1970: 300)))
+        store.apply(.init(session: session(id: "waiting"), status: .waiting,
+                          observedAt: Date(timeIntervalSince1970: 400)))
+
+        XCTAssertEqual(store.items.map(\.session.sessionID), [
+            "completed", "unknown", "idle", "interrupted", "failed", "approval", "question", "waiting", "worker", "read"
+        ])
+        XCTAssertTrue(store.items.prefix(7).allSatisfy(\.needsAttention))
+        XCTAssertTrue(store.items.suffix(3).allSatisfy { !$0.needsAttention })
+    }
+
+    /// Preserves a completion's attention time across idle, disconnect, and reconnect baselines.
+    func testUnreadCompletionDoesNotJumpAboveNewWorkAfterReconnect() {
+        let store = immediateStore()
+        let older = session(id: "older")
+        let newer = session(id: "newer")
+        let start = Date(timeIntervalSince1970: 100)
+        store.apply(.init(session: older, status: .completed, completionID: "old-turn", observedAt: start))
+        store.apply(.init(session: newer, status: .completed, completionID: "newer-turn",
+                          observedAt: start.addingTimeInterval(1)))
+        for (index, status) in [AgentInboxStatus.unknown, .idle, .completed, .idle, .unknown, .completed].enumerated() {
+            store.apply(.init(session: older, status: status, preview: "Retained answer",
+                              completionID: status == .completed ? "old-turn" : nil,
+                              observedAt: start.addingTimeInterval(Double(index + 2))))
+            XCTAssertEqual(store.items.map(\.id), [newer.id, older.id])
+            XCTAssertEqual(store.items.last?.updatedAt, start)
+        }
+        store.apply(.init(session: older, status: .completed, completionID: "genuinely-new-turn",
+                          observedAt: start.addingTimeInterval(10)))
+        XCTAssertEqual(store.items.first?.id, older.id)
+        XCTAssertEqual(store.items.first?.updatedAt, start.addingTimeInterval(10))
+
+        store.apply(.init(session: newer, status: .failed, observedAt: start.addingTimeInterval(11)))
+        XCTAssertEqual(store.items.first?.id, newer.id)
+        XCTAssertEqual(store.items.first?.updatedAt, start.addingTimeInterval(11))
+        store.apply(.init(session: older, status: .interrupted, observedAt: start.addingTimeInterval(12)))
+        XCTAssertEqual(store.items.first?.id, older.id)
+        XCTAssertEqual(store.items.first?.updatedAt, start.addingTimeInterval(12))
+    }
+
+    /// Leaves an old unanswered request in place when its owner streams or reconnects.
+    func testPendingRequestRetainsAttentionTimeUntilANewRequestArrives() {
+        let store = immediateStore()
+        let first = session(id: "old-question")
+        let second = session(id: "new-question")
+        let oldQuestion = AgentInboxRequest(id: "question", kind: .input, text: "Which option?")
+        let approval = AgentInboxRequest(id: "approval", kind: .approval, text: "Approve?")
+        let start = Date(timeIntervalSince1970: 100)
+        store.apply(.init(session: first, status: .waiting, pendingRequests: [oldQuestion, approval], observedAt: start))
+        store.apply(.init(session: second, status: .waiting, pendingRequests: [oldQuestion],
+                          observedAt: start.addingTimeInterval(1)))
+        let changedQuestion = AgentInboxRequest(id: "question", kind: .input, text: "Expanded details")
+        store.apply(.init(session: first, status: .running, pendingRequests: [approval, changedQuestion],
+                          preview: "Partial response", observedAt: start.addingTimeInterval(2)))
+        store.apply(.init(session: first, status: .unknown, pendingRequests: [changedQuestion],
+                          preview: "More text", observedAt: start.addingTimeInterval(3)))
+        store.markRead(first.id)
+        XCTAssertEqual(store.items.map(\.id), [second.id, first.id])
+        XCTAssertEqual(store.items.last?.updatedAt, start)
+        XCTAssertTrue(store.items.last?.needsAttention == true)
+
+        let newQuestion = AgentInboxRequest(id: "next-question", kind: .input, text: "And then?")
+        store.apply(.init(session: first, status: .waiting, pendingRequests: [changedQuestion, newQuestion],
+                          observedAt: start.addingTimeInterval(4)))
+        XCTAssertEqual(store.items.first?.id, first.id)
+        XCTAssertEqual(store.items.first?.updatedAt, start.addingTimeInterval(4))
+
+        store.apply(.init(session: first, status: .running, pendingRequests: [],
+                          observedAt: start.addingTimeInterval(5)))
+        XCTAssertEqual(store.items.map(\.id), [second.id, first.id])
+        XCTAssertEqual(store.items.last?.updatedAt, start.addingTimeInterval(5))
+        XCTAssertFalse(store.items.last?.needsAttention ?? true)
+    }
+
+    /// Updates visible streamed text without making it newer than another worker's state.
+    func testStreamingPreviewDoesNotRefreshOrderingTime() {
+        let store = immediateStore()
+        let first = session(id: "first")
+        let second = session(id: "second")
+        let start = Date(timeIntervalSince1970: 100)
+        store.apply(.init(session: first, status: .running, preview: "Beginning", observedAt: start))
+        store.apply(.init(session: second, status: .running, observedAt: start.addingTimeInterval(1)))
+        store.apply(.init(session: first, status: .running, preview: "Expanded output",
+                          observedAt: start.addingTimeInterval(2)))
+        XCTAssertEqual(store.items.map(\.id), [second.id, first.id])
+        XCTAssertEqual(store.items.last?.preview, "Expanded output")
+        XCTAssertEqual(store.items.last?.updatedAt, start)
+        store.apply(.init(session: first, status: .waiting, observedAt: start.addingTimeInterval(3)))
+        XCTAssertEqual(store.items.first?.id, first.id)
+        XCTAssertEqual(store.items.first?.updatedAt, start.addingTimeInterval(3))
+    }
+
+    /// Resolves ties by native identity and immediately reorders a completed row when read.
+    func testStableIdentityTieBreakAndReadReordering() {
+        let store = immediateStore()
+        let start = Date(timeIntervalSince1970: 100)
+        for id in ["zeta", "alpha"] {
+            store.apply(.init(session: session(id: id), status: .completed, completionID: "turn", observedAt: start))
+        }
+        store.apply(.init(session: session(id: "worker"), status: .running, observedAt: start.addingTimeInterval(1)))
+        XCTAssertEqual(store.items.map(\.session.sessionID), ["alpha", "zeta", "worker"])
+        store.markRead(session(id: "alpha").id)
+        XCTAssertEqual(store.items.map(\.session.sessionID), ["zeta", "worker", "alpha"])
+    }
+
+    /// Applies the retention bound after grouping so active work cannot evict an old request.
+    func testRetentionKeepsOutstandingAttentionBeforeNewerWorkers() {
+        var configuration = AgentNotificationConfiguration()
+        configuration.maximumInboxItems = 2
+        let store = AgentInboxStore(configuration: configuration)
+        let question = AgentInboxRequest(id: "question", kind: .input, text: "Which option?")
+        store.apply(.init(session: session(id: "question"), status: .waiting, pendingRequests: [question],
+                          observedAt: Date(timeIntervalSince1970: 100)))
+        store.apply(.init(session: session(id: "worker-1"), status: .running,
+                          observedAt: Date(timeIntervalSince1970: 200)))
+        store.apply(.init(session: session(id: "worker-2"), status: .running,
+                          observedAt: Date(timeIntervalSince1970: 300)))
+        XCTAssertEqual(store.items.map(\.session.sessionID), ["question", "worker-2"])
+    }
+
     /// Verifies a new turn with identical output receives its own completion time and popup.
     func testIdenticalAnswersFromDifferentTurnsAreNewWork() {
         let store = immediateStore()

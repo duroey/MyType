@@ -4,8 +4,10 @@ import SwiftUI
 struct AgentInboxView: View {
     @ObservedObject var store: AgentInboxStore
     @ObservedObject var model: AgentInboxViewModel
+    var layout = AgentInboxPanelLayout()
     let onClose: () -> Void
-    var onHoverChanged: (Bool) -> Void = { _ in }
+    var onContentHeightChange: (CGFloat) -> Void = { _ in }
+    @State private var measurements: [AgentInboxMeasuredElement: CGFloat] = [:]
     @AppStorage("tf_language") private var languageRaw = AppLanguage.systemDefault
     @AppStorage(SettingsTheme.storageKey) private var themeRaw = SettingsTheme.defaultValue.rawValue
 
@@ -14,30 +16,35 @@ struct AgentInboxView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
+            header.measuringInboxHeight(.header)
             if store.storageError {
                 Text(copy(.storageFailed))
                     .font(.system(size: 12)).foregroundStyle(TF.settingsAccentAmber)
                     .padding(.horizontal, TF.spacingLG).padding(.bottom, TF.spacingMD)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .measuringInboxHeight(.warning)
             }
             if store.items.isEmpty {
-                emptyState
+                emptyState.measuringInboxHeight(.empty)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: TF.spacingSM) {
-                        ForEach(store.items) { item in
-                            AgentInboxRow(
-                                item: item, language: language,
-                                isOpening: model.openingID == item.id,
-                                isBusy: model.openingID != nil,
-                                failure: model.failedID == item.id ? model.failure : nil,
-                                onOpen: { Task { await model.open(item) } },
-                                onDismiss: { store.dismiss(item.id) }
-                            )
+                    VStack(spacing: layout.rowSpacing) {
+                        // Keep the measured prefix mounted even while the rest of the queue scrolls.
+                        ForEach(Array(store.items.prefix(layout.maximumVisibleItems))) { item in
+                            row(item, measured: true)
+                        }
+                        if store.items.count > layout.maximumVisibleItems {
+                            LazyVStack(spacing: layout.rowSpacing) {
+                                ForEach(Array(store.items.dropFirst(layout.maximumVisibleItems))) { item in
+                                    row(item, measured: false)
+                                }
+                            }
                         }
                     }
-                    .padding(.horizontal, TF.spacingLG).padding(.bottom, TF.spacingLG)
+                    .padding(.horizontal, TF.spacingLG)
                 }
+                .padding(.bottom, layout.listBottomInset)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -47,9 +54,11 @@ struct AgentInboxView: View {
         .foregroundStyle(TF.settingsText)
         .preferredColorScheme(theme.colorScheme)
         .environment(\.locale, Locale(identifier: language == .zh ? "zh_CN" : "en_US"))
-        .background(AgentInboxWindowAppearance(
-            theme: theme, title: copy(.title), onHoverChanged: onHoverChanged
-        ))
+        .background(AgentInboxWindowAppearance(theme: theme, title: copy(.title)))
+        .onPreferenceChange(AgentInboxHeightPreference.self) { measurements in
+            self.measurements = measurements
+            onContentHeightChange(layout.contentHeight(itemIDs: store.items.map(\.id), measurements: measurements))
+        }
     }
 
     private var header: some View {
@@ -89,8 +98,31 @@ struct AgentInboxView: View {
             Text(copy(.emptyDetail)).font(.system(size: 13))
                 .foregroundStyle(TF.settingsTextSecondary).fixedSize(horizontal: false, vertical: true)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .padding(TF.spacingXL)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Builds a native-session row with intrinsic height for the current language and width.
+    ///
+    /// Args:
+    ///   item: Queue snapshot, already ordered by user attention and activity time.
+    ///   measured: Whether this row belongs to the measured prefix of the queue.
+    ///
+    /// Returns:
+    ///   A naturally sized row whose navigation leaves the queue visible.
+    private func row(_ item: AgentInboxItem, measured: Bool) -> some View {
+        AgentInboxRow(
+            item: item, language: language,
+            minimumHeight: layout.minimumRowHeight(itemIDs: store.items.map(\.id), measurements: measurements),
+            measured: measured,
+            isOpening: model.openingID == item.id,
+            isBusy: model.openingID != nil,
+            failure: model.failedID == item.id ? model.failure : nil,
+            onOpen: { Task { await model.open(item) } },
+            onDismiss: { store.dismiss(item.id) }
+        )
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     /// Resolves semantic UI text whenever the persistent panel is rendered.
@@ -108,6 +140,8 @@ struct AgentInboxView: View {
 private struct AgentInboxRow: View {
     let item: AgentInboxItem
     let language: AppLanguage
+    let minimumHeight: CGFloat
+    let measured: Bool
     let isOpening: Bool
     let isBusy: Bool
     let failure: AgentInboxCopy.Label?
@@ -171,6 +205,9 @@ private struct AgentInboxRow: View {
             }
         }
         .padding(TF.spacingMD)
+        .fixedSize(horizontal: false, vertical: true)
+        .measuringInboxHeight(measured ? .row(item.id) : nil)
+        .frame(minHeight: minimumHeight, alignment: .topLeading)
         .background(hovered ? TF.settingsRowHover : TF.settingsCard,
                     in: RoundedRectangle(cornerRadius: TF.cornerMD))
         .overlay(RoundedRectangle(cornerRadius: TF.cornerMD).stroke(TF.settingsBorder, lineWidth: 1))
@@ -232,7 +269,6 @@ private struct AgentInboxRow: View {
 private struct AgentInboxWindowAppearance: NSViewRepresentable {
     let theme: SettingsTheme
     let title: String
-    let onHoverChanged: (Bool) -> Void
 
     /// Creates an invisible bridge for live window title and theme changes.
     ///
@@ -245,7 +281,6 @@ private struct AgentInboxWindowAppearance: NSViewRepresentable {
         let view = AppearanceView()
         view.theme = theme
         view.title = title
-        view.onHoverChanged = onHoverChanged
         return view
     }
 
@@ -257,45 +292,47 @@ private struct AgentInboxWindowAppearance: NSViewRepresentable {
     func updateNSView(_ nsView: AppearanceView, context: Context) {
         nsView.theme = theme
         nsView.title = title
-        nsView.onHoverChanged = onHoverChanged
     }
 
     final class AppearanceView: NSView {
         var theme = SettingsTheme.defaultValue { didSet { window?.appearance = theme.appearance } }
         var title = "" { didSet { window?.title = title } }
-        var onHoverChanged: ((Bool) -> Void)?
-
-        /// Tracks reading even when the nonactivating queue does not own keyboard focus.
-        override func updateTrackingAreas() {
-            trackingAreas.forEach(removeTrackingArea)
-            addTrackingArea(NSTrackingArea(
-                rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self
-            ))
-            super.updateTrackingAreas()
-        }
-
-        /// Suspends the notification deadline only for a pointer actually inside this view.
-        override func mouseEntered(with event: NSEvent) {
-            guard containsMouse else { return }
-            onHoverChanged?(true)
-        }
-
-        /// Ignores synthetic exits caused by resizing while the pointer is still over the queue.
-        override func mouseExited(with event: NSEvent) {
-            guard !containsMouse else { return }
-            onHoverChanged?(false)
-        }
-
-        private var containsMouse: Bool {
-            guard let window, window.isVisible else { return false }
-            return bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
-        }
-
         /// Updates AppKit after the observer joins its native window.
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             window?.appearance = theme.appearance
             window?.title = title
         }
+    }
+}
+
+/// Aggregates intrinsic heights without coupling SwiftUI layout to native window dimensions.
+private struct AgentInboxHeightPreference: PreferenceKey {
+    static let defaultValue: [AgentInboxMeasuredElement: CGFloat] = [:]
+
+    /// Combines current header, warning, empty state, and leading row measurements.
+    ///
+    /// Args:
+    ///   value: Measurements already collected in this render pass.
+    ///   nextValue: Measurements reported by another content element.
+    static func reduce(value: inout [AgentInboxMeasuredElement: CGFloat],
+                       nextValue: () -> [AgentInboxMeasuredElement: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+private extension View {
+    /// Reports natural content height without adding a layout constraint or visible element.
+    ///
+    /// Args:
+    ///   element: Stable identity, or nil for lazy rows outside the measured prefix.
+    ///
+    /// Returns:
+    ///   The original view with a noninteractive geometry reader in its background.
+    func measuringInboxHeight(_ element: AgentInboxMeasuredElement?) -> some View {
+        background(GeometryReader { geometry in
+            Color.clear.preference(key: AgentInboxHeightPreference.self,
+                                   value: element.map { [$0: geometry.size.height] } ?? [:])
+        })
     }
 }

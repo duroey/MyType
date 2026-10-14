@@ -17,9 +17,20 @@ struct AgentInboxItem: Codable, Equatable, Identifiable, Sendable {
     var status: AgentInboxStatus
     var pendingRequests: [AgentInboxRequest]
     var preview: String
+    /// Last meaningful state/request/completion change, excluding polling and streamed text.
     var updatedAt: Date
     var isUnread: Bool
     var id: String { session.id }
+
+    /// Whether the row still needs attention, independently of its execution state.
+    var needsAttention: Bool {
+        if !pendingRequests.isEmpty { return true }
+        switch status {
+        case .failed, .interrupted: return true
+        case .completed, .idle, .unknown: return isUnread
+        case .running, .waiting: return false
+        }
+    }
 }
 
 struct AgentInboxUpdate: Sendable {
@@ -65,7 +76,6 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
     var maximumCodexReadRefreshes = 4
     var persistenceDebounceSeconds: Double = 0.25
     var completionAlertDelaySeconds: Double = 2.5
-    var inboxAutoHideSeconds: Double = 8
     var viewingPollSeconds: Double = 0.25
     var viewingStableSeconds: Double = 1
     var viewingEvidenceMaxAgeSeconds: Double = 1
@@ -123,7 +133,6 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
               codexReadReconcileIntervalSeconds.isFinite, (0.5...30).contains(codexReadReconcileIntervalSeconds),
               (1...16).contains(maximumCodexReadRefreshes),
               completionAlertDelaySeconds.isFinite, (0...10).contains(completionAlertDelaySeconds),
-              inboxAutoHideSeconds.isFinite, (3...60).contains(inboxAutoHideSeconds),
               (0.1...2).contains(viewingPollSeconds), (0.5...5).contains(viewingStableSeconds),
               viewingEvidenceMaxAgeSeconds >= viewingPollSeconds, viewingEvidenceMaxAgeSeconds <= 5,
               (1_024...1_048_576).contains(maximumClaudeFocusLogBytes),

@@ -5,6 +5,8 @@ import Foundation
 /// A small persistent inbox; it never schedules or executes an agent task.
 @MainActor
 final class AgentInboxStore: ObservableObject {
+    private enum OrderingGroup: Int { case attention, active, history }
+
     static let shared: AgentInboxStore = {
         do {
             return AgentInboxStore(fileURL: AppIdentity.appSupportDirectory()
@@ -61,6 +63,7 @@ final class AgentInboxStore: ObservableObject {
                 copy.status = .unknown
                 return copy
             }
+            sortItems()
             // A hidden row stays hidden across a restart until new work is observed.
             dismissed = Dictionary(snapshot.dismissed.map { ($0.id, bounded($0)) }, uniquingKeysWith: { _, last in last })
             receipts = snapshot.receipts
@@ -110,7 +113,9 @@ final class AgentInboxStore: ObservableObject {
             !previousRequestIDs.contains($0.kind.rawValue + ":" + $0.id)
         }
         next.isUnread = update.nativeHasUnreadTurn != false && (next.isUnread || newCompletion || newRequest)
-        if !semanticChange, !newCompletion { next.updatedAt = old?.updatedAt ?? next.updatedAt }
+        // Streaming text and reconnects must not promote an already outstanding question.
+        if let old, !newCompletion, !newRequest,
+           !hasMeaningfulStateChange(from: old, to: next) { next.updatedAt = old.updatedAt }
 
         if hidden != nil, !semanticChange, !newCompletion {
             lastObserved[update.session.id] = update.observedAt
@@ -127,7 +132,7 @@ final class AgentInboxStore: ObservableObject {
         lastObserved[next.id] = update.observedAt
         items.removeAll { $0.id == next.id }
         items.append(next)
-        items.sort { $0.updatedAt > $1.updatedAt }
+        sortItems()
         items = Array(items.prefix(configuration.maximumInboxItems))
         trimBookkeeping()
         persist()
@@ -199,6 +204,7 @@ final class AgentInboxStore: ObservableObject {
         cancelCompletionAlert(id)
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].isUnread else { return }
         items[index].isUnread = false
+        sortItems()
         persist()
     }
 
@@ -252,6 +258,52 @@ final class AgentInboxStore: ObservableObject {
     private func sameContent(_ lhs: AgentInboxItem, _ rhs: AgentInboxItem) -> Bool {
         lhs.session.title == rhs.session.title && lhs.status == rhs.status
             && lhs.pendingRequests == rhs.pendingRequests && lhs.preview == rhs.preview
+    }
+
+    /// Recognizes state changes without treating streamed content as a fresh request.
+    ///
+    /// Args:
+    ///   previous: Previously retained state.
+    ///   current: New observation whose new request and completion IDs were already checked.
+    ///
+    /// Returns:
+    ///   Whether the existing row should receive a new ordering timestamp.
+    private func hasMeaningfulStateChange(from previous: AgentInboxItem, to current: AgentInboxItem) -> Bool {
+        // An unanswered request retains its original place even if the owner keeps working,
+        // disconnects, changes its preview, or removes another request from the same row.
+        if !previous.pendingRequests.isEmpty, !current.pendingRequests.isEmpty { return false }
+        if previous.pendingRequests.isEmpty != current.pendingRequests.isEmpty { return true }
+        if previous.needsAttention, current.needsAttention {
+            // Idle/disconnected observations do not announce new work. Revalidating an
+            // existing completion after either baseline retains that completion's time.
+            if current.status == .unknown || current.status == .idle { return false }
+            if current.status == .completed,
+               previous.status == .unknown || previous.status == .idle { return false }
+        }
+        return previous.status != current.status
+    }
+
+    /// Places actionable updates above active work while keeping equal timestamps stable.
+    private func sortItems() {
+        items.sort { lhs, rhs in
+            let leftGroup = orderingGroup(for: lhs)
+            let rightGroup = orderingGroup(for: rhs)
+            if leftGroup != rightGroup { return leftGroup.rawValue < rightGroup.rawValue }
+            if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            return lhs.id < rhs.id
+        }
+    }
+
+    /// Classifies attention, background work, and already-seen history for presentation.
+    ///
+    /// Args:
+    ///   item: Current row with independent request and unread state.
+    ///
+    /// Returns:
+    ///   Attention first, then active work, then other retained history.
+    private func orderingGroup(for item: AgentInboxItem) -> OrderingGroup {
+        if item.needsAttention { return .attention }
+        return item.status == .running || item.status == .waiting ? .active : .history
     }
 
     /// Bounds tombstones and observation clocks together with the visible queue.

@@ -20,7 +20,7 @@ enum AgentInboxCopy {
         let values: (String, String)
         switch label {
         case .title: values = ("Agent 消息", "Agent inbox")
-        case .subtitle: values = ("完成、需要回复或批准时提醒你。", "Notifies you when work finishes or needs your reply or approval.")
+        case .subtitle: values = ("需要你看的在上，正在工作的在下。", "Updates needing attention come first, followed by ongoing work.")
         case .showInbox: values = ("打开消息队列", "Open agent inbox")
         case .entryDetail: values = ("查看 Agent 进度、完成消息和待办请求", "View agent progress, results, and requests")
         case .close: values = ("收起消息队列", "Hide inbox")
@@ -96,8 +96,6 @@ final class AgentInboxViewModel: ObservableObject {
     @Published private(set) var failure: AgentInboxCopy.Label?
     private let opener: Opener
     private let markRead: (AgentInboxItem) -> Void
-    private let onOpened: () -> Void
-    private let presentationRevision: () -> Int
     private var generation = 0
 
     /// Creates a queue navigator with replaceable app launching and read receipts.
@@ -105,22 +103,16 @@ final class AgentInboxViewModel: ObservableObject {
     /// Args:
     ///   opener: Opens the exact original conversation; production never substitutes a directory.
     ///   markRead: Acknowledges only the selected inbox update after opening is accepted.
-    ///   onOpened: Collapses the originating presentation after successful navigation.
-    ///   presentationRevision: Identifies new presentations that an older launch must not close.
     init(
         opener: @escaping Opener = { session in
             try await AgentDesktopLauncherService.shared.open(
                 application: session.application, projectURL: nil, sessionID: session.sessionID
             )
         },
-        markRead: @escaping (AgentInboxItem) -> Void,
-        onOpened: @escaping () -> Void = {},
-        presentationRevision: @escaping () -> Int = { 0 }
+        markRead: @escaping (AgentInboxItem) -> Void
     ) {
         self.opener = opener
         self.markRead = markRead
-        self.onOpened = onOpened
-        self.presentationRevision = presentationRevision
     }
 
     /// Opens an exact session when the user selects its queue row.
@@ -141,15 +133,12 @@ final class AgentInboxViewModel: ObservableObject {
         }
         openingID = item.id
         let token = generation
-        let openingPresentation = presentationRevision()
         do {
             try await opener(item.session)
             try Task.checkCancellation()
             guard generation == token else { return }
             openingID = nil
             markRead(item)
-            // A newer completion or manual reveal owns its own presentation.
-            if presentationRevision() == openingPresentation { onOpened() }
         } catch {
             guard generation == token else { return }
             openingID = nil

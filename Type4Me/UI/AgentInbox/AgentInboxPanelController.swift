@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 enum AgentInboxPresentation: Equatable {
@@ -8,32 +7,74 @@ enum AgentInboxPresentation: Equatable {
     case needsResponse
 
     var requestsKeyboardFocus: Bool { self == .userRequested }
+}
 
-    /// Decides whether a notification-opened panel no longer needs user attention.
+/// Shared sizing configuration for the native panel and its measured SwiftUI content.
+struct AgentInboxPanelLayout {
+    var preferredWidth: CGFloat = 420
+    var maximumVisibleItems = 3
+    var estimatedHeaderHeight: CGFloat = 88
+    var estimatedRowHeight: CGFloat = 160
+    var estimatedEmptyHeight: CGFloat = 144
+    var screenInset: CGFloat = TF.spacingLG
+    var rowSpacing: CGFloat = TF.spacingSM
+    var listBottomInset: CGFloat = TF.spacingLG
+
+    /// Fits the current content while capping the viewport at the first three rows.
     ///
     /// Args:
-    ///   items: Latest complete queue snapshot, after the store finishes its update.
-    ///   storageError: Whether a visible persistence warning still needs attention.
+    ///   itemIDs: Queue identities in their current presentation order.
+    ///   measurements: Intrinsic heights from the current language, width, and row content.
     ///
     /// Returns:
-    ///   True only for an automatic panel with no results, requests, or problems to review.
-    func shouldHideWhenQuiet(items: [AgentInboxItem], storageError: Bool) -> Bool {
-        guard self != .userRequested, !storageError else { return false }
-        return !items.contains { item in
-            if !item.pendingRequests.isEmpty { return true }
-            switch item.status {
-            case .completed, .failed, .interrupted: return true
-            case .unknown, .idle: return item.isUnread
-            case .running, .waiting: return false
-            }
+    ///   The desired panel height before clamping to the available display area.
+    func contentHeight(itemIDs: [String], measurements: [AgentInboxMeasuredElement: CGFloat]) -> CGFloat {
+        let header = measurements[.header] ?? estimatedHeaderHeight
+        let warning = measurements[.warning] ?? 0
+        guard !itemIDs.isEmpty else {
+            return ceil(header + warning + (measurements[.empty] ?? estimatedEmptyHeight))
         }
+        let visibleIDs = itemIDs.prefix(max(1, maximumVisibleItems))
+        let rows = CGFloat(visibleIDs.count) * minimumRowHeight(itemIDs: itemIDs, measurements: measurements)
+        return ceil(header + warning + rows + CGFloat(max(0, visibleIDs.count - 1)) * rowSpacing + listBottomInset)
+    }
+
+    /// Gives every row enough space to prevent shorter later cards exceeding the three-row limit.
+    ///
+    /// Args:
+    ///   itemIDs: Ordered queue identities, with only the visible prefix used for sizing.
+    ///   measurements: Natural content heights measured before applying the minimum row height.
+    ///
+    /// Returns:
+    ///   The tallest natural height in the visible prefix; longer later rows remain unconstrained.
+    func minimumRowHeight(itemIDs: [String], measurements: [AgentInboxMeasuredElement: CGFloat]) -> CGFloat {
+        itemIDs.prefix(max(1, maximumVisibleItems)).map { measurements[.row($0)] ?? estimatedRowHeight }.max()
+            ?? estimatedRowHeight
+    }
+
+    /// Keeps the panel's top edge anchored when its measured content grows or shrinks.
+    ///
+    /// Args:
+    ///   contentHeight: Measured content height, including header and list padding.
+    ///   visibleFrame: Usable display area, excluding the menu bar and Dock.
+    ///   currentFrame: Existing visible panel bounds, or nil for initial presentation.
+    ///
+    /// Returns:
+    ///   A display-bounded frame anchored to the current or default upper-right corner.
+    func frame(contentHeight: CGFloat, visibleFrame: NSRect, currentFrame: NSRect? = nil) -> NSRect {
+        let width = min(preferredWidth, max(0, visibleFrame.width - screenInset * 2))
+        let height = min(max(0, contentHeight), max(0, visibleFrame.height - screenInset * 2))
+        let right = min(max(currentFrame?.maxX ?? visibleFrame.maxX - screenInset,
+                            visibleFrame.minX + screenInset + width), visibleFrame.maxX - screenInset)
+        let top = min(max(currentFrame?.maxY ?? visibleFrame.maxY - screenInset,
+                          visibleFrame.minY + screenInset + height), visibleFrame.maxY - screenInset)
+        return NSRect(x: right - width, y: top - height, width: width, height: height)
     }
 }
 
-struct AgentInboxPanelLayout {
-    var preferredWidth: CGFloat = 420
-    var preferredHeight: CGFloat = 560
-    var screenInset: CGFloat = TF.spacingLG
+enum AgentInboxMeasuredElement: Hashable {
+    case header, warning, empty
+    case row(String)
 }
 
 @MainActor
@@ -44,173 +85,104 @@ private final class AgentInboxPanel: NSPanel {
 
 @MainActor
 final class AgentInboxPanelController {
-    static let shared: AgentInboxPanelController = {
-        do { return AgentInboxPanelController(configuration: try .bundled()) }
-        catch {
-            NSLog("[AgentInbox] Invalid panel configuration; using bounded presentation defaults.")
-            return AgentInboxPanelController()
-        }
-    }()
+    static let shared = AgentInboxPanelController()
 
     private let layout: AgentInboxPanelLayout
-    private let configuration: AgentNotificationConfiguration
-    private let sleep: @Sendable (TimeInterval) async throws -> Void
     private let storeProvider: @MainActor () -> AgentInboxStore
     private let presentOverride: ((AgentInboxPresentation) -> Void)?
     private let dismissOverride: (() -> Void)?
     private var panel: AgentInboxPanel?
     private var model: AgentInboxViewModel?
-    private var presentation: AgentInboxPresentation?
-    private var presentationRevision = 0
-    private var visibilityObserver: AnyCancellable?
-    private var navigationObserver: AnyCancellable?
-    private var pointerInside = false
-    private var navigationInProgress = false
-    private var trackingMenus: Set<ObjectIdentifier> = []
-    private var autoHideTask: Task<Void, Never>?
-    private var autoHideRevision = 0
-    private var localClickMonitor: Any?
-    private var globalClickMonitor: Any?
-    private var applicationObserver: NSObjectProtocol?
-    private var menuObservers: [NSObjectProtocol] = []
+    private var contentHeight: CGFloat?
+    private(set) var presentation: AgentInboxPresentation?
 
-    /// Creates the persistent queue panel without opening a window or starting monitoring.
+    /// Creates a persistent queue without a window, timers, or global interaction observers.
     ///
     /// Args:
-    ///   layout: Bounded panel dimensions and screen margins.
-    ///   configuration: Notification display duration; tests can supply isolated bounds.
-    ///   sleep: Replaceable delay for window-free presentation checks.
-    ///   storeProvider: Supplies the shared inbox only when presentation needs it.
-    ///   present: Optional window-free presentation observer for policy tests.
-    ///   dismiss: Optional window-free counterpart for dismissal tests.
+    ///   layout: Shared content sizing and screen margins.
+    ///   storeProvider: Supplies the shared inbox only when native presentation needs it.
+    ///   present: Optional window-free presentation observer for isolated checks.
+    ///   dismiss: Optional window-free counterpart for explicit dismissal.
     init(
         layout: AgentInboxPanelLayout = AgentInboxPanelLayout(),
-        configuration: AgentNotificationConfiguration = AgentNotificationConfiguration(),
-        sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { seconds in
-            try await Task.sleep(for: .seconds(seconds))
-        },
         storeProvider: @escaping @MainActor () -> AgentInboxStore = { AgentInboxStore.shared },
         present: ((AgentInboxPresentation) -> Void)? = nil,
         dismiss: (() -> Void)? = nil
     ) {
         self.layout = layout
-        self.configuration = configuration
-        self.sleep = sleep
         self.storeProvider = storeProvider
         presentOverride = present
         dismissOverride = dismiss
     }
 
-    /// Opens the inbox in response to an explicit menu action.
-    ///
-    /// Returns:
-    ///   Nothing. Only this user-requested route may request keyboard focus.
+    /// Opens the persistent queue from its menu entry, allowing keyboard interaction.
     func show() {
         present(.userRequested)
     }
 
-    /// Reveals the shared queue for a newly verified task completion.
+    /// Shows a fresh completion without taking focus from the user's current work.
     ///
     /// Args:
-    ///   item: Completed session snapshot emitted by the store after deduplication.
-    ///
-    /// Returns:
-    ///   Nothing. The current app and keyboard focus remain unchanged.
+    ///   item: Verified completed session snapshot after store deduplication.
     func showCompletion(_ item: AgentInboxItem) {
         guard item.status == .completed else { return }
         present(.taskCompleted)
     }
 
-    /// Reveals a newly observed native question or approval without stealing keyboard focus.
+    /// Shows an unresolved question or approval without taking keyboard focus.
     ///
     /// Args:
-    ///   item: Current queue snapshot containing at least one unresolved native request.
+    ///   item: Current queue snapshot containing a native pending request.
     func showRequest(_ item: AgentInboxItem) {
         guard !item.pendingRequests.isEmpty else { return }
         present(.needsResponse)
     }
 
-    /// Hides the panel while keeping all session state in the inbox store.
-    ///
-    /// Returns:
-    ///   Nothing. Closing never interrupts or approves a native conversation.
+    /// Hides the queue only on explicit dismissal; stored native state is unchanged.
     func close() {
         presentation = nil
-        cancelAutoHide()
-        removeInteractionObservers()
-        pointerInside = false
-        navigationInProgress = false
         model?.resetPresentation()
         if let dismissOverride { dismissOverride() } else { panel?.orderOut(nil) }
     }
 
-    /// Releases presentation resources during app shutdown.
-    ///
-    /// Returns:
-    ///   Nothing. Monitoring is stopped separately by the owning service.
+    /// Releases the panel during application shutdown without consuming messages.
     func stop() {
-        visibilityObserver = nil
-        navigationObserver = nil
         close()
         panel?.contentView = nil
         panel = nil
         model = nil
+        contentHeight = nil
     }
 
-    /// Presents the same queue surface for manual opening and task completion.
+    /// Presents the queue until the user explicitly closes it, including while all agents work.
     ///
     /// Args:
-    ///   reason: Determines whether keyboard focus was explicitly requested.
-    ///
-    /// Returns:
-    ///   Nothing. Completion never calls an app-activation or key-window API.
+    ///   reason: Only a manual reveal may request keyboard focus.
     private func present(_ reason: AgentInboxPresentation) {
-        presentationRevision &+= 1
-        // New completions must not turn a manually opened queue into an automatic one.
         if presentation != .userRequested { presentation = reason }
         if let presentOverride {
             presentOverride(reason)
-            scheduleAutoHide()
             return
         }
         if panel == nil { createPanel() }
-        guard let panel, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
-        if !panel.isVisible {
-            let visible = screen.visibleFrame
-            let width = min(layout.preferredWidth, max(0, visible.width - layout.screenInset * 2))
-            let height = min(layout.preferredHeight, max(0, visible.height - layout.screenInset * 2))
-            panel.setFrame(NSRect(
-                x: visible.maxX - width - layout.screenInset,
-                y: visible.maxY - height - layout.screenInset,
-                width: width, height: height
-            ), display: false)
-        }
+        guard let panel else { return }
+        resizeToContent()
         if reason.requestsKeyboardFocus {
             panel.makeKeyAndOrderFront(nil)
         } else {
             panel.orderFrontRegardless()
         }
-        pointerInside = panel.frame.contains(NSEvent.mouseLocation)
-        installInteractionObservers()
-        scheduleAutoHide()
     }
 
-    /// Lazily hosts the settings-styled queue in a nonactivating floating panel.
-    ///
-    /// Returns:
-    ///   Nothing. Manual browsing stays open; automatic presentation can become quiet.
+    /// Hosts the existing MyType style and leaves the queue visible after native navigation.
     private func createPanel() {
         let store = storeProvider()
-        let model = AgentInboxViewModel(
-            markRead: { [weak store] selected in
-                // Opening may overlap a fresh update; consume only the update the user selected.
-                guard store?.items.first(where: { $0.id == selected.id }) == selected else { return }
-                store?.markRead(selected.id)
-                // Native viewing evidence, not URL acceptance, removes completed messages.
-            },
-            onOpened: { [weak self] in self?.close() },
-            presentationRevision: { [weak self] in self?.presentationRevision ?? 0 }
-        )
+        let model = AgentInboxViewModel(markRead: { [weak store] selected in
+            // Opening can overlap a fresh update; acknowledge only the snapshot that was selected.
+            guard store?.items.first(where: { $0.id == selected.id }) == selected else { return }
+            store?.markRead(selected.id)
+            // Native viewing evidence, not URL acceptance, removes completed messages.
+        })
         let panel = AgentInboxPanel(
             contentRect: .zero,
             styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
@@ -225,170 +197,27 @@ final class AgentInboxPanelController {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
-        panel.contentView = NSHostingView(rootView: AgentInboxView(
-            store: store, model: model, onClose: { [weak self] in self?.close() },
-            onHoverChanged: { [weak self] inside in self?.setPointerInside(inside) }
-        ))
         self.model = model
         self.panel = panel
-        visibilityObserver = Publishers.Merge(store.objectWillChange, model.objectWillChange)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.hideIfQuiet() }
-        navigationObserver = model.$openingID
-            .map { $0 != nil }
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] active in self?.setNavigationInProgress(active) }
-    }
-
-    /// Dismisses only the presentation after a click outside the queue.
-    ///
-    /// Returns:
-    ///   Nothing. All unread messages and outstanding native requests remain stored.
-    func handleOutsideInteraction() {
-        guard presentation != nil, trackingMenus.isEmpty else { return }
-        close()
-    }
-
-    /// Hides on app switching, except while this queue is opening a native conversation.
-    ///
-    /// Returns:
-    ///   Nothing. Navigation owns its success callback and selected-message receipt.
-    func handleApplicationChange() {
-        guard presentation != nil, !isNavigating else { return }
-        close()
-    }
-
-    /// Pauses a notification while its full surface is being read or interacted with.
-    ///
-    /// Args:
-    ///   inside: Whether the pointer is currently over the visible queue.
-    func setPointerInside(_ inside: Bool) {
-        guard presentation != nil, pointerInside != inside else { return }
-        pointerInside = inside
-        scheduleAutoHide()
-    }
-
-    /// Gives a navigation result a fresh reading interval after the opener returns.
-    ///
-    /// Args:
-    ///   active: Whether an exact-session opening is still in progress.
-    func setNavigationInProgress(_ active: Bool) {
-        guard navigationInProgress != active else { return }
-        navigationInProgress = active
-        scheduleAutoHide()
-    }
-
-    private var isNavigating: Bool { navigationInProgress || model?.openingID != nil }
-
-    /// Arms a bounded notification timeout without expiring manually opened queues.
-    ///
-    /// Returns:
-    ///   Nothing. Old delays cannot close a newer presentation or an active interaction.
-    private func scheduleAutoHide() {
-        cancelAutoHide()
-        guard presentation != nil, presentation != .userRequested, !pointerInside, !isNavigating,
-              trackingMenus.isEmpty else { return }
-        let revision = autoHideRevision
-        let visibleRevision = presentationRevision
-        let delay = configuration.inboxAutoHideSeconds
-        let sleep = self.sleep
-        autoHideTask = Task { @MainActor [weak self] in
-            do { try await sleep(delay) }
-            catch { return }
-            guard !Task.isCancelled, let self, self.autoHideRevision == revision,
-                  self.presentationRevision == visibleRevision,
-                  self.presentation != nil, self.presentation != .userRequested, !self.isNavigating,
-                  !self.pointerInside, self.trackingMenus.isEmpty else { return }
-            // An inactive panel can appear underneath an already stationary pointer.
-            if let panel = self.panel, panel.isVisible, panel.frame.contains(NSEvent.mouseLocation) {
-                self.setPointerInside(true)
-                return
+        contentHeight = layout.contentHeight(itemIDs: store.items.map(\.id), measurements: [:])
+        panel.contentView = NSHostingView(rootView: AgentInboxView(
+            store: store, model: model, layout: layout,
+            onClose: { [weak self] in self?.close() },
+            onContentHeightChange: { [weak self] height in
+                guard let self, height.isFinite, height > 0, self.contentHeight != height else { return }
+                self.contentHeight = height
+                self.resizeToContent()
             }
-            self.close()
-        }
+        ))
     }
 
-    /// Invalidates even a delay implementation that delivers after cancellation.
-    private func cancelAutoHide() {
-        autoHideRevision &+= 1
-        autoHideTask?.cancel()
-        autoHideTask = nil
-    }
-
-    /// Observes clicks and app changes only while the queue is visible.
-    ///
-    /// Returns:
-    ///   Nothing. Click events continue to their original targets unchanged.
-    private func installInteractionObservers() {
-        let alreadyTracking = trackingMenus
-        removeInteractionObservers()
-        trackingMenus = alreadyTracking
-        let revision = presentationRevision
-        let clicks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .scrollWheel]
-        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: clicks) { [weak self] event in
-            guard let self, self.presentationRevision == revision,
-                  let panel = self.panel, event.window !== panel else { return event }
-            self.handleOutsideInteraction()
-            return event
-        }
-        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: clicks) { [weak self] _ in
-            guard let self, self.presentationRevision == revision else { return }
-            self.handleOutsideInteraction()
-        }
-        applicationObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] notification in
-            MainActor.assumeIsolated {
-                guard let self, self.presentationRevision == revision,
-                      let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                      app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
-                self.handleApplicationChange()
-            }
-        }
-        for name in [NSMenu.didBeginTrackingNotification, NSMenu.didEndTrackingNotification] {
-            menuObservers.append(NotificationCenter.default.addObserver(
-                forName: name, object: nil, queue: .main
-            ) { [weak self] notification in
-                MainActor.assumeIsolated {
-                    guard let self, self.presentationRevision == revision,
-                          let menu = notification.object as? NSMenu else { return }
-                    if notification.name == NSMenu.didBeginTrackingNotification {
-                        self.trackingMenus.insert(ObjectIdentifier(menu))
-                    } else {
-                        self.trackingMenus.remove(ObjectIdentifier(menu))
-                    }
-                    self.scheduleAutoHide()
-                }
-            })
-        }
-    }
-
-    /// Releases all native input observers when this presentation is hidden or stopped.
-    private func removeInteractionObservers() {
-        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
-        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
-        if let applicationObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(applicationObserver)
-        }
-        menuObservers.forEach { NotificationCenter.default.removeObserver($0) }
-        localClickMonitor = nil
-        globalClickMonitor = nil
-        applicationObserver = nil
-        menuObservers.removeAll()
-        trackingMenus.removeAll()
-    }
-
-    /// Reconciles visibility after published mutations finish, without polling.
-    ///
-    /// Returns:
-    ///   Nothing. In-flight navigation and visible launch errors keep the queue available.
-    private func hideIfQuiet() {
-        guard let presentation, model?.openingID == nil, model?.failure == nil else { return }
-        let store = storeProvider()
-        // Use current state, not transient remove/append snapshots from a store update.
-        if presentation.shouldHideWhenQuiet(items: store.items, storageError: store.storageError) {
-            close()
-        }
+    /// Applies measured height without activating, reordering, or revealing a hidden panel.
+    private func resizeToContent() {
+        guard let panel, let contentHeight,
+              let screen = (panel.isVisible ? panel.screen : nil) ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        let frame = layout.frame(contentHeight: contentHeight, visibleFrame: screen.visibleFrame,
+                                 currentFrame: panel.isVisible ? panel.frame : nil)
+        guard panel.frame != frame else { return }
+        panel.setFrame(frame, display: panel.isVisible)
     }
 }

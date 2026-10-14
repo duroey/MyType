@@ -22,7 +22,6 @@
   "maximumSubscriptionAttempts": 3,
   "codexSigningTeamIdentifier": "2DC432GLL2",
   "completionAlertDelaySeconds": 2.5,
-  "inboxAutoHideSeconds": 8,
   "viewingPollSeconds": 0.25,
   "viewingStableSeconds": 1,
   "viewingEvidenceMaxAgeSeconds": 1,
