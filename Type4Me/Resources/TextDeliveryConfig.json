@@ -6,5 +6,12 @@
   "maximumValueUTF16Length": 100000,
   "maximumMenuNodes": 128,
   "maximumMenuDepth": 4,
-  "maximumMenuSearchSeconds": 0.2
+  "maximumMenuSearchSeconds": 0.2,
+  "unicodeChunkUTF16Length": 20,
+  "unicodeChunkIntervalSeconds": 0.005,
+  "maximumUnicodeDeliverySeconds": 3.0,
+  "maximumFocusWindowCandidates": 16,
+  "maximumFocusResolutionSeconds": 0.2,
+  "minimumFloatingWindowDimension": 48.0,
+  "focusWindowMatchTolerance": 1.0
 }

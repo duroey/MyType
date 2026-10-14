@@ -3,7 +3,7 @@ import ApplicationServices
 import Carbon.HIToolbox
 
 /// Delivers to the original focused control without retaining its contents beyond a delivery.
-final class NativeTextDeliveryTarget: TextDeliveryTarget {
+final class NativeTextDeliveryTarget: TextDeliveryTarget, ClipboardFreeTextDeliveryTarget {
     enum ControlAccess: Equatable {
         case blocked
         case opaque
@@ -34,6 +34,7 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
     private var beforeRange: NSRange?
     private var expectedValue: String?
     private var blocked = false
+    private var focusSnapshot: FocusedInputResolver.Snapshot?
 
     /// Captures only the exact focused, non-secure text control and its insertion range.
     ///
@@ -45,7 +46,9 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
         self.application = application
         self.text = text
         self.configuration = configuration
-        guard sameApplicationIsFrontmost() else {
+        focusSnapshot = FocusedInputResolver.resolve(configuration: configuration)
+        guard focusSnapshot?.application.processIdentifier == application.processIdentifier,
+              ownsKeyboardFocus() else {
             blocked = true
             return
         }
@@ -82,15 +85,15 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
     /// Distinguishes absent focus metadata from evidence that the user selected another destination.
     private func focusEvidence() -> FocusEvidence {
         guard !blocked else { return .blocked }
-        guard sameApplicationIsFrontmost() else { return .changed }
+        guard ownsKeyboardFocus() else { return .changed }
         switch currentFocus() {
         case .otherApplication:
             return .changed
         case .unavailable:
-            return sameApplicationIsFrontmost() ? .unknown : .changed
+            return ownsKeyboardFocus() ? .unknown : .changed
         case .element(let current):
             guard controlAccess(of: current) != .blocked else { return .blocked }
-            guard sameApplicationIsFrontmost() else { return .changed }
+            guard ownsKeyboardFocus() else { return .changed }
             guard let focusedElement else { return .unknown }
             return CFEqual(focusedElement, current) ? .matched : .changed
         }
@@ -179,6 +182,72 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
         return result == .attributeUnsupported ? .unavailable : .dispatched
     }
 
+    /// Sends Unicode text events without a Paste command or clipboard access.
+    ///
+    /// Args:
+    ///   shouldDispatch: Final unchanged-input check before the first event.
+    /// Returns:
+    ///   Dispatched once any event was posted, including partial delivery after focus loss.
+    func insertUsingUnicode(shouldDispatch: () -> Bool) -> TextDeliveryAttempt {
+        guard !text.isEmpty, Self.permitsUnicodeEvents(text), text.utf16.count <= configuration.maximumValueUTF16Length,
+              CGPreflightPostEventAccess(), isCurrent(), shouldDispatch() else { return .unavailable }
+        var dispatched = false
+        let deadline = ProcessInfo.processInfo.systemUptime + configuration.maximumUnicodeDeliverySeconds
+        for chunk in Self.unicodeChunks(text, maximumUTF16Length: configuration.unicodeChunkUTF16Length) {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+            else { return dispatched ? .dispatched : .unavailable }
+            for event in [down, up] {
+                event.flags = []
+                chunk.withUnsafeBufferPointer { buffer in
+                    event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress!)
+                }
+                TextInjectionEngine.markAsSyntheticInput(event)
+            }
+            guard ownsKeyboardFocus(), dispatched || shouldDispatch() else { return dispatched ? .dispatched : .unavailable }
+            // Pin queued events to the original process so a later application switch cannot receive them.
+            down.postToPid(application.processIdentifier)
+            up.postToPid(application.processIdentifier)
+            dispatched = true
+            Thread.sleep(forTimeInterval: configuration.unicodeChunkIntervalSeconds)
+        }
+        return dispatched ? .dispatched : .unavailable
+    }
+
+    /// Keeps Return, Tab and other control characters out of synthetic keyboard events.
+    ///
+    /// Args:
+    ///   text: Proposed event payload.
+    /// Returns:
+    ///   False for control text, which must use selected-text insertion or remain in history.
+    static func permitsUnicodeEvents(_ text: String) -> Bool {
+        text.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7F }
+    }
+
+    /// Splits UTF-16 into bounded event payloads without breaking a surrogate pair.
+    ///
+    /// Args:
+    ///   text: Complete text, including line breaks and non-BMP characters.
+    ///   maximumUTF16Length: Event payload bound, at least two UTF-16 units.
+    /// Returns:
+    ///   Ordered payloads which concatenate to the original UTF-16 sequence.
+    static func unicodeChunks(_ text: String, maximumUTF16Length: Int) -> [[UInt16]] {
+        let limit = max(2, maximumUTF16Length)
+        var chunks: [[UInt16]] = []
+        var chunk: [UInt16] = []
+        for scalar in text.unicodeScalars {
+            let units = Array(String(scalar).utf16)
+            if chunk.count + units.count > limit {
+                chunks.append(chunk)
+                chunk = []
+            }
+            chunk.append(contentsOf: units)
+        }
+        if !chunk.isEmpty { chunks.append(chunk) }
+        return chunks
+    }
+
     /// Posts one Command-V pair through the system event stream used by the original working injector.
     ///
     /// Args:
@@ -192,22 +261,29 @@ final class NativeTextDeliveryTarget: TextDeliveryTarget {
         keyUp.flags = .maskCommand
         TextInjectionEngine.markAsSyntheticInput(keyDown)
         TextInjectionEngine.markAsSyntheticInput(keyUp)
-        guard sameApplicationIsFrontmost(), shouldDispatch() else { return false }
+        guard ownsKeyboardFocus(), shouldDispatch() else { return false }
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
         return true
     }
 
-    /// Checks the application on the main thread without moving accessibility work there.
-    private func sameApplicationIsFrontmost() -> Bool {
-        let readPID = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
-        let pid = Thread.isMainThread ? readPID() : DispatchQueue.main.sync(execute: readPID)
-        return !application.isTerminated && pid == application.processIdentifier
+    /// Revalidates the keyboard owner, including a proven non-activating input panel.
+    private func ownsKeyboardFocus() -> Bool {
+        guard let focusSnapshot, !application.isTerminated else { return false }
+        return FocusedInputResolver.isCurrent(focusSnapshot, configuration: configuration)
     }
 
     /// Queries focus directly; window-tree traversal must never guess the destination control.
     private func currentFocus() -> FocusLookup {
         guard AXIsProcessTrusted() else { return .unavailable }
+        guard let current = FocusedInputResolver.resolve(configuration: configuration) else { return .otherApplication }
+        guard current.application.processIdentifier == application.processIdentifier else { return .otherApplication }
+        if let element = current.element {
+            setTimeout(on: element)
+            return .element(element)
+        }
+        // Only ordinary frontmost fallback may tolerate missing AX metadata.
+        guard current.proof == .frontmostFallback else { return .otherApplication }
         let system = AXUIElementCreateSystemWide()
         setTimeout(on: system)
         let app = AXUIElementCreateApplication(application.processIdentifier)

@@ -27,6 +27,7 @@ struct ReceiverConfiguration {
     var timeoutSeconds = 10.0
     var caseTimeoutSeconds = 3.0
     var settleSeconds = 0.15
+    var transport = "clipboard"
 
     /// Parses optional artifact and timing arguments while enforcing a ten-second run limit.
     static func parse(_ arguments: [String]) throws -> Self {
@@ -42,6 +43,7 @@ struct ReceiverConfiguration {
             case "--timeout-seconds": value.timeoutSeconds = Double(argument) ?? -1
             case "--case-timeout-seconds": value.caseTimeoutSeconds = Double(argument) ?? -1
             case "--settle-seconds": value.settleSeconds = Double(argument) ?? -1
+            case "--transport": value.transport = argument
             default: throw NSError(domain: "Unknown argument: \(key)", code: 1)
             }
             index += 2
@@ -49,14 +51,15 @@ struct ReceiverConfiguration {
         guard value.delayedReadSeconds > 0.4, value.delayedReadSeconds < value.caseTimeoutSeconds,
               value.timeoutSeconds > 0, value.timeoutSeconds <= 10,
               value.caseTimeoutSeconds > 0, value.caseTimeoutSeconds * 2 < value.timeoutSeconds,
-              value.settleSeconds > 0, value.settleSeconds < 0.5
+              value.settleSeconds > 0, value.settleSeconds < 0.5,
+              ["clipboard", "unicode"].contains(value.transport)
         else { throw NSError(domain: "Invalid receiver timing limits", code: 1) }
         return value
     }
 }
 
 /// Adds a final probe-window safety check while forwarding every operation to production code.
-final class GuardedNativeTarget: TextDeliveryTarget {
+final class GuardedNativeTarget: TextDeliveryTarget, ClipboardFreeTextDeliveryTarget {
     private let native: NativeTextDeliveryTarget
     private let ownsReceiver: () -> Bool
 
@@ -81,12 +84,22 @@ final class GuardedNativeTarget: TextDeliveryTarget {
 
     /// Forwards direct insertion only if the probe's field remains focused.
     func insertDirectly(shouldDispatch: () -> Bool) -> TextDeliveryAttempt {
-        native.insertDirectly { self.ownsReceiver() && shouldDispatch() }
+        // AX against our own process executes AppKit in-process; keep that mutation on its UI thread.
+        // Production targets are separate processes and receive normal accessibility IPC.
+        withoutActuallyEscaping(shouldDispatch) { check in
+            let insert = { self.native.insertDirectly { self.ownsReceiver() && check() } }
+            return Thread.isMainThread ? insert() : DispatchQueue.main.sync(execute: insert)
+        }
     }
 
     /// Forwards real production key posting only if the probe's field remains focused.
     func pasteUsingShortcut(shouldDispatch: () -> Bool) -> Bool {
         native.pasteUsingShortcut { self.ownsReceiver() && shouldDispatch() }
+    }
+
+    /// Forwards Unicode events only while this receiver owns its exact input field.
+    func insertUsingUnicode(shouldDispatch: () -> Bool) -> TextDeliveryAttempt {
+        native.insertUsingUnicode { self.ownsReceiver() && shouldDispatch() }
     }
 }
 
@@ -96,6 +109,12 @@ final class ReceiverTextView: NSTextView {
     /// Reads the uniquely named private pasteboard only after the test's configured delay.
     override func paste(_ sender: Any?) {
         receiver?.receivePaste()
+    }
+
+    /// Records receiver-side insertion from actual AppKit text processing.
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        super.insertText(insertString, replacementRange: replacementRange)
+        receiver?.receiveTextEvent()
     }
 }
 
@@ -123,6 +142,7 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
     private var transactionResult: String?
     private var evaluationScheduled = false
     private var results: [[String: Any]] = []
+    private var initialPasteboardChangeCount = 0
 
     /// Captures the original foreground app without reading any of its windows or clipboard.
     init(configuration: ReceiverConfiguration) {
@@ -160,7 +180,7 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 guard let self, self.armed, !self.finished else { return event }
                 guard event.cgEvent?.getIntegerValueField(.eventSourceUserData) == TextInjectionEngine.marker,
-                      event.keyCode == 9 else {
+                      event.keyCode == (self.configuration.transport == "unicode" ? 0 : 9) else {
                     self.finish(reason: "Non-test input arrived in receiver", succeeded: false)
                     return nil
                 }
@@ -217,7 +237,9 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
         guard caseIndex < 2 else { finish(reason: "Both native input cases completed", succeeded: true); return }
         let index = caseIndex
         caseStartedAt = ProcessInfo.processInfo.systemUptime
-        expectedText = "MYTYPE_NEW_\(nonce)_\(index)"
+        expectedText = configuration.transport == "unicode"
+            ? (index == 0 ? "中文输入 English \(nonce)" : "多行😀👩🏽‍💻\n第二行 with tabs\t末尾 \(nonce)")
+            : "MYTYPE_NEW_\(nonce)_\(index)"
         oldText = "MYTYPE_OLD_\(nonce)_\(index)"
         textView.string = ""
         textView.setSelectedRange(NSRange(location: 0, length: 0))
@@ -226,6 +248,7 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
             finish(reason: "Private pasteboard could not be initialized", succeeded: false)
             return
         }
+        initialPasteboardChangeCount = privatePasteboard.changeCount
         pasteCalls = 0
         keyDowns = 0
         keyUps = 0
@@ -235,6 +258,7 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
         let text = expectedText
         let application = NSRunningApplication.current
         let pasteboard = privatePasteboard
+        let transport = configuration.transport
         let checkFocus: @Sendable () -> Bool = { [weak self] in
             let check = { MainActor.assumeIsolated { self?.ownsReceiver() ?? false } }
             return Thread.isMainThread ? check() : DispatchQueue.main.sync(execute: check)
@@ -242,8 +266,13 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             let target = NativeTextDeliveryTarget(application: application, text: text, configuration: .init())
             let guarded = GuardedNativeTarget(native: target, ownsReceiver: checkFocus)
-            let transaction = ClipboardDeliveryTransaction(clipboard: SystemTextDeliveryClipboard(pasteboard: pasteboard))
-            let result = transaction.deliver(text, to: guarded, restoreOriginal: true)
+            let result: TextDeliveryResult
+            if transport == "unicode" {
+                result = ClipboardFreeDeliveryTransaction().deliver(to: guarded)
+            } else {
+                result = ClipboardDeliveryTransaction(clipboard: SystemTextDeliveryClipboard(pasteboard: pasteboard))
+                    .deliver(text, to: guarded, restoreOriginal: true)
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.finished, self.caseIndex == index else { return }
                 self.transactionResult = String(describing: result)
@@ -272,8 +301,18 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Marks complete Unicode receipt without inspecting or changing the general pasteboard.
+    func receiveTextEvent() {
+        guard configuration.transport == "unicode", textView.string == expectedText else { return }
+        readTimes.append(ProcessInfo.processInfo.systemUptime - caseStartedAt)
+        scheduleEvaluationIfReady()
+    }
+
     /// Waits briefly after both real insertion and transaction completion to catch duplicate events.
     private func scheduleEvaluationIfReady() {
+        if configuration.transport == "unicode", textView.string == expectedText, readTimes.isEmpty {
+            readTimes.append(ProcessInfo.processInfo.systemUptime - caseStartedAt)
+        }
         guard transactionResult != nil, !readTimes.isEmpty, !evaluationScheduled else { return }
         evaluationScheduled = true
         let index = caseIndex
@@ -287,17 +326,28 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
     private func recordCaseAndContinue(timedOut: Bool) {
         let received = textView.string
         let boardText = privatePasteboard.string(forType: .string) ?? ""
-        let passed = !timedOut && pasteCalls == 1 && keyDowns == 1 && keyUps == 1 && received == expectedText
+        let eventCount = configuration.transport == "unicode"
+            ? (NativeTextDeliveryTarget.permitsUnicodeEvents(expectedText)
+               ? NativeTextDeliveryTarget.unicodeChunks(expectedText, maximumUTF16Length: 20).count : 0) : 1
+        let untouched = privatePasteboard.changeCount == initialPasteboardChangeCount && boardText == oldText
+        let passed = !timedOut && pasteCalls == (configuration.transport == "unicode" ? 0 : 1)
+            && keyDowns == eventCount && keyUps == eventCount && received == expectedText
+            && (configuration.transport != "unicode" || untouched)
         results.append([
-            "name": caseIndex == 0 ? "immediate-private-read" : "delayed-private-read",
+            "name": configuration.transport == "unicode"
+                ? (caseIndex == 0 ? "unicode-text-events" : "multiline-selected-text")
+                : (caseIndex == 0 ? "immediate-private-read" : "delayed-private-read"),
             "passed": passed, "timed_out": timedOut,
             "new_marker": expectedText, "received": received,
             "paste_calls": pasteCalls, "synthetic_key_downs": keyDowns, "synthetic_key_ups": keyUps,
             "read_elapsed_seconds": readTimes,
-            "configured_read_delay_seconds": caseIndex == 0 ? 0 : configuration.delayedReadSeconds,
+            "configured_read_delay_seconds": configuration.transport == "unicode" || caseIndex == 0
+                ? 0 : configuration.delayedReadSeconds,
             "transaction_result": transactionResult ?? "not-returned",
             "clipboard_restored_to_old": boardText == oldText,
             "clipboard_retains_new": boardText == expectedText,
+            "clipboard_untouched": untouched,
+            "transport": configuration.transport,
             "elapsed_seconds": ProcessInfo.processInfo.systemUptime - caseStartedAt,
         ])
         guard passed else { finish(reason: "Receiver evidence did not confirm exactly one native insertion", succeeded: false); return }
@@ -313,7 +363,9 @@ final class ReceiverController: NSObject, NSApplicationDelegate {
         let evidence: [String: Any] = [
             "passed": succeeded, "reason": reason, "nonce": nonce,
             "process_id": ProcessInfo.processInfo.processIdentifier,
-            "uses_production_native_target": true, "uses_production_clipboard_transaction": true,
+            "uses_production_native_target": true,
+            "uses_production_clipboard_transaction": configuration.transport == "clipboard",
+            "uses_production_clipboard_free_transaction": configuration.transport == "unicode",
             "general_clipboard_accessed": false, "target_is_probe_owned_window": true,
             "accessibility_permission_present": AXIsProcessTrusted(),
             "post_event_permission_present": CGPreflightPostEventAccess(),
@@ -351,6 +403,11 @@ enum TextDeliveryReceiverMain {
         do {
             let configuration = try ReceiverConfiguration.parse(CommandLine.arguments)
             let app = NSApplication.shared
+            setbuf(stdout, nil)
+            DispatchQueue.global().asyncAfter(deadline: .now() + configuration.timeoutSeconds) {
+                fputs("Receiver watchdog: process deadline reached\n", stderr)
+                exit(2)
+            }
             app.setActivationPolicy(.regular)
             let controller = ReceiverController(configuration: configuration)
             app.delegate = controller

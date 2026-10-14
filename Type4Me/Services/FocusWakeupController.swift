@@ -977,41 +977,41 @@ final class FocusWakeupController {
         return chunks
     }
 
-    /// Probes the current frontmost editable focus, excluding mytype itself.
+    /// Probes the actual keyboard input, including non-activating floating panels.
     ///
     /// Returns:
     ///   Editable, unknown, or confirmed non-editable state for retention policy.
     private func currentFocusProbe() -> FocusProbe {
         guard AXIsProcessTrusted() else { return .confirmedNoEditableFocus }
-        guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+        guard let snapshot = FocusedInputResolver.resolve() else {
             return .confirmedNoEditableFocus
         }
+        let frontmost = snapshot.application
         guard frontmost.bundleIdentifier != Bundle.main.bundleIdentifier else {
             return .confirmedNoEditableFocus
         }
 
         let pid = frontmost.processIdentifier
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.5)
-
-        switch copyFocusedElement(from: app) {
+        let lookup: FocusedElementLookup = snapshot.element.map(FocusedElementLookup.found) ?? .unavailable
+        switch lookup {
         case .found(let element):
             if let focus = editableSignature(for: element, pid: pid) {
-                return .editable(focus, pid: pid)
-            }
-            if Self.shouldUseEditableWindowFallback(focusedElementWasUnavailable: false),
-               let fallback = findEditableElementInApp(frontmost),
-               let focus = editableSignature(for: fallback, pid: pid) {
                 return .editable(focus, pid: pid)
             }
             return .confirmedNoEditableFocus
 
         case .unavailable:
+            guard snapshot.proof == .frontmostFallback else { return .confirmedNoEditableFocus }
             enableEnhancedAX(for: frontmost)
             usleep(30_000)
-            if case .found(let element) = copyFocusedElement(from: app),
+            guard let refreshed = FocusedInputResolver.resolve(),
+                  refreshed.application.processIdentifier == pid else { return .confirmedNoEditableFocus }
+            if let element = refreshed.element,
                let focus = editableSignature(for: element, pid: pid) {
                 return .editable(focus, pid: pid)
+            }
+            guard refreshed.proof == .frontmostFallback, refreshed.element == nil else {
+                return .confirmedNoEditableFocus
             }
             if Self.shouldUseEditableWindowFallback(focusedElementWasUnavailable: true),
                let fallback = findEditableElementInApp(frontmost),

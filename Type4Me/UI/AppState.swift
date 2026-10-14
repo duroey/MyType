@@ -1741,6 +1741,8 @@ final class AppState {
                     "处理失败，已尝试输入，原文已保留至剪贴板",
                     "Processing failed; paste attempted, raw text kept in clipboard"
                 )
+            case .inputAttempted:
+                message = L("处理失败，原文已发送；可在历史中查看", "Processing failed; raw text sent. Available in history")
             }
             showDone(message: message, delay: .seconds(2.0))
         } else {

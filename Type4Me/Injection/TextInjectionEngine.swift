@@ -21,7 +21,7 @@ final class TextInjectionEngine: @unchecked Sendable {
     enum ClipboardRetention: Sendable, Equatable {
         /// Keep the dictated result in the system clipboard after the paste attempt.
         case retainResult
-        /// Restore the previous clipboard only after insertion is verified.
+        /// Preserve every clipboard format by using text events without accessing it.
         case restoreOriginal
     }
     typealias ClipboardSnapshot = Type4Me.ClipboardSnapshot
@@ -98,7 +98,7 @@ final class TextInjectionEngine: @unchecked Sendable {
     /// Injects text once and returns a verified or explicitly unconfirmed outcome.
     func inject(_ text: String) -> InjectionOutcome {
         guard !text.isEmpty else { return .inserted }
-        return injectViaClipboard(text, trackingMetadata: nil).outcome
+        return deliverText(text, trackingMetadata: nil).outcome
     }
 
     /// Inject text while capturing enough Accessibility context to observe a
@@ -113,7 +113,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         guard !text.isEmpty else {
             return TrackedInjectionResult(outcome: .inserted, observationContext: nil)
         }
-        return injectViaClipboard(
+        return deliverText(
             text,
             trackingMetadata: (
                 sourceText: sourceText,
@@ -133,32 +133,30 @@ final class TextInjectionEngine: @unchecked Sendable {
     }
 
     /// Delivers to the original input, with optional authorized correction-learning snapshots.
-    private func injectViaClipboard(
+    private func deliverText(
         _ text: String,
         trackingMetadata: (sourceText: String, sourceRecordID: String, modeID: UUID)?,
         authorizeCapture: (String?) -> Bool = { _ in false }
     ) -> TrackedInjectionResult {
         let shouldRestoreClipboard = Self.shouldRestoreClipboard(retention: clipboardRetention)
-        let readFrontmost = { NSWorkspace.shared.frontmostApplication }
-        let frontmost = Thread.isMainThread ? readFrontmost() : DispatchQueue.main.sync(execute: readFrontmost)
+        let frontmost = FocusedInputResolver.currentApplication()
         let deliveryTarget = Self.resolveDeliveryTarget(frontmost: frontmost)
         guard case .app(let application) = deliveryTarget else {
             // Type4Me itself is frontmost (e.g. Settings → About → Report an Issue).
             // Insert in-process into our own focused text view instead of posting
             // Cmd+V, so we never paste into another app and never touch the clipboard.
-            if Self.insertIntoOwnFocusedTextView(text) {
+            if Self.mayInsertIntoOwnApp(targetPID: frontmost?.processIdentifier,
+                                       ownPID: ProcessInfo.processInfo.processIdentifier),
+               Self.insertIntoOwnFocusedTextView(text) {
                 if !shouldRestoreClipboard {
                     copyToClipboard(text, transient: false)
                 }
                 DebugFileLogger.log("injection: inserted into Type4Me's own focused text view")
                 return TrackedInjectionResult(outcome: .inserted, observationContext: nil)
             }
-            // Delivery fallback: no valid external target application. Always preserve the
-            // dictated text in the system clipboard so the user's speech is never lost.
-            let copied = copyToClipboard(text, transient: false)
-            DebugFileLogger.log("injection fallback: no valid external target app; copied to clipboard")
+            DebugFileLogger.log("injection: no valid input target; text remains in MyType history")
             return TrackedInjectionResult(
-                outcome: Self.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed),
+                outcome: .notInserted,
                 observationContext: nil
             )
         }
@@ -167,9 +165,8 @@ final class TextInjectionEngine: @unchecked Sendable {
         do { configuration = try .bundled() }
         catch {
             DebugFileLogger.log("injection: invalid delivery configuration; automatic delivery skipped")
-            let copied = copyToClipboard(text)
             return TrackedInjectionResult(
-                outcome: Self.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed), observationContext: nil
+                outcome: .notInserted, observationContext: nil
             )
         }
         let before = trackingMetadata != nil
@@ -177,8 +174,9 @@ final class TextInjectionEngine: @unchecked Sendable {
             : nil
 
         let target = NativeTextDeliveryTarget(application: application, text: text, configuration: configuration)
-        let result = ClipboardDeliveryTransaction(configuration: configuration)
-            .deliver(text, to: target, restoreOriginal: shouldRestoreClipboard)
+        let result = shouldRestoreClipboard
+            ? ClipboardFreeDeliveryTransaction(configuration: configuration).deliver(to: target)
+            : ClipboardDeliveryTransaction(configuration: configuration).deliver(text, to: target, restoreOriginal: false)
         let outcome = Self.deliveryOutcome(result)
         DebugFileLogger.log("injection: delivery result=\(result)")
 
@@ -204,6 +202,17 @@ final class TextInjectionEngine: @unchecked Sendable {
         retention == .restoreOriginal
     }
 
+    /// Allows in-process editing only after focus resolution positively names this process.
+    ///
+    /// Args:
+    ///   targetPID: Resolved keyboard owner; nil includes ambiguous floating panels.
+    ///   ownPID: This application's process identifier.
+    /// Returns:
+    ///   Whether the app's own first responder can be used as the destination.
+    static func mayInsertIntoOwnApp(targetPID: pid_t?, ownPID: pid_t) -> Bool {
+        targetPID == ownPID
+    }
+
 
     /// Maps delivery evidence to the existing bilingual feedback without claiming a sent event succeeded.
     static func deliveryOutcome(_ result: TextDeliveryResult) -> InjectionOutcome {
@@ -215,6 +224,8 @@ final class TextInjectionEngine: @unchecked Sendable {
             return .actionFailed(L("剪贴板已变化，文本可从历史记录恢复", "Clipboard changed; recover the text from history"))
         case .clipboardWriteFailed:
             return .actionFailed(L("无法写入剪贴板，文本可从历史记录恢复", "Could not write to clipboard; recover the text from history"))
+        case .inputAttempted: return .inputAttempted
+        case .notDelivered: return .notInserted
         }
     }
 
@@ -233,7 +244,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         isPrePaste: Bool,
         authorize: (String?) -> Bool
     ) -> FocusedElementSnapshot? {
-        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let frontmostApp = FocusedInputResolver.currentApplication()
         let frontmostBundleID = frontmostApp?.bundleIdentifier
         return Self.authorizedSnapshot(
             bundleIdentifier: frontmostBundleID,

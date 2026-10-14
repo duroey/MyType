@@ -1340,7 +1340,7 @@ actor RecognitionSession {
         // than reusing a stale one, so we can never re-activate and paste into the
         // wrong application. In that case the natural frontmost app at paste time
         // receives the text, guarded by the frontmost confirmation below.
-        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        let frontmostApplication = FocusedInputResolver.currentApplication()
         let isSelf = frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
         if isSelf {
             targetApplication = nil
@@ -3329,7 +3329,7 @@ actor RecognitionSession {
 
             let targetApp = targetApplication
             let manualInputHasNoTarget = isManualInput && targetApp == nil
-            let injectLog = "stop: injecting method=clipboard len=\(finalText.count) +\(ContinuousClock.now - stopT0)"
+            let injectLog = "stop: injecting method=\(retainsClipboardResult ? "clipboard" : "text-events") len=\(finalText.count) +\(ContinuousClock.now - stopT0)"
             let injectionResult: TrackedInjectionResult
             if wasCancelled, retainsClipboardResult {
                 let copied = engine.copyToClipboard(finalText)
@@ -3378,14 +3378,11 @@ actor RecognitionSession {
                         )
                     }
                 } else {
-                    // Fail-safe: the intended target is gone or never became
-                    // frontmost, so pasting now could leak the dictated text
-                    // into the wrong app. Retain it in the clipboard instead.
-                    let copied = engine.copyToClipboard(finalText)
+                    // Keep failed delivery in MyType history, without replacing the user's clipboard.
                     let reason = plan == .failSafeClipboard ? "target terminated" : "target focus unconfirmed"
-                    DebugFileLogger.log("stop: \(reason); retained in clipboard, paste skipped")
+                    DebugFileLogger.log("stop: \(reason); retained in history, input skipped")
                     injectionResult = TrackedInjectionResult(
-                        outcome: TextInjectionEngine.deliveryOutcome(copied ? .clipboardOnly : .clipboardWriteFailed),
+                        outcome: .notInserted,
                         observationContext: nil
                     )
                 }
@@ -4264,7 +4261,7 @@ actor RecognitionSession {
         #if DEBUG
         if let targetForTesting { return targetForTesting() }
         #endif
-        let app = NSWorkspace.shared.frontmostApplication
+        let app = FocusedInputResolver.currentApplication()
         return TargetApplicationContext(
             processIdentifier: app?.processIdentifier,
             bundleIdentifier: app?.bundleIdentifier,

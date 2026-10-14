@@ -83,6 +83,8 @@ enum InjectionOutcome: Sendable, Equatable {
     /// Cmd+V was sent to an AX-opaque editor, but insertion cannot be proven.
     /// The dictated result intentionally remains in the clipboard.
     case pasteAttemptedClipboardRetained
+    /// Text events were sent without modifying the clipboard; receipt is unavailable.
+    case inputAttempted
     case copiedToClipboard
     case actionFailed(String)
     case notInserted
@@ -97,6 +99,8 @@ enum InjectionOutcome: Sendable, Equatable {
                 "已尝试输入，文本已保留到剪贴板",
                 "Paste attempted; text kept in clipboard"
             )
+        case .inputAttempted:
+            return L("文字已发送，未能确认输入；可在历史中查看", "Text sent; insertion unconfirmed. Available in history")
         case .copiedToClipboard:
             return L("已粘贴到剪贴板", "Copied to clipboard")
         case .actionFailed(let message):

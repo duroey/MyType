@@ -5,6 +5,7 @@ enum TextDeliveryObservation: Equatable { case inserted, unchanged, unavailable,
 enum TextDeliveryAttempt { case unavailable, dispatched }
 enum TextDeliveryResult: Equatable {
     case inserted, pasteAttempted, clipboardOnly, clipboardChanged, clipboardWriteFailed
+    case inputAttempted, notDelivered
 }
 
 protocol TextDeliveryTarget {
@@ -24,6 +25,13 @@ struct TextDeliveryConfiguration: Codable, Sendable {
     var maximumMenuNodes = 128
     var maximumMenuDepth = 4
     var maximumMenuSearchSeconds = 0.2
+    var unicodeChunkUTF16Length = 20
+    var unicodeChunkIntervalSeconds = 0.005
+    var maximumUnicodeDeliverySeconds = 3.0
+    var maximumFocusWindowCandidates = 16
+    var maximumFocusResolutionSeconds = 0.2
+    var minimumFloatingWindowDimension = 48.0
+    var focusWindowMatchTolerance = 1.0
 
     /// Loads bounded delivery timings from the application resource, or development defaults.
     static func bundled(in bundle: Bundle = .main) throws -> Self {
@@ -36,6 +44,13 @@ struct TextDeliveryConfiguration: Codable, Sendable {
               value.verificationPollIntervalSeconds.isFinite, (0.01...0.2).contains(value.verificationPollIntervalSeconds),
               value.accessibilityTimeoutSeconds.isFinite, (0.01...0.2).contains(value.accessibilityTimeoutSeconds),
               value.maximumMenuSearchSeconds.isFinite, (0.05...0.5).contains(value.maximumMenuSearchSeconds),
+              (2...20).contains(value.unicodeChunkUTF16Length),
+              value.unicodeChunkIntervalSeconds.isFinite, (0.001...0.02).contains(value.unicodeChunkIntervalSeconds),
+              value.maximumUnicodeDeliverySeconds.isFinite, (0.5...5).contains(value.maximumUnicodeDeliverySeconds),
+              (1...32).contains(value.maximumFocusWindowCandidates),
+              value.maximumFocusResolutionSeconds.isFinite, (0.05...0.5).contains(value.maximumFocusResolutionSeconds),
+              value.minimumFloatingWindowDimension.isFinite, (16...256).contains(value.minimumFloatingWindowDimension),
+              value.focusWindowMatchTolerance.isFinite, (0...4).contains(value.focusWindowMatchTolerance),
               (1...1_000_000).contains(value.maximumValueUTF16Length),
               (1...256).contains(value.maximumMenuNodes), (1...6).contains(value.maximumMenuDepth)
         else { throw CocoaError(.coderInvalidValue) }
