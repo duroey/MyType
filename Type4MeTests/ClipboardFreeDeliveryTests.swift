@@ -3,6 +3,124 @@ import XCTest
 @testable import Type4Me
 
 final class ClipboardFreeDeliveryTests: XCTestCase {
+    /// Optional verification preserves a precise correction target after immediate send feedback.
+    func testDeferredVerificationPreservesConfirmedContext() async {
+        let target = StubClipboardFreeTarget()
+        target.unicodeResult = .dispatched
+        target.observe = { target.unicodeCalls > 0 ? .inserted : .unchanged }
+        let transaction = ClipboardFreeDeliveryTransaction(wait: { _ in })
+        let result = TrackedInjectionResult(
+            outcome: TextInjectionEngine.deliveryOutcome(transaction.deliver(to: target)),
+            observationContext: nil,
+            deferredObservation: {
+                transaction.verifyInsertion(to: target) ? Self.trackingContext() : nil
+            })
+        XCTAssertEqual(result.outcome, .inputDispatched)
+        XCTAssertNil(result.observationContext)
+        let context = await result.resolveObservationContext()
+        XCTAssertEqual(context?.baselineValue, "confirmed text")
+        XCTAssertEqual(context?.sourceRecordID, "confirmed-record")
+        XCTAssertEqual(target.unicodeCalls, 1)
+        XCTAssertEqual(target.directCalls, 0)
+        XCTAssertEqual(result.outcome, .inputDispatched)
+    }
+
+    /// Cancellation reaches an already-running receipt and discards even a late valid context.
+    func testCancellationReachesRunningVerification() async {
+        let started = expectation(description: "receipt started")
+        let released = DispatchSemaphore(value: 0)
+        let result = TrackedInjectionResult(outcome: .inputDispatched, observationContext: nil,
+                                           deferredObservation: {
+            started.fulfill()
+            _ = released.wait(timeout: .now() + 1)
+            XCTAssertTrue(Task.isCancelled)
+            return Self.trackingContext()
+        })
+        let verification = Task { await result.resolveObservationContext() }
+        await fulfillment(of: [started], timeout: 1)
+        verification.cancel()
+        released.signal()
+        let context = await verification.value
+        XCTAssertNil(context)
+        XCTAssertEqual(result.outcome, .inputDispatched)
+    }
+
+    /// Creates an inert tracking fixture without reading any live application or input field.
+    private static func trackingContext() -> TrackedInjectionContext {
+        TrackedInjectionContext(
+            element: AXUIElementCreateSystemWide(), processIdentifier: 1234,
+            bundleIdentifier: "com.example.fixture", baselineValue: "confirmed text",
+            injectedRange: NSRange(location: 0, length: 14), beforeSelectedRange: nil,
+            afterSelectedRange: nil, placeholderCandidates: [], sourceText: "confirmed text",
+            injectedText: "confirmed text", sourceRecordID: "confirmed-record", modeID: UUID()
+        )
+    }
+
+    /// A slow optional receipt starts only when requested, leaving completion immediately available.
+    func testTrackingIsLazyAndCannotChangeCompletion() async {
+        let started = expectation(description: "optional tracking started")
+        let released = DispatchSemaphore(value: 0)
+        let result = TrackedInjectionResult(outcome: .inputDispatched, observationContext: nil,
+                                           deferredObservation: {
+            started.fulfill()
+            _ = released.wait(timeout: .now() + 1)
+            return nil
+        })
+        XCTAssertEqual(result.outcome, .inputDispatched)
+        XCTAssertFalse(result.outcome.requiresAttention)
+        let verification = Task { await result.resolveObservationContext() }
+        await fulfillment(of: [started], timeout: 1)
+        // Even while the editor is unresponsive, completion has already been returned.
+        XCTAssertEqual(result.outcome, .inputDispatched)
+        released.signal()
+        let context = await verification.value
+        XCTAssertNil(context)
+        XCTAssertEqual(result.outcome, .inputDispatched)
+    }
+
+    /// A newer session can cancel a queued receipt without publishing stale correction context.
+    func testCancelledTrackingDoesNotReadEditor() async {
+        let result = TrackedInjectionResult(outcome: .inputDispatched, observationContext: nil,
+                                           deferredObservation: {
+            XCTFail("Cancelled tracking must not read the editor")
+            return nil
+        })
+        let verification = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await result.resolveObservationContext()
+        }
+        let context = await verification.value
+        XCTAssertNil(context)
+        XCTAssertEqual(result.outcome, .inputDispatched)
+    }
+
+    /// Enter, further typing and focus changes after a complete send cannot delay or fail completion.
+    func testCompletionDoesNotReadOrWaitAfterDispatch() {
+        for afterSend in [TextDeliveryObservation.unchanged, .selectionChanged, .changed,
+                          .unavailable, .targetChanged, .inserted] {
+            for useDirect in [false, true] {
+                let target = StubClipboardFreeTarget()
+                if useDirect { target.directResult = .dispatched }
+                else { target.unicodeResult = .dispatched }
+                var postSendReads = 0
+                var waits = 0
+                target.observe = {
+                    let sent = useDirect ? target.directCalls > 0 : target.unicodeCalls > 0
+                    guard sent else { return .unchanged }
+                    postSendReads += 1
+                    return afterSend
+                }
+                let result = ClipboardFreeDeliveryTransaction(wait: { _ in waits += 1 }).deliver(to: target)
+                XCTAssertEqual(result, .inputDispatched)
+                XCTAssertFalse(TextInjectionEngine.deliveryOutcome(result).requiresAttention)
+                XCTAssertEqual(postSendReads, 0)
+                XCTAssertEqual(waits, 0)
+                XCTAssertEqual(target.unicodeCalls, 1)
+                XCTAssertEqual(target.directCalls, useDirect ? 1 : 0)
+            }
+        }
+    }
+
     /// Unresolved floating focus cannot fall through into MyType's cached first responder.
     func testUncertainFocusCannotInsertIntoOwnApp() {
         XCTAssertFalse(TextInjectionEngine.mayInsertIntoOwnApp(targetPID: nil, ownPID: 123))
@@ -65,18 +183,20 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         }
     }
 
-    /// Caret movement alone is not evidence of text delivery and must keep recovery feedback.
-    func testCaretMovementWithoutTextStillWarns() {
+    /// A caret-only receipt does not prove insertion, but cannot reverse a completed send.
+    func testCaretMovementDoesNotCreateAFalseFailure() {
         let target = StubClipboardFreeTarget()
         target.unicodeResult = .dispatched
         let caretOnly = NativeTextDeliveryTarget.compareReceipt(
             beforeValue: "before", beforeRange: NSRange(location: 6, length: 0),
             expectedValue: "before new", insertedUTF16Length: 4,
             currentValue: "before", currentRange: NSRange(location: 0, length: 0))
+        XCTAssertEqual(caretOnly, .selectionChanged)
         target.observe = { target.unicodeCalls > 0 ? caretOnly : .unchanged }
-        let result = ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target)
-        XCTAssertEqual(result, .inputUnchanged)
-        XCTAssertTrue(TextInjectionEngine.deliveryOutcome(result).requiresAttention)
+        let transaction = ClipboardFreeDeliveryTransaction(wait: { _ in })
+        let result = transaction.deliver(to: target)
+        XCTAssertEqual(result, .inputDispatched)
+        XCTAssertFalse(transaction.verifyInsertion(to: target))
         XCTAssertEqual(target.unicodeCalls, 1)
         XCTAssertEqual(target.directCalls, 0)
     }
@@ -103,7 +223,7 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         let target = StubClipboardFreeTarget()
         target.directResult = .dispatched
         target.observe = { target.directCalls > 0 ? .inserted : .unchanged }
-        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .inserted)
+        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .inputDispatched)
         XCTAssertEqual(target.unicodeCalls, 1)
         XCTAssertEqual(target.directCalls, 1)
     }
@@ -116,32 +236,28 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         XCTAssertEqual(target.unicodeCalls + target.directCalls, 0)
     }
 
-    /// A readable field that stayed unchanged is distinct from an unreadable receipt; neither is retried.
-    func testUnchangedAndUnavailableReceiptsRemainDistinct() {
-        for (observation, expected) in [
-            (TextDeliveryObservation.unchanged, TextDeliveryResult.inputUnchanged),
-            (.unavailable, .inputDispatched),
-        ] {
+    /// Old or unreadable AX values cannot diagnose a failure after events were fully sent.
+    func testStaleReceiptsDoNotFailCompletion() {
+        for observation in [TextDeliveryObservation.unchanged, .unavailable] {
             let target = StubClipboardFreeTarget()
             target.unicodeResult = .dispatched
             target.observe = { observation }
-            XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), expected)
+            XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), .inputDispatched)
             XCTAssertEqual(target.unicodeCalls, 1)
             XCTAssertEqual(target.directCalls, 0)
-            XCTAssertEqual(TextInjectionEngine.deliveryOutcome(expected).requiresAttention, expected == .inputUnchanged)
         }
     }
 
-    /// Losing the destination still warns, while editor text differences alone are not failures.
-    func testFocusAndContentChangesAfterDispatchRemainDistinct() {
-        for (observation, expected) in [
-            (TextDeliveryObservation.targetChanged, TextDeliveryResult.inputTargetChanged),
-            (.changed, .inputDispatched),
-        ] {
+    /// Submitting or leaving after a complete send only abandons optional tracking.
+    func testPostSendChangesDoNotOverrideCompletion() {
+        for observation in [TextDeliveryObservation.targetChanged, .changed] {
             let target = StubClipboardFreeTarget()
             target.unicodeResult = .dispatched
             target.observe = { target.unicodeCalls == 0 ? .unchanged : observation }
-            XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in }).deliver(to: target), expected)
+            let transaction = ClipboardFreeDeliveryTransaction(wait: { _ in })
+            let result = transaction.deliver(to: target)
+            XCTAssertFalse(transaction.verifyInsertion(to: target))
+            XCTAssertEqual(TextInjectionEngine.deliveryOutcome(result), .inputDispatched)
             XCTAssertEqual(target.unicodeCalls, 1)
             XCTAssertEqual(target.directCalls, 0)
         }
@@ -160,7 +276,7 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
     /// A late AX timeout may already have applied its write, so uncertainty must survive receipt polling.
     func testAmbiguousDirectWriteDoesNotClaimSuccessOrRetry() {
         for (observation, expected) in [(TextDeliveryObservation.unavailable, TextDeliveryResult.inputAttempted),
-                                         (.changed, .inputChanged)] {
+                                         (.changed, .inputAttempted)] {
             let target = StubClipboardFreeTarget()
             target.directResult = .uncertain
             target.observe = { target.directCalls > 0 ? observation : .unchanged }
@@ -195,13 +311,18 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
         XCTAssertTrue(TextDeliveryAttempt.partiallyDispatched.mayHaveDispatched)
     }
 
-    /// A delayed receipt can confirm a single uncertain write without any additional dispatch.
-    func testDelayedReceiptConfirmsUncertainWrite() {
+    /// Optional verification can still confirm delayed rendering without another write.
+    func testDelayedReceiptConfirmsTrackingWithoutChangingCompletion() {
         let target = StubClipboardFreeTarget()
-        target.directResult = .uncertain
+        target.directResult = .dispatched
         var waited = false
         target.observe = { waited ? .inserted : .unchanged }
-        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in waited = true }).deliver(to: target), .inserted)
+        let transaction = ClipboardFreeDeliveryTransaction(wait: { _ in waited = true })
+        let result = transaction.deliver(to: target)
+        XCTAssertEqual(result, .inputDispatched)
+        XCTAssertFalse(waited)
+        XCTAssertTrue(transaction.verifyInsertion(to: target))
+        XCTAssertEqual(result, .inputDispatched)
         XCTAssertEqual(target.unicodeCalls, 1)
         XCTAssertEqual(target.directCalls, 1)
     }
@@ -215,8 +336,11 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
             if target.unicodeCalls == 0 { return .unchanged }
             return pollsWaited >= 2 ? .inserted : .changed
         }
-        let result = ClipboardFreeDeliveryTransaction(wait: { _ in pollsWaited += 1 }).deliver(to: target)
-        XCTAssertEqual(result, .inserted)
+        let transaction = ClipboardFreeDeliveryTransaction(wait: { _ in pollsWaited += 1 })
+        let result = transaction.deliver(to: target)
+        XCTAssertEqual(result, .inputDispatched)
+        XCTAssertEqual(pollsWaited, 0)
+        XCTAssertTrue(transaction.verifyInsertion(to: target))
         XCTAssertEqual(pollsWaited, 2)
         XCTAssertEqual(target.unicodeCalls, 1)
         XCTAssertEqual(target.directCalls, 0)
@@ -231,8 +355,9 @@ final class ClipboardFreeDeliveryTests: XCTestCase {
             if target.unicodeCalls == 0 { return .unchanged }
             return waited ? .targetChanged : .changed
         }
-        XCTAssertEqual(ClipboardFreeDeliveryTransaction(wait: { _ in waited = true }).deliver(to: target),
-                       .inputTargetChanged)
+        let transaction = ClipboardFreeDeliveryTransaction(wait: { _ in waited = true })
+        XCTAssertEqual(transaction.deliver(to: target), .inputDispatched)
+        XCTAssertFalse(transaction.verifyInsertion(to: target))
         XCTAssertEqual(target.unicodeCalls, 1)
         XCTAssertEqual(target.directCalls, 0)
     }

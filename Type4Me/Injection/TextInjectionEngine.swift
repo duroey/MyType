@@ -108,7 +108,7 @@ final class TextInjectionEngine: @unchecked Sendable {
         sourceText: String,
         sourceRecordID: String,
         modeID: UUID,
-        shouldCaptureApp: @Sendable (String?) -> Bool
+        shouldCaptureApp: @escaping @Sendable (String?) -> Bool
     ) -> TrackedInjectionResult {
         guard !text.isEmpty else {
             return TrackedInjectionResult(outcome: .inserted, observationContext: nil)
@@ -136,7 +136,7 @@ final class TextInjectionEngine: @unchecked Sendable {
     private func deliverText(
         _ text: String,
         trackingMetadata: (sourceText: String, sourceRecordID: String, modeID: UUID)?,
-        authorizeCapture: (String?) -> Bool = { _ in false }
+        authorizeCapture: @escaping (String?) -> Bool = { _ in false }
     ) -> TrackedInjectionResult {
         let shouldRestoreClipboard = Self.shouldRestoreClipboard(retention: clipboardRetention)
         let frontmost = FocusedInputResolver.currentApplication()
@@ -180,22 +180,24 @@ final class TextInjectionEngine: @unchecked Sendable {
         let outcome = Self.deliveryOutcome(result)
         DebugFileLogger.log("injection: delivery result=\(result)")
 
-        let after = trackingMetadata != nil && outcome == .inserted
-            ? captureFocusedElementSnapshot(isPrePaste: false, authorize: authorizeCapture)
-            : nil
-
-        let context = trackingMetadata.flatMap { metadata in
-            makeObservationContext(
-                before: before,
-                after: after,
-                pastedText: text,
-                sourceText: metadata.sourceText,
-                sourceRecordID: metadata.sourceRecordID,
-                modeID: metadata.modeID,
-                outcome: outcome
-            )
+        guard let metadata = trackingMetadata, before != nil,
+              outcome == .inserted || outcome == .inputDispatched else {
+            return TrackedInjectionResult(outcome: outcome, observationContext: nil)
         }
-        return TrackedInjectionResult(outcome: outcome, observationContext: context)
+        return TrackedInjectionResult(outcome: outcome, observationContext: nil, deferredObservation: { [self] in
+            // Exact receipts belong to correction tracking, not the user's completion indicator.
+            // This closure is only resolved off-actor after the finalized event has been emitted.
+            guard ClipboardFreeDeliveryTransaction(configuration: configuration).verifyInsertion(to: target),
+                  !Task.isCancelled else { return nil }
+            // Read only the focused element; never search another field after the user has moved on.
+            let after = captureFocusedElementSnapshot(isPrePaste: true, authorize: authorizeCapture)
+            guard !Task.isCancelled, target.observation() == .inserted else { return nil }
+            return makeObservationContext(
+                before: before, after: after, pastedText: text,
+                sourceText: metadata.sourceText, sourceRecordID: metadata.sourceRecordID,
+                modeID: metadata.modeID, outcome: .inserted
+            )
+        })
     }
 
     static func shouldRestoreClipboard(retention: ClipboardRetention) -> Bool {

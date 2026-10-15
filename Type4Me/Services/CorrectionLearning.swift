@@ -54,17 +54,42 @@ typealias CorrectionObservationContext = TrackedInjectionContext
 struct TrackedInjectionResult: @unchecked Sendable {
     let outcome: InjectionOutcome
     let context: TrackedInjectionContext?
+    // Owned exclusively by this result; resolved after completion feedback, never during dispatch.
+    private let deferredObservation: (() -> TrackedInjectionContext?)?
 
     var observationContext: TrackedInjectionContext? { context }
 
     init(outcome: InjectionOutcome, context: TrackedInjectionContext?) {
         self.outcome = outcome
         self.context = context
+        self.deferredObservation = nil
     }
 
-    init(outcome: InjectionOutcome, observationContext: TrackedInjectionContext?) {
+    init(outcome: InjectionOutcome, observationContext: TrackedInjectionContext?,
+         deferredObservation: (() -> TrackedInjectionContext?)? = nil) {
         self.outcome = outcome
         self.context = observationContext
+        self.deferredObservation = deferredObservation
+    }
+
+    /// Resolves authorized tracking without blocking the recognition actor or changing completion feedback.
+    ///
+    /// Returns:
+    ///   A precisely verified context, or nil when the user submitted, edited or left the field.
+    func resolveObservationContext() async -> TrackedInjectionContext? {
+        guard !Task.isCancelled, outcome == .inserted || outcome == .inputDispatched else { return nil }
+        if let context { return context }
+        guard deferredObservation != nil else { return nil }
+        let verification = Task.detached(priority: .utility) {
+            guard !Task.isCancelled else { return Optional<TrackedInjectionContext>.none }
+            return self.deferredObservation?()
+        }
+        return await withTaskCancellationHandler {
+            let context = await verification.value
+            return Task.isCancelled ? nil : context
+        } onCancel: {
+            verification.cancel()
+        }
     }
 }
 

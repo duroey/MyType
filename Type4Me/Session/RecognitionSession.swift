@@ -629,7 +629,13 @@ actor RecognitionSession {
 
     // MARK: - Session generation (prevents zombie tasks after forceReset)
 
-    private var sessionGeneration: Int = 0
+    private var postInjectionTrackingTask: Task<Void, Never>?
+    private var sessionGeneration: Int = 0 {
+        didSet {
+            postInjectionTrackingTask?.cancel()
+            postInjectionTrackingTask = nil
+        }
+    }
 
     // MARK: - Accumulated text
 
@@ -3440,8 +3446,17 @@ actor RecognitionSession {
                 appliedSnippets: historySnippetApplication?.appliedRules
             ))
             guard ownsSession(myGeneration) else { return }
-            if injectionResult.outcome == .inserted,
-               let context = injectionResult.observationContext {
+            // Invalidate the previous target before releasing this session. Verification runs
+            // independently so an already-completed send never blocks the next recording.
+            await ReviseCoordinator.shared.clearTarget()
+            guard ownsSession(myGeneration) else { return }
+            postInjectionTrackingTask?.cancel()
+            postInjectionTrackingTask = Task { [self, intelliSenseSettings, intelliSenseTarget,
+                intelliSenseStartedModeID, intelliSenseCrossModeFallback, intelliSenseGuardRejected,
+                intelliSenseRequestContext, currentMode, isManualInput] in
+                guard !Task.isCancelled, sessionGeneration == myGeneration else { return }
+                guard let context = await injectionResult.resolveObservationContext() else { return }
+                guard !Task.isCancelled, sessionGeneration == myGeneration else { return }
                 let actualBundleID = context.bundleIdentifier
                 let actualAvailability: ContextAvailability? = {
                     if intelliSenseSettings?.isBlacklisted(bundleIdentifier: actualBundleID) == true {
@@ -3489,10 +3504,11 @@ actor RecognitionSession {
                     sourceModeKind: sourceKind,
                     learningResumePlan: ReviseLearningResumePlan(shouldResume: effectiveShouldTrackLearning, modeID: currentMode.id)
                 )
-                guard ownsSession(myGeneration) else { return }
+                guard !Task.isCancelled, sessionGeneration == myGeneration else { return }
 
                 if effectiveShouldTrackLearning {
                     await MainActor.run {
+                        guard !Task.isCancelled else { return }
                         PostInjectionLearningCoordinator.shared.begin(
                             context,
                             options: PostInjectionLearningOptions(
@@ -3502,16 +3518,8 @@ actor RecognitionSession {
                             )
                         )
                     }
-                    guard ownsSession(myGeneration) else { return }
+                    guard !Task.isCancelled, sessionGeneration == myGeneration else { return }
                 }
-            } else {
-                // A new output that cannot be tracked (AX-blind app, clipboard-only
-                // fallback, or unverifiable range) must invalidate the previous
-                // app's target. Otherwise Revise reports a misleading focus error
-                // and risks carrying stale target identity across applications.
-                await ReviseCoordinator.shared.clearTarget()
-                guard ownsSession(myGeneration) else { return }
-                DebugFileLogger.log("revise_target: cleared reason=untracked_injection")
             }
             if !isManualInput { KeychainService.addASRUsage(seconds: duration) }
 

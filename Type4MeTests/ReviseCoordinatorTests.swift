@@ -61,6 +61,13 @@ final class ReviseCoordinatorTests: XCTestCase {
         XCTAssertEqual(prepared.currentText, initial)
         XCTAssertEqual(prepared.targetGeneration, 0)
 
+        // A cancelled background receipt must not replace a target whose revision is already active.
+        let staleRegistration = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await coordinator.registerTarget(context: context, sourceModeKind: .direct)
+        }
+        await staleRegistration.value
+
         // Attempting another prepare while busy returns busy
         let secondPrep = await coordinator.prepareForRecording()
         guard case .failure(let err) = secondPrep else {

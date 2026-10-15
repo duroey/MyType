@@ -124,6 +124,8 @@ actor ReviseCoordinator {
         sourceModeKind: ReviseSourceModeKind,
         learningResumePlan: ReviseLearningResumePlan? = nil
     ) async {
+        // A newer recording can cancel receipt verification while this actor call is queued.
+        guard !Task.isCancelled else { return }
         expiryTask?.cancel()
         expiryTask = nil
         transaction = nil
