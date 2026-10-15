@@ -435,6 +435,24 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
         liveResizeStartSize = panel.frame.size
     }
 
+    /// Stops a native drag at the size limits before AppKit applies the proposed frame.
+    ///
+    /// Args:
+    ///   sender: Window whose live resize is proposing a new frame size.
+    ///   frameSize: Proposed outer size in screen points.
+    ///
+    /// Returns:
+    ///   A size within the configured minimum and usable display bounds.
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        guard sender === panel else { return frameSize }
+        let availableFrame = sender.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? NSRect(origin: .zero, size: sender.contentMaxSize)
+        // This borderless panel's frame and content sizes are identical. Unlike
+        // contentMinSize, the delegate result is not discarded by Auto Layout.
+        return layout.frame(contentHeight: frameSize.height, visibleFrame: availableFrame,
+                            preferredSize: frameSize).size
+    }
+
     /// Keeps the user's final dimensions across incoming messages, reopening, and app restarts.
     ///
     /// Args:
@@ -447,8 +465,6 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
         defaults.set([
             "width": Double(panel.frame.width), "height": Double(panel.frame.height)
         ], forKey: Self.preferredSizeKey)
-        // AppKit still reports inLiveResize during this notification; clamp position after it ends.
-        DispatchQueue.main.async { [weak self] in self?.resizeToContent() }
     }
 
     /// Reapplies display bounds when the queue moves to a different screen.
