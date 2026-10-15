@@ -118,6 +118,7 @@ private final class AgentInboxHostingView: NSHostingView<AgentInboxView> {
     var resizeLayout = AgentInboxPanelLayout()
     private var resizeTrackingAreas: [NSTrackingArea] = []
     private var currentResizeCursor: NSCursor?
+    private let backgroundCursor = AgentInboxBackgroundCursor()
 
     private enum Edge {
         case top, bottom, left, right, topLeft, topRight, bottomLeft, bottomRight
@@ -205,7 +206,25 @@ private final class AgentInboxHostingView: NSHostingView<AgentInboxView> {
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
         guard resizeTrackingAreas.contains(where: { $0 === event.trackingArea }) else { return }
-        updateResizeCursor(at: convert(event.locationInWindow, from: nil))
+        // AppKit can synthesize exits while rebuilding tracking areas after resizing.
+        guard let window else { releaseResizeCursor(); return }
+        updateResizeCursor(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+
+    /// Releases cursor ownership when the queue hides or its hosting view is detached.
+    func releaseResizeCursor() {
+        if let cursor = currentResizeCursor, NSCursor.current == cursor { NSCursor.arrow.set() }
+        currentResizeCursor = nil
+        backgroundCursor.end()
+    }
+
+    /// Restores background cursor policy before AppKit disconnects the hosting view.
+    ///
+    /// Args:
+    ///   newWindow: Destination window, or nil when the view is being removed.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow !== window { releaseResizeCursor() }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     /// Sets a system resize cursor or releases it without overwriting a cursor set by content.
@@ -217,11 +236,12 @@ private final class AgentInboxHostingView: NSHostingView<AgentInboxView> {
     ///   Whether the pointer is over a resizing region.
     @discardableResult
     private func updateResizeCursor(at point: NSPoint) -> Bool {
-        guard let region = resizeRegions().first(where: { $0.rect.contains(point) }) else {
-            if let cursor = currentResizeCursor, NSCursor.current == cursor { NSCursor.arrow.set() }
-            currentResizeCursor = nil
+        guard window?.isVisible == true, !isHiddenOrHasHiddenAncestor,
+              let region = resizeRegions().first(where: { $0.rect.contains(point) }) else {
+            releaseResizeCursor()
             return false
         }
+        backgroundCursor.begin()
         let cursor = region.edge.cursor
         cursor.set()
         currentResizeCursor = cursor
@@ -322,6 +342,7 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
     func close() {
         presentation = nil
         model?.resetPresentation()
+        (panel?.contentView as? AgentInboxHostingView)?.releaseResizeCursor()
         if let dismissOverride { dismissOverride() } else { panel?.orderOut(nil) }
     }
 
