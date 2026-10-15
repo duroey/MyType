@@ -373,12 +373,13 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
         panel.isFloatingPanel = true
         panel.acceptsMouseMovedEvents = true
         panel.becomesKeyOnlyIfNeeded = true
-        panel.level = .floating
+        // Match the dictation overlay while preserving manual-only keyboard focus.
+        panel.level = .popUpMenu
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.delegate = self
         preferredSize = loadPreferredSize()

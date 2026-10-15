@@ -64,11 +64,12 @@ final class FloatingBarPanel: NSPanel {
         )
 
         isFloatingPanel = true
-        level = .floating
+        // Keep dictation visible above ordinary app panels without activating the app.
+        level = .popUpMenu
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications, .fullScreenAuxiliary]
         isMovableByWindowBackground = false
         hidesOnDeactivate = false
         ignoresMouseEvents = true
