@@ -85,6 +85,7 @@ struct AgentInboxView: View {
                     .background(TF.settingsControl, in: RoundedRectangle(cornerRadius: TF.cornerSM))
             }
             .buttonStyle(.plain).help(copy(.close)).accessibilityLabel(copy(.close))
+            .focusEffectDisabled()
             .keyboardShortcut(.escape, modifiers: [])
         }
         .padding(TF.spacingLG)
