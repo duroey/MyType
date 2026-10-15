@@ -314,8 +314,10 @@ struct CodexInboxStateReducer {
     private var confirmedCompletedTurnID: String?
     private var readCompletedTurnID: String?
     private var lastProjectedStatus: AgentInboxStatus?
-    private var outstanding: [String: (request: AgentInboxRequest, position: Position)] = [:]
+    private var outstanding: [String: (request: AgentInboxRequest, position: Position, sourceEnded: Bool)] = [:]
     private var answeredQuestionIDs: [String] = []
+    private var retiredQuestionIDs: [String] = []
+    private var latestObservedTurn: Position?
 
     private struct QuestionReply: Decodable {
         let questionItemId: String
@@ -332,6 +334,11 @@ struct CodexInboxStateReducer {
             if left.turnID != right.turnID { return left.turnID < right.turnID }
             return left.itemIndex < right.itemIndex
         }
+    }
+
+    private struct ItemIdentity: Hashable {
+        let type: String
+        let id: String
     }
 
     /// Creates an isolated stream reducer with explicit payload bounds.
@@ -358,7 +365,7 @@ struct CodexInboxStateReducer {
         return id
     }
 
-    /// Invalidates stale patch state while retaining questions and their accepted answer receipts.
+    /// Invalidates patch state while retaining accepted answers and superseded-question evidence.
     mutating func invalidateRevision() {
         state = nil; revision = nil; estimatedBytes = 0; turnStatuses = [:]
         confirmedCompletedTurnID = nil; readCompletedTurnID = nil
@@ -496,7 +503,9 @@ struct CodexInboxStateReducer {
         let history = ((state["turnHistory"] as? [String: Any])?["history"] as? [String: Any])?["entitiesByKey"] as? [String: Any] ?? [:]
         var turnsByID: [String: [String: Any]] = [:]
         for turn in (state["turns"] as? [[String: Any]] ?? []) + history.values.compactMap({ $0 as? [String: Any] }) {
-            if let id = turn["turnId"] as? String { turnsByID[id] = turn }
+            if let id = turn["turnId"] as? String {
+                turnsByID[id] = turnsByID[id].map { Self.mergeTurn(live: $0, canonical: turn) } ?? turn
+            }
         }
         let turns = turnsByID.values.sorted {
             let left = $0["turnStartedAtMs"] as? Double ?? 0, right = $1["turnStartedAtMs"] as? Double ?? 0
@@ -506,16 +515,29 @@ struct CodexInboxStateReducer {
         var completion: String?
         var newStatuses: [String: String] = [:]
         for turn in turns {
+            guard let id = turn["turnId"] as? String,
+                  let time = turn["turnStartedAtMs"] as? Double, time.isFinite, time > 0 else { continue }
+            if latestObservedTurn == nil || time > latestObservedTurn!.time {
+                latestObservedTurn = Position(time: time, turnID: id, itemIndex: 0)
+            }
+        }
+        for turn in turns {
             guard let turnID = turn["turnId"] as? String else { continue }
             let status = turn["status"] as? String ?? ""
             newStatuses[turnID] = status
             if !snapshot, status == "completed", turnStatuses[turnID] == "inProgress" {
                 completion = turnID
             }
+            // Receipt merging must not reorder the existing canonical message preview.
+            let previewTurn = history[turnID] as? [String: Any] ?? turn
+            for item in previewTurn["items"] as? [[String: Any]] ?? [] {
+                if item["type"] as? String == "agentMessage", let text = item["text"] as? String, !text.isEmpty {
+                    preview = String(text.prefix(configuration.maximumPreviewCharacters))
+                }
+            }
             for (index, item) in (turn["items"] as? [[String: Any]] ?? []).enumerated() {
                 let position = Position(time: turn["turnStartedAtMs"] as? Double ?? 0, turnID: turnID, itemIndex: index)
                 guard item["type"] as? String == "agentMessage" else { continue }
-                if let text = item["text"] as? String, !text.isEmpty { preview = String(text.prefix(configuration.maximumPreviewCharacters)) }
                 if item["delivery"] as? String == "async", let questions = item["questions"] as? [[String: Any]],
                    !questions.isEmpty, let id = item["id"] as? String,
                    !id.isEmpty, id.count <= AgentSessionMetadataValidation.maximumIdentifierCharacters {
@@ -523,12 +545,31 @@ struct CodexInboxStateReducer {
                         guard let identity = Self.questionIdentity(sourceID: id, index: questionIndex) else { continue }
                         let text = (question["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                             ?? item["text"] as? String ?? ""
+                        let sourceEnded = Self.isTerminalTurn(status) || outstanding[identity]?.sourceEnded == true
                         outstanding[identity] = (.init(id: "async:\(id):\(questionIndex)", kind: .input,
-                            text: String(text.prefix(configuration.maximumPreviewCharacters))), position)
+                            text: String(text.prefix(configuration.maximumPreviewCharacters))), position, sourceEnded)
                     }
                 }
             }
         }
+        // A terminal historical prompt is no longer a current action once a strictly
+        // newer turn exists. This is lifecycle evidence, not an inferred user answer.
+        for identity in Array(outstanding.keys) {
+            if let pending = outstanding[identity], Self.isTerminalTurn(newStatuses[pending.position.turnID] ?? "") {
+                outstanding[identity]?.sourceEnded = true
+            }
+        }
+        var retired = Set(retiredQuestionIDs)
+        if let latestObservedTurn {
+            for (identity, pending) in outstanding.sorted(by: { $0.value.position < $1.value.position }) {
+                if pending.sourceEnded, pending.position.time.isFinite, pending.position.time > 0,
+                   pending.position.turnID != latestObservedTurn.turnID,
+                   pending.position.time < latestObservedTurn.time, retired.insert(identity).inserted {
+                    retiredQuestionIDs.append(identity)
+                }
+            }
+        }
+        retiredQuestionIDs = Array(retiredQuestionIDs.suffix(configuration.maximumCompletionReceipts))
         // A card response can become an accepted steering item without a new userMessage.
         // Gather every question first, then match exact native IDs so item order, partial
         // answers and subsequent history snapshots cannot clear or resurrect other questions.
@@ -550,7 +591,7 @@ struct CodexInboxStateReducer {
             if recentAnswers.count >= configuration.maximumCompletionReceipts { break }
         }
         answeredQuestionIDs = recentAnswers.reversed()
-        outstanding = outstanding.filter { !answered.contains($0.key) }
+        outstanding = outstanding.filter { !answered.contains($0.key) && !retired.contains($0.key) }
         // Bound retained question state even if the native history contains repeated unanswered prompts.
         outstanding = Dictionary(uniqueKeysWithValues: outstanding.sorted {
             $0.value.position == $1.value.position ? $0.key < $1.key : $0.value.position > $1.value.position
@@ -635,6 +676,55 @@ struct CodexInboxStateReducer {
             withJSONObject: ["request_user_input_async", sourceID, index], options: [.withoutEscapingSlashes]
         ) else { return nil }
         return String(decoding: bytes, as: UTF8.self)
+    }
+
+    /// Preserves live-only cards and accepted receipts when canonical history overlaps a live turn.
+    ///
+    /// Args:
+    ///   live: Live representation already present in the stream.
+    ///   canonical: Canonical history representation of the same turn.
+    /// Returns:
+    ///   Canonical metadata with a union of items; terminal and accepted states do not regress.
+    private static func mergeTurn(live: [String: Any], canonical: [String: Any]) -> [String: Any] {
+        var merged = live.merging(canonical) { _, canonicalValue in canonicalValue }
+        if isTerminalTurn(live["status"] as? String ?? ""),
+           !isTerminalTurn(canonical["status"] as? String ?? "") {
+            merged["status"] = live["status"]
+        }
+        var items = canonical["items"] as? [[String: Any]] ?? []
+        var indexes: [ItemIdentity: Int] = [:]
+        for (index, item) in items.enumerated() {
+            if let type = item["type"] as? String, let id = item["id"] as? String {
+                indexes[ItemIdentity(type: type, id: id)] = index
+            }
+        }
+        for item in live["items"] as? [[String: Any]] ?? [] {
+            guard let type = item["type"] as? String, let id = item["id"] as? String else {
+                items.append(item)
+                continue
+            }
+            let identity = ItemIdentity(type: type, id: id)
+            if let index = indexes[identity] {
+                if type == "steeringUserMessage", item["status"] as? String == "accepted" {
+                    items[index] = item
+                }
+            } else {
+                indexes[identity] = items.count
+                items.append(item)
+            }
+        }
+        merged["items"] = items
+        return merged
+    }
+
+    /// Identifies explicit ended-turn states without treating absent state or runtime idle as completion.
+    ///
+    /// Args:
+    ///   status: Native turn status.
+    /// Returns:
+    ///   Whether the source turn is explicitly terminal.
+    private static func isTerminalTurn(_ status: String) -> Bool {
+        ["completed", "interrupted", "failed"].contains(status)
     }
 
     /// Bounds retained answer identities even when the source question has not loaded yet.

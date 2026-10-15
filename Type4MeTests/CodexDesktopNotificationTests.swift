@@ -6,6 +6,128 @@ final class CodexDesktopNotificationTests: XCTestCase {
     private let sessionID = "11111111-1111-4111-8111-111111111111"
     private let ownerID = "22222222-2222-4222-8222-222222222222"
 
+    /// An old ended prompt must not mask accepted answers and active work in a later turn.
+    @MainActor
+    func testEndedHistoricalPromptDoesNotKeepCurrentConversationWaiting() throws {
+        let inbox = AgentInboxStore()
+        var reducer = CodexInboxStateReducer()
+        let old = turn(id: "old", status: "completed", time: 1, items: [asyncQuestion(id: "old-install")])
+        inbox.apply(try reducer.accept(packet: snapshot(turns: [old]), ownerID: ownerID, session: session()))
+        XCTAssertTrue(inbox.items.first?.needsAttention == true)
+        let current = turn(id: "current", status: "inProgress", time: 2, items: [
+            asyncQuestion(id: "current-question"),
+            ["type": "steeringUserMessage", "id": "reply", "status": "accepted",
+             "input": try questionReply(sourceID: "current-question", indexes: [0])],
+        ])
+        let update = try reducer.accept(packet: snapshot(turns: [old, current], active: true, revision: 2),
+                                        ownerID: ownerID, session: session())
+        inbox.apply(update)
+        XCTAssertEqual(update.pendingRequests, [])
+        XCTAssertEqual(inbox.items.first?.status, .running)
+        XCTAssertFalse(inbox.items.first?.needsAttention ?? true)
+        XCTAssertEqual(AgentInboxCopy.statusLabels(for: try XCTUnwrap(inbox.items.first)), [.running])
+    }
+
+    /// Live and canonical representations both contribute accepted receipts and visible questions.
+    func testCanonicalHistoryDoesNotOverwriteLiveAnswerReceipts() throws {
+        for acceptedInLive in [false, true] {
+            var reducer = CodexInboxStateReducer()
+            let unanswered = turn(status: "inProgress", items: [asyncQuestion()])
+            let answered = turn(status: "inProgress", items: [
+                asyncQuestion(),
+                ["type": "steeringUserMessage", "id": "reply", "status": "accepted",
+                 "input": try questionReply(sourceID: "question-1", indexes: [0])],
+            ])
+            let packet = overlappingSnapshot(live: acceptedInLive ? answered : unanswered,
+                                             canonical: acceptedInLive ? unanswered : answered)
+            let update = try reducer.accept(packet: packet, ownerID: ownerID, session: session())
+            XCTAssertEqual(update.pendingRequests, [])
+            XCTAssertEqual(update.status, .running)
+        }
+    }
+
+    /// A pending copy of the same steering item cannot replace its accepted state.
+    func testAcceptedReplyWinsOverPendingCopyInEitherRepresentation() throws {
+        for acceptedInLive in [false, true] {
+            var reducer = CodexInboxStateReducer()
+            let input = try questionReply(sourceID: "question-1", indexes: [0])
+            let accepted = turn(status: "inProgress", items: [asyncQuestion(),
+                ["type": "steeringUserMessage", "id": "reply", "status": "accepted", "input": input]])
+            let pending = turn(status: "inProgress", items: [asyncQuestion(),
+                ["type": "steeringUserMessage", "id": "reply", "status": "pending", "input": input]])
+            let update = try reducer.accept(packet: overlappingSnapshot(live: acceptedInLive ? accepted : pending,
+                                                                        canonical: acceptedInLive ? pending : accepted),
+                                            ownerID: ownerID, session: session())
+            XCTAssertEqual(update.pendingRequests, [])
+        }
+    }
+
+    /// An unanswered live card remains visible even when canonical history has not received it.
+    func testCanonicalHistoryDoesNotHideLiveQuestion() throws {
+        var reducer = CodexInboxStateReducer()
+        let update = try reducer.accept(packet: overlappingSnapshot(
+            live: turn(status: "inProgress", items: [asyncQuestion()]),
+            canonical: turn(status: "inProgress", items: [["type": "agentMessage", "id": "newer", "text": "Current progress"]])),
+            ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests?.map(\.id), ["async:question-1:0"])
+        XCTAssertEqual(update.preview, "Current progress")
+    }
+
+    /// Retired prompts remain retired across partial snapshots, stale turn states and reconnects.
+    func testSupersededQuestionsDoNotReturnAfterPartialHistoryReplay() throws {
+        for status in ["completed", "failed", "interrupted"] {
+            var reducer = CodexInboxStateReducer()
+            let old = turn(id: "old", status: status, items: [asyncQuestion()])
+            let later = turn(id: "later", status: "inProgress", time: 2)
+            let update = try reducer.accept(packet: snapshot(turns: [old, later]), ownerID: ownerID, session: session())
+            XCTAssertEqual(update.pendingRequests, [])
+            reducer.invalidateRevision()
+            let recovered = try reducer.accept(packet: snapshot(turns: [
+                turn(id: "old", status: "inProgress", items: [asyncQuestion()]),
+            ]), ownerID: ownerID, session: session())
+            XCTAssertEqual(recovered.pendingRequests, [])
+        }
+    }
+
+    /// A terminal status can arrive separately from question items or the following turn.
+    func testTerminalEvidenceSurvivesPartialSnapshots() throws {
+        var reducer = CodexInboxStateReducer()
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress", items: [asyncQuestion()])]),
+                               ownerID: ownerID, session: session())
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "completed")], revision: 2),
+                               ownerID: ownerID, session: session())
+        reducer.invalidateRevision()
+        let update = try reducer.accept(packet: snapshot(turns: [turn(id: "later", status: "inProgress", time: 2)]),
+                                        ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests, [])
+    }
+
+    /// Uncertain chronology and nonterminal questions cannot be dismissed by unrelated later work.
+    func testSupersessionRequiresTerminalStatusAndStrictlyLaterTime() throws {
+        for source in [turn(status: "inProgress", items: [asyncQuestion()]),
+                       turn(status: "unknown", items: [asyncQuestion()]),
+                       turn(status: "completed", time: 0, items: [asyncQuestion()]),
+                       turn(status: "completed", time: 2, items: [asyncQuestion()])] {
+            var reducer = CodexInboxStateReducer()
+            let later = turn(id: "later", status: "inProgress", time: 2,
+                             items: [["type": "userMessage", "id": "ordinary", "content": [["type": "text", "text": "Continue"]]]])
+            let update = try reducer.accept(packet: snapshot(turns: [source, later]), ownerID: ownerID, session: session())
+            XCTAssertEqual(update.pendingRequests?.map(\.id), ["async:question-1:0"])
+        }
+    }
+
+    /// Retiring an obsolete async question cannot remove native blocking approvals or current questions.
+    func testSupersessionPreservesCurrentQuestionsAndApprovals() throws {
+        var reducer = CodexInboxStateReducer()
+        let approval: [String: Any] = ["id": 42, "method": "item/commandExecution/requestApproval",
+                                      "params": ["threadId": sessionID, "reason": "Fixture approval"]]
+        let update = try reducer.accept(packet: snapshot(turns: [
+            turn(status: "completed", items: [asyncQuestion()]),
+            turn(id: "later", status: "inProgress", time: 2, items: [asyncQuestion(id: "current")]),
+        ], requests: [approval]), ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests?.map(\.id), ["request:42", "async:current:0"])
+    }
+
     /// Historical completion and runtime idle must never create new completion alerts.
     func testInitialSnapshotAndIdleAreQuiet() throws {
         var reducer = CodexInboxStateReducer()
@@ -315,8 +437,8 @@ final class CodexDesktopNotificationTests: XCTestCase {
         }
     }
 
-    /// An asynchronous question survives completion and ordinary chat until an explicit answer arrives.
-    func testAsyncQuestionSurvivesCompletionAndOrdinaryChat() throws {
+    /// The latest ended question remains actionable until a subsequent turn supersedes it.
+    func testLatestAsyncQuestionSurvivesCompletionUntilSuperseded() throws {
         var reducer = CodexInboxStateReducer()
         let question: [String: Any] = ["type": "agentMessage", "id": "question-1", "text": "Which language?",
                                        "delivery": "async", "phase": "final_answer",
@@ -332,11 +454,11 @@ final class CodexDesktopNotificationTests: XCTestCase {
         let assistantOnly = try reducer.accept(packet: patches(base: 2, next: 3, values: [
             ["op": "add", "path": ["turns", 1], "value": nextTurn],
         ]), ownerID: ownerID, session: session())
-        XCTAssertEqual(assistantOnly.pendingRequests?.count, 1)
+        XCTAssertEqual(assistantOnly.pendingRequests, [])
         let replied = try reducer.accept(packet: patches(base: 3, next: 4, values: [
             ["op": "add", "path": ["turns", 1, "items", 0], "value": ["type": "userMessage", "id": "reply", "content": []]],
         ]), ownerID: ownerID, session: session())
-        XCTAssertEqual(replied.pendingRequests?.count, 1)
+        XCTAssertEqual(replied.pendingRequests, [])
     }
 
     /// Card submission can update an existing steering item without adding a userMessage.
@@ -677,6 +799,33 @@ final class CodexDesktopNotificationTests: XCTestCase {
         XCTAssertGreaterThan(approvals, 0)
     }
 
+    /// Checks one explicitly selected live conversation through the production observer, without sending input.
+    func testOptInResolvedCurrentDesktopConversation() async throws {
+        guard let id = ProcessInfo.processInfo.environment["MYTYPE_CODEX_EXPECT_NO_PENDING_SESSION_ID"],
+              UUID(uuidString: id) != nil else {
+            throw XCTSkip("Resolved-conversation probe requires an explicit native session ID")
+        }
+        let target = AgentSessionDescriptor(sessionID: id, application: .codex, title: "Explicit passive probe",
+                                            workspacePath: nil, updatedAt: Date().timeIntervalSince1970,
+                                            matchTexts: [], openCapability: .codexDeepLink)
+        let received = expectation(description: "Selected desktop owner emitted a resolved running state")
+        received.assertForOverFulfill = false
+        let source = CodexDesktopNotificationSource(loadSessions: { [target] })
+        let task = Task {
+            await source.run { update in
+                guard update.status != .unknown else { return }
+                XCTAssertEqual(update.session.sessionID, id)
+                XCTAssertEqual(update.pendingRequests?.count, 0)
+                XCTAssertEqual(update.status, .running)
+                print("PASSIVE_CURRENT_SESSION status=\(update.status.rawValue) pending=\(update.pendingRequests?.count ?? -1)")
+                received.fulfill()
+            }
+        }
+        await fulfillment(of: [received], timeout: 15)
+        task.cancel()
+        await task.value
+    }
+
     /// Opt-in smoke probe only subscribes to existing owners; it sends no task, input, or approval.
     func testOptInPassiveDesktopSubscription() async throws {
         guard ProcessInfo.processInfo.environment["MYTYPE_RUN_CODEX_OBSERVER_LIVE"] == "1" else {
@@ -734,6 +883,21 @@ final class CodexDesktopNotificationTests: XCTestCase {
         ]
         if let unread { state["hasUnreadTurn"] = unread }
         return envelope(["type": "snapshot", "revision": revision, "conversationState": state])
+    }
+
+    /// Builds overlapping native representations of one turn for receipt-merge regression coverage.
+    ///
+    /// Args:
+    ///   live: Live turn representation.
+    ///   canonical: Canonical history representation of the same turn.
+    /// Returns:
+    ///   An active conversation snapshot containing both representations.
+    private func overlappingSnapshot(live: [String: Any], canonical: [String: Any]) -> [String: Any] {
+        var change = (snapshot(turns: [live], active: true)["params"] as! [String: Any])["change"] as! [String: Any]
+        var conversation = change["conversationState"] as! [String: Any]
+        conversation["turnHistory"] = ["history": ["entitiesByKey": ["turn-1": canonical]]]
+        change["conversationState"] = conversation
+        return envelope(change)
     }
 
     /// Builds one atomic native patch batch for exact revision-boundary tests.
