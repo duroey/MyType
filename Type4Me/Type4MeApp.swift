@@ -15,13 +15,7 @@ struct Type4MeApp: App {
                 .environment(appDelegate.menuBarControlCenterModel)
                 .environment(appDelegate.menuBarActionCoordinator)
         } label: {
-            if appDelegate.appState.quietCalibrationSecondsRemaining > 0 {
-                Text(L("安静 \(appDelegate.appState.quietCalibrationSecondsRemaining)秒",
-                       "Quiet \(appDelegate.appState.quietCalibrationSecondsRemaining)s"))
-            } else {
-                Image(systemName: appDelegate.appState.barPhase == .hidden ? "mic" : "mic.fill")
-                    .accessibilityLabel("MyType")
-            }
+            MenuBarStatusLabel(appState: appDelegate.appState, inbox: .shared)
         }
 
         Window(L("MyType 设置", "MyType Settings"), id: "settings") {
