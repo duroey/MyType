@@ -39,6 +39,8 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         var finalText = ""
         var questionID: String?
         var questionText = ""
+        /// True only after a correlated successful desktop wrap-up result ends the turn.
+        var nativeTurnEnd = false
     }
 
     struct IdleNotice: Decodable, Sendable {
@@ -59,12 +61,16 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         var notice: IdleNotice?
         var completedID: String?
         var previousStatus: String?
+        var idleAt: Date?
 
         /// Starts a cycle only after observing an actual busy registration.
         ///
         /// Args:
         ///   registration: Current validated native state.
         mutating func observe(_ registration: Registration) {
+            idleAt = registration.status == "idle"
+                ? registration.statusUpdatedAt.flatMap { $0.isFinite && $0 > 0 ? Date(timeIntervalSince1970: $0 / 1_000) : nil }
+                : nil
             let finishedBeforeCurrentBusy = notice?.state == "idle"
                 && notice?.finished_at.map { $0 < (registration.statusUpdatedAt ?? 0) } == true
             if registration.status == "busy", busySince == nil || previousStatus == "idle" || finishedBeforeCurrentBusy,
@@ -99,7 +105,7 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
             return true
         }
 
-        /// Requires both a native idle push and a new final visible answer before completing.
+        /// Requires a current visible result and either a native idle push or durable end-turn receipt.
         ///
         /// Args:
         ///   tail: Visible evidence from this exact engine session.
@@ -108,10 +114,13 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         /// Returns:
         ///   A stable completion identifier once, or nil for old, missing or interrupted evidence.
         mutating func completion(tail: VisibleTail, status: String?) -> String? {
-            guard status == "idle", let since = busySince, let notice, notice.state == "idle",
-                  let finished = notice.finished_at, let id = tail.finalID, let date = tail.finalDate,
-                  date >= since, date.timeIntervalSince1970 <= finished / 1_000,
+            guard status == "idle", let since = busySince, let id = tail.finalID, let date = tail.finalDate,
+                  date >= since,
                   !tail.finalText.isEmpty, id != completedID else { return nil }
+            let pushedFinish = notice?.state == "idle" ? notice?.finished_at : nil
+            let hasPush = pushedFinish.map { date.timeIntervalSince1970 <= $0 / 1_000 } == true
+            let hasNativeReceipt = tail.nativeTurnEnd && idleAt.map { date <= $0 } == true
+            guard hasPush || hasNativeReceipt else { return nil }
             completedID = id
             busySince = nil
             subscriptionID = nil
@@ -229,26 +238,45 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                         }
                     }
                 }
-                if registry.status == "waiting" || item.cycle.busySince != nil {
+                if ["waiting", "idle"].contains(registry.status ?? "") || item.cycle.busySince != nil {
                     refreshTail(&item)
                 }
-                let update: AgentInboxUpdate
-                if let completion = item.cycle.completion(tail: item.tail, status: registry.status) {
-                    update = AgentInboxUpdate(session: item.session, status: .completed, pendingRequests: [],
-                                              preview: item.tail.finalText, completionID: completion)
-                } else if registry.status == "idle", item.cycle.busySince != nil {
-                    // The runtime stopped working, but the completion channel or visible result is not yet verified.
-                    update = AgentInboxUpdate(session: item.session, status: .unknown, pendingRequests: [])
-                } else {
-                    update = Self.stateUpdate(registry: registry, session: item.session, tail: item.tail,
-                                              completionID: item.cycle.completedID)
-                }
+                let update = Self.reconciledUpdate(registry: registry, session: item.session, tail: item.tail, cycle: &item.cycle)
                 tracked[key] = item
                 await emit(update)
             }
             do { try await Task.sleep(for: .seconds(configuration.socketPollSeconds)) }
             catch { break }
         }
+    }
+
+    /// Combines current runtime state with same-turn visible completion or input evidence.
+    ///
+    /// Args:
+    ///   registry: Identity-checked native state.
+    ///   session: Exact desktop conversation.
+    ///   tail: Latest bounded visible transcript projection.
+    ///   cycle: Observed turn lifecycle, updated when completion is proven.
+    ///
+    /// Returns:
+    ///   A pending native card, a newly completed turn, or the current runtime state.
+    static func reconciledUpdate(registry: Registration, session: AgentSessionDescriptor,
+                                 tail: VisibleTail, cycle: inout Cycle) -> AgentInboxUpdate {
+        var currentTail = tail
+        if tail.nativeTurnEnd, let since = cycle.busySince,
+           tail.finalDate.map({ $0 < since }) != false { currentTail = VisibleTail() }
+        let completion = cycle.completion(tail: currentTail, status: registry.status)
+        let state = stateUpdate(registry: registry, session: session, tail: currentTail, completionID: cycle.completedID)
+        // A finished model turn can leave a real next-step question in the desktop card.
+        if state.status == .waiting { return state }
+        if let completion {
+            return AgentInboxUpdate(session: session, status: .completed, pendingRequests: [],
+                                    preview: currentTail.finalText, completionID: completion)
+        }
+        if registry.status == "idle", cycle.busySince != nil {
+            return AgentInboxUpdate(session: session, status: .unknown, pendingRequests: [])
+        }
+        return state
     }
 
     /// Maps validated native state while keeping approval instructions inside the original app.
@@ -276,7 +304,17 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                                         pendingRequests: [AgentInboxRequest(id: id, kind: .approval, text: "")])
             }
             return AgentInboxUpdate(session: session, status: .waiting)
-        case "idle": return AgentInboxUpdate(session: session, status: completionID == nil ? .idle : .completed, pendingRequests: [])
+        case "idle":
+            if tail.nativeTurnEnd, let id = tail.questionID, let date = tail.finalDate,
+               let updatedAt = registry.statusUpdatedAt, updatedAt.isFinite,
+               date.timeIntervalSince1970 <= updatedAt / 1_000 {
+                return AgentInboxUpdate(session: session, status: .waiting,
+                                        pendingRequests: [AgentInboxRequest(id: id, kind: .input, text: tail.questionText)],
+                                        preview: tail.finalText)
+            }
+            return AgentInboxUpdate(session: session,
+                                    status: completionID != nil && completionID == tail.finalID ? .completed : .idle,
+                                    pendingRequests: [])
         default: return AgentInboxUpdate(session: session, status: .unknown)
         }
     }
@@ -390,7 +428,7 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         return candidate
     }
 
-    /// Refreshes a changed transcript tail only while active evidence is needed.
+    /// Refreshes a changed tail, including idle runtimes whose native card may need a reply.
     ///
     /// Args:
     ///   item: Verified session binding and cached visible evidence.
@@ -415,7 +453,7 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         item.tailRevision = revision
     }
 
-    /// Projects final assistant text and visible questions, excluding tools, results and thinking.
+    /// Projects final text, questions and acknowledged native cards without exposing tool payloads.
     ///
     /// Args:
     ///   data: Bounded complete JSONL records from one native transcript tail.
@@ -426,6 +464,7 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
     ///   Latest visible evidence; malformed or foreign rows cannot produce completion.
     static func visibleTail(data: Data, engineID: String, maximumCharacters: Int) -> VisibleTail {
         var result = VisibleTail()
+        var pendingWrapUp: (assistantID: String, toolID: String, date: Date, recap: String, question: String?)?
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         for line in data.split(separator: 10) {
@@ -435,7 +474,33 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                   let type = row["type"] as? String, ["assistant", "user"].contains(type),
                   let timestamp = row["timestamp"] as? String,
                   let date = formatter.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) else { continue }
-            if type == "user" { result = VisibleTail(); continue }
+            if type == "user" {
+                let candidate = pendingWrapUp
+                pendingWrapUp = nil
+                result = VisibleTail()
+                // This is a displayed desktop card, not an arbitrary tool's reported success.
+                guard let candidate, date >= candidate.date,
+                      row["entrypoint"] as? String == "claude-desktop",
+                      row["sourceToolAssistantUUID"] as? String == candidate.assistantID,
+                      row["parentUuid"] as? String == candidate.assistantID,
+                      let meta = row["mcpMeta"] as? [String: Any],
+                      let native = meta["_meta"] as? [String: Any], native["claude/endTurn"] as? Bool == true,
+                      let message = row["message"] as? [String: Any], message["role"] as? String == "user",
+                      let blocks = message["content"] as? [[String: Any]], blocks.count == 1,
+                      let receipt = blocks.first, receipt["type"] as? String == "tool_result",
+                      receipt["tool_use_id"] as? String == candidate.toolID,
+                      receipt["is_error"] as? Bool != true else { continue }
+                result.finalID = candidate.assistantID
+                result.finalDate = date
+                result.finalText = candidate.recap
+                result.nativeTurnEnd = true
+                if let question = candidate.question {
+                    result.questionID = candidate.toolID
+                    result.questionText = question
+                }
+                continue
+            }
+            pendingWrapUp = nil
             guard row["entrypoint"] as? String == "claude-desktop",
                   let message = row["message"] as? [String: Any], message["role"] as? String == "assistant",
                   let blocks = message["content"] as? [[String: Any]], let id = row["uuid"] as? String else { continue }
@@ -450,6 +515,21 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                 guard let input = block["input"] as? [String: Any], let questions = input["questions"] as? [[String: Any]] else { continue }
                 result.questionID = block["id"] as? String
                 result.questionText = String(questions.compactMap { $0["question"] as? String }.joined(separator: "\n").prefix(maximumCharacters))
+            }
+            let tools = blocks.filter { $0["type"] as? String == "tool_use" }
+            if message["stop_reason"] as? String == "tool_use", tools.count == 1,
+               let tool = tools.first, tool["name"] as? String == "mcp__ccd_turn__wrap_up",
+               let toolID = tool["id"] as? String, !toolID.isEmpty,
+               let input = tool["input"] as? [String: Any] {
+                let recap = (input["recap"] as? String ?? input["outcome"] as? String ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !recap.isEmpty else { continue }
+                let legacyQuestion = (input["needs_user"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let needsUser = input["blocked"] as? Bool == true || input["blocked"] as? String == "true" || !legacyQuestion.isEmpty
+                let ask = (input["ask"] as? String ?? input["next_ask"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let question = ask.isEmpty ? (legacyQuestion.isEmpty ? recap : legacyQuestion) : ask
+                pendingWrapUp = (id, toolID, date, String(recap.prefix(maximumCharacters)),
+                                 needsUser ? String(question.prefix(maximumCharacters)) : nil)
             }
         }
         return result

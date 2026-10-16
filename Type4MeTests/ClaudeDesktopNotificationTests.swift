@@ -149,6 +149,227 @@ final class ClaudeDesktopNotificationTests: XCTestCase {
         XCTAssertNil(ClaudeDesktopNotificationSource.visibleTail(data: data, engineID: engineID, maximumCharacters: 1_000).finalID)
     }
 
+    /// Reproduces a desktop wrap-up card that asks the user to choose the next step.
+    func testAcknowledgedBlockedWrapUpIsWaitingEvenWhenRegistryIsIdle() throws {
+        let tail = try wrapUpTail(blocked: true)
+        let update = ClaudeDesktopNotificationSource.stateUpdate(
+            registry: try registry(status: "idle", timestamp: 103_000),
+            session: session, tail: tail, completionID: nil
+        )
+        XCTAssertEqual(update.status, .waiting)
+        XCTAssertEqual(update.pendingRequests?.first?.kind, .input)
+        XCTAssertEqual(update.pendingRequests?.first?.text, "继续下一步吗？")
+        XCTAssertNil(update.completionID)
+    }
+
+    /// Accepts the native end-turn receipt even if the one-shot idle push was missed.
+    func testAcknowledgedWrapUpCompletesObservedTurnWithoutIdlePush() throws {
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        cycle.observe(try registry(status: "busy"))
+        cycle.observe(try registry(status: "idle", timestamp: 103_000))
+        let tail = try wrapUpTail(blocked: false)
+        XCTAssertEqual(tail.finalText, "已完成本轮核对。")
+        XCTAssertEqual(cycle.completion(tail: tail, status: "idle"), "answer")
+        XCTAssertNil(cycle.completion(tail: tail, status: "idle"))
+    }
+
+    /// Rejects an old, future or still-running wrap-up as a new completed turn.
+    func testWrapUpReceiptMustBelongToObservedIdleTurn() throws {
+        let tail = try wrapUpTail(blocked: false)
+        for (busy, idle, status): (Double?, Double, String) in [
+            (nil, 103_000, "idle"), (104_000, 105_000, "idle"),
+            (100_000, 101_000, "idle"), (100_000, 103_000, "busy"),
+        ] {
+            var cycle = ClaudeDesktopNotificationSource.Cycle()
+            if let busy { cycle.observe(try registry(status: "busy", timestamp: busy)) }
+            cycle.observe(try registry(status: status, timestamp: idle))
+            XCTAssertNil(cycle.completion(tail: tail, status: status))
+        }
+    }
+
+    /// Rejects tool failures and uncorrelated or non-terminal tool results.
+    func testWrapUpNeedsSuccessfulExactNativeReceipt() throws {
+        for (resultID, sourceID, terminal, failed): (String, String, Bool, Bool) in [
+            ("other-tool", "answer", true, false), ("wrap-up", "other-answer", true, false),
+            ("wrap-up", "answer", false, false), ("wrap-up", "answer", true, true),
+        ] {
+            let tail = try wrapUpTail(blocked: true, resultID: resultID, sourceID: sourceID,
+                                      terminal: terminal, failed: failed)
+            XCTAssertNil(tail.finalID)
+            XCTAssertNil(tail.questionID)
+        }
+    }
+
+    /// Keeps ordinary progress tools and unacknowledged wrap-up calls out of the inbox.
+    func testUnacknowledgedOrUnrelatedToolCannotFinishTurn() throws {
+        for tool in ["mcp__ccd_turn__wrap_up", "mcp__other__wrap_up", "Bash"] {
+            let data = try transcriptRow(blocks: [["type": "tool_use", "id": "wrap-up", "name": tool,
+                                                  "input": ["recap": "未确认的内容", "blocked": true, "ask": "继续？"]]],
+                                         stop: "tool_use")
+            let tail = ClaudeDesktopNotificationSource.visibleTail(data: data, engineID: engineID, maximumCharacters: 1_000)
+            XCTAssertNil(tail.finalID)
+            XCTAssertNil(tail.questionID)
+        }
+    }
+
+    /// Clears the old card when the person replies and preserves only the current turn.
+    func testUserReplyClearsAcknowledgedWrapUp() throws {
+        let user: [String: Any] = ["type": "user", "sessionId": engineID, "timestamp": "1970-01-01T00:01:44.000Z",
+                                   "message": ["role": "user", "content": "继续"]]
+        let data = try wrapUpTranscript(blocked: true) + JSONSerialization.data(withJSONObject: user) + Data([10])
+        let tail = ClaudeDesktopNotificationSource.visibleTail(data: data, engineID: engineID, maximumCharacters: 1_000)
+        XCTAssertNil(tail.finalID)
+        XCTAssertNil(tail.questionID)
+    }
+
+    /// Exercises the actual inbox merge: one question alert, then a clear when work resumes.
+    @MainActor
+    func testBlockedCardAlertsOnceAndDoesNotReturnAfterReply() throws {
+        var configuration = AgentNotificationConfiguration()
+        configuration.completionAlertDelaySeconds = 0
+        let store = AgentInboxStore(configuration: configuration)
+        var requests = 0
+        var completions = 0
+        store.onRequest = { _ in requests += 1 }
+        store.onCompletion = { _ in completions += 1 }
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        let busy = try registry(status: "busy")
+        cycle.observe(busy)
+        store.apply(ClaudeDesktopNotificationSource.reconciledUpdate(registry: busy, session: session,
+                                                                    tail: .init(), cycle: &cycle))
+        let idle = try registry(status: "idle", timestamp: 103_000)
+        let tail = try wrapUpTail(blocked: true)
+        for _ in 0..<2 {
+            cycle.observe(idle)
+            store.apply(ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: session,
+                                                                        tail: tail, cycle: &cycle))
+        }
+        XCTAssertEqual(store.items.first?.status, .waiting)
+        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(completions, 0)
+        let resumed = try registry(status: "busy", timestamp: 104_000)
+        cycle.observe(resumed)
+        store.apply(ClaudeDesktopNotificationSource.reconciledUpdate(registry: resumed, session: session,
+                                                                    tail: tail, cycle: &cycle))
+        XCTAssertEqual(store.items.first?.status, .running)
+        XCTAssertEqual(store.items.first?.pendingRequests.count, 0)
+        let laterIdle = try registry(status: "idle", timestamp: 105_000)
+        cycle.observe(laterIdle)
+        store.apply(ClaudeDesktopNotificationSource.reconciledUpdate(registry: laterIdle, session: session,
+                                                                    tail: tail, cycle: &cycle))
+        XCTAssertEqual(store.items.first?.pendingRequests.count, 0, "A previous turn's card must not reopen.")
+        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(completions, 0)
+    }
+
+    /// Restores pending native cards at startup without replaying historical completions.
+    @MainActor
+    func testStartupShowsBlockedCardButNotOldCompletedWrapUp() throws {
+        for blocked in [false, true] {
+            let store = AgentInboxStore()
+            var cycle = ClaudeDesktopNotificationSource.Cycle()
+            let idle = try registry(status: "idle", timestamp: 103_000)
+            cycle.observe(idle)
+            let update = ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: session,
+                                                                          tail: try wrapUpTail(blocked: blocked), cycle: &cycle)
+            store.apply(update)
+            XCTAssertEqual(store.items.count, blocked ? 1 : 0)
+            XCTAssertNil(update.completionID)
+        }
+    }
+
+    /// Checks an explicitly selected native pending card without writing to or opening its app.
+    @MainActor
+    func testOptInReadOnlyNativeWrapUpProjection() async throws {
+        guard let path = ProcessInfo.processInfo.environment["MYTYPE_CLAUDE_WRAPUP_REGISTRY"] else {
+            throw XCTSkip("Set MYTYPE_CLAUDE_WRAPUP_REGISTRY to an existing pending-card fixture.")
+        }
+        let configuration = AgentNotificationConfiguration()
+        let registration = try XCTUnwrap(ClaudeDesktopNotificationSource.readRegistration(
+            URL(fileURLWithPath: path), maximumBytes: configuration.maximumRegistryFileBytes
+        ))
+        let hostID = try XCTUnwrap(registration.hostSessionId)
+        let target = AgentSessionDescriptor(sessionID: hostID, application: .claudeCode, title: "",
+                                            workspacePath: registration.cwd, updatedAt: 0, matchTexts: [],
+                                            openCapability: .claudeNativeDeepLink, engineSessionID: registration.sessionId)
+        let app = try XCTUnwrap(AgentDesktopLauncherService.shared.detectInstallation(for: .claudeCode).applicationURL)
+        let verified = try await AgentHandoffDeliveryService.findClaudeInbox(target: target, applicationURL: app,
+                                                                            configuration: .init())
+        XCTAssertTrue(registration.matches(session: target, inbox: verified))
+        let directory = try XCTUnwrap(registration.cwd).replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
+        let transcript = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+            .appendingPathComponent(directory).appendingPathComponent(registration.sessionId + ".jsonl")
+        let handle = try FileHandle(forReadingFrom: transcript)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let offset = size > configuration.maximumTranscriptTailBytes ? size - UInt64(configuration.maximumTranscriptTailBytes) : 0
+        try handle.seek(toOffset: offset)
+        var data = try XCTUnwrap(handle.read(upToCount: configuration.maximumTranscriptTailBytes))
+        if offset > 0, let newline = data.firstIndex(of: 10) { data = Data(data.suffix(from: data.index(after: newline))) }
+        let tail = ClaudeDesktopNotificationSource.visibleTail(data: data, engineID: registration.sessionId,
+                                                               maximumCharacters: configuration.maximumPreviewCharacters)
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        cycle.observe(registration)
+        let update = ClaudeDesktopNotificationSource.reconciledUpdate(registry: registration, session: target,
+                                                                      tail: tail, cycle: &cycle)
+        let store = AgentInboxStore()
+        store.apply(update)
+        XCTAssertTrue(tail.nativeTurnEnd)
+        XCTAssertEqual(update.status, .waiting)
+        XCTAssertEqual(store.items.first?.pendingRequests.first?.kind, .input)
+        XCTAssertFalse(store.items.first?.pendingRequests.first?.text.isEmpty ?? true)
+        XCTAssertNil(update.completionID)
+    }
+
+    /// Builds the same tool-call/receipt structure as the native desktop next-step card.
+    ///
+    /// Args:
+    ///   blocked: Whether the native card requires a user decision.
+    ///   resultID: Tool identity echoed by the result.
+    ///   sourceID: Assistant UUID echoed by the result.
+    ///   terminal: Whether the native host acknowledged the end of this turn.
+    ///   failed: Whether execution of the card failed.
+    ///
+    /// Returns:
+    ///   Sanitized JSONL fixtures containing no actual conversation content.
+    private func wrapUpTranscript(blocked: Bool, resultID: String = "wrap-up", sourceID: String = "answer",
+                                  terminal: Bool = true, failed: Bool = false) throws -> Data {
+        let call = try transcriptRow(blocks: [[
+            "type": "tool_use", "id": "wrap-up", "name": "mcp__ccd_turn__wrap_up",
+            "input": ["recap": "已完成本轮核对。", "blocked": blocked, "ask": "继续下一步吗？",
+                      "actions": [["label": "继续", "message": "继续下一步"]]],
+        ]], stop: "tool_use")
+        let receipt: [String: Any] = [
+            "type": "user", "sessionId": engineID, "entrypoint": "claude-desktop", "uuid": "receipt",
+            "parentUuid": sourceID, "sourceToolAssistantUUID": sourceID,
+            "timestamp": "1970-01-01T00:01:42.100Z", "isSidechain": false,
+            "mcpMeta": ["_meta": ["claude/endTurn": terminal]],
+            "message": ["role": "user", "content": [["type": "tool_result", "tool_use_id": resultID,
+                                                        "is_error": failed, "content": "Wrap-up shown."]]],
+        ]
+        return try call + JSONSerialization.data(withJSONObject: receipt) + Data([10])
+    }
+
+    /// Parses a native card fixture through the production visible-tail projection.
+    ///
+    /// Args:
+    ///   blocked: Whether user input is required.
+    ///   resultID: Result correlation override.
+    ///   sourceID: Assistant correlation override.
+    ///   terminal: Native end-turn marker override.
+    ///   failed: Tool execution error override.
+    ///
+    /// Returns:
+    ///   The production projection used by the notification state machine.
+    private func wrapUpTail(blocked: Bool, resultID: String = "wrap-up", sourceID: String = "answer",
+                            terminal: Bool = true, failed: Bool = false) throws -> ClaudeDesktopNotificationSource.VisibleTail {
+        ClaudeDesktopNotificationSource.visibleTail(
+            data: try wrapUpTranscript(blocked: blocked, resultID: resultID, sourceID: sourceID,
+                                        terminal: terminal, failed: failed),
+            engineID: engineID, maximumCharacters: 1_000
+        )
+    }
+
     /// Verifies an incomplete registry write is unknown rather than idle.
     func testPartialRegistryReadFailsClosed() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
