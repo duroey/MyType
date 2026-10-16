@@ -154,6 +154,7 @@ cp "$PROJECT_DIR/Type4Me/Resources/AgentsViewSearchConfig.json" "$APP_PATH/Conte
 cp "$PROJECT_DIR/Type4Me/Resources/AgentHandoffConfig.json" "$APP_PATH/Contents/Resources/AgentHandoffConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentHandoffSuggestionConfig.json" "$APP_PATH/Contents/Resources/AgentHandoffSuggestionConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentIntentConfig.json" "$APP_PATH/Contents/Resources/AgentIntentConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentNewTaskConfig.json" "$APP_PATH/Contents/Resources/AgentNewTaskConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentIndexConfig.json" "$APP_PATH/Contents/Resources/AgentIndexConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentNotificationConfig.json" "$APP_PATH/Contents/Resources/AgentNotificationConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentEmbeddingConfig.json" "$APP_PATH/Contents/Resources/AgentEmbeddingConfig.json"

@@ -38,7 +38,7 @@ final class AgentRoutingFeedbackTests: XCTestCase {
     /// Returns:
     ///   Nothing. Asserts preview and choice states are unsure and failures stay failures.
     func testRoutingStatusesMapToExistingActionFeedback() {
-        for outcome in [AgentRouterResult.Outcome.matchedPreview, .selectionRequired, .cancelled, .historyIndexUpdating] {
+        for outcome in [AgentRouterResult.Outcome.matchedPreview, .selectionRequired, .cancelled, .historyIndexUpdating, .newTaskPrepared] {
             XCTAssertEqual(AppState.agentRoutingFeedbackStatus(for: AgentRouterResult(outcome: outcome)), .unsure)
         }
         for outcome in [AgentRouterResult.Outcome.requestedOpen, .openedWithoutContinuation] {

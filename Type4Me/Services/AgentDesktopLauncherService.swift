@@ -46,6 +46,8 @@ enum AgentDesktopLauncherError: LocalizedError, Equatable {
     case invalidSessionIdentifier
     case unsupportedSession(AgentDesktopApplication)
     case invalidDestination
+    case invalidPrompt
+    case promptTooLong
     case launchFailed(AgentDesktopApplication)
     case launchTimedOut(AgentDesktopApplication)
 
@@ -81,6 +83,10 @@ enum AgentDesktopLauncherError: LocalizedError, Equatable {
                 : "Opening a specific \(application.displayName) chat is not supported yet."
         case .invalidDestination:
             return isChinese ? "无法创建桌面应用打开链接。" : "Could not create the desktop app link."
+        case .invalidPrompt:
+            return isChinese ? "请说出要交给新 Agent 的任务。" : "Describe the task for the new agent."
+        case .promptTooLong:
+            return isChinese ? "任务描述太长，请缩短后再打开。" : "The task is too long. Shorten it before opening the app."
         case .launchFailed(let application):
             return isChinese
                 ? "无法打开 \(application.displayName)，请检查应用后重试。"
@@ -104,6 +110,10 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
         var minimumClaudeDesktopVersion = "2.1.285"
         // Lowest app version verified locally for Claude's native continue route.
         var minimumClaudeNativeDesktopVersion = "2.26454.2"
+        var maximumNewTaskPromptUTF16Units = 4_000
+        var maximumNewTaskURLBytes = 48_000
+        // Claude's current native deep-link handler truncates after this UTF-16 limit.
+        static let claudeNativePromptUTF16Limit = 14_336
     }
 
     struct CommandResult: Equatable, Sendable {
@@ -311,12 +321,66 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
         try await openApplication(applicationURL, destinationURL: destinationURL, application: application)
     }
 
+    /// Opens a native new-task composer with the exact task and existing workspace.
+    ///
+    /// Args:
+    ///   application: Official desktop app chosen for the new task.
+    ///   projectURL: Existing project or MyType-managed task directory.
+    ///   prompt: Complete task text to prefill; it is never trimmed or submitted.
+    ///
+    /// Returns:
+    ///   Only after macOS accepts the open request. No conversation or send is confirmed.
+    ///
+    /// Raises:
+    ///   AgentDesktopLauncherError: The app, directory, task, or opening is unavailable.
+    func openNewTask(application: AgentDesktopApplication, projectURL: URL, prompt: String) async throws {
+        try Task.checkCancellation()
+        let destinationURL = try Self.destinationURL(
+            for: application, projectURL: projectURL, prompt: prompt, configuration: configuration
+        )
+        try validateProject(projectURL)
+        let installation = detectInstallation(for: application)
+        guard let applicationURL = installation.applicationURL else {
+            throw AgentDesktopLauncherError.applicationNotInstalled(application)
+        }
+        let timeout = configuration.commandLaunchTimeout
+        guard timeout.isFinite, timeout > 0 else { throw AgentDesktopLauncherError.invalidDestination }
+        let completion = AgentDesktopOpenCompletion()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                completion.install(continuation)
+                let opening = Task {
+                    do {
+                        guard !completion.isFinished else { return }
+                        try Task.checkCancellation()
+                        try validateProject(projectURL)
+                        try await openApplication(applicationURL, destinationURL: destinationURL, application: application)
+                        completion.finish(.success(()))
+                    } catch {
+                        completion.finish(.failure(error))
+                    }
+                }
+                let deadline = Task {
+                    do {
+                        try await Task.sleep(for: .seconds(timeout))
+                        completion.finish(.failure(AgentDesktopLauncherError.launchTimedOut(application)))
+                    } catch { /* A completed or cancelled open no longer needs its deadline. */ }
+                }
+                completion.register([opening, deadline])
+            }
+        } onCancel: {
+            completion.finish(.failure(CancellationError()))
+        }
+    }
+
     /// Builds app links while preserving query values as data.
     ///
     /// Args:
     ///   application: App whose registered URL scheme is used.
     ///   projectURL: Optional project directory, already validated by the caller.
     ///   sessionID: Optional Codex chat ID or Claude native local chat ID.
+    ///   prompt: Optional exact new-task text; existing-session links reject this field.
+    ///   configuration: Bounds that prevent silent prompt truncation in desktop handlers.
     ///
     /// Returns:
     ///   A deep link, or nil when Codex only needs app activation.
@@ -326,8 +390,21 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
     static func destinationURL(
         for application: AgentDesktopApplication,
         projectURL: URL? = nil,
-        sessionID: String? = nil
+        sessionID: String? = nil,
+        prompt: String? = nil,
+        configuration: Configuration = Configuration()
     ) throws -> URL? {
+        if let prompt {
+            guard sessionID == nil else { throw AgentDesktopLauncherError.invalidDestination }
+            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !prompt.contains("\0") else { throw AgentDesktopLauncherError.invalidPrompt }
+            guard configuration.maximumNewTaskPromptUTF16Units > 0,
+                  configuration.maximumNewTaskURLBytes > 0 else { throw AgentDesktopLauncherError.invalidDestination }
+            let limit = application == .claudeCode
+                ? min(configuration.maximumNewTaskPromptUTF16Units, Configuration.claudeNativePromptUTF16Limit)
+                : configuration.maximumNewTaskPromptUTF16Units
+            guard prompt.utf16.count <= limit else { throw AgentDesktopLauncherError.promptTooLong }
+        }
         var components = URLComponents()
         switch application {
         case .codex:
@@ -342,9 +419,11 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
                 }
                 components.host = "threads"
                 components.path = "/\(sessionID)"
-            } else if let projectURL {
+            } else if projectURL != nil || prompt != nil {
                 components.host = "new"
-                components.queryItems = [URLQueryItem(name: "path", value: projectURL.standardizedFileURL.path)]
+                if let projectURL {
+                    components.queryItems = [URLQueryItem(name: "path", value: projectURL.standardizedFileURL.path)]
+                }
             } else {
                 return nil
             }
@@ -364,10 +443,18 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
                 }
             }
         }
+        if let prompt {
+            var queryItems = components.queryItems ?? []
+            queryItems.append(URLQueryItem(name: application == .codex ? "prompt" : "q", value: prompt))
+            components.queryItems = queryItems
+        }
         // URLSearchParams treats a raw plus as a space; paths must retain literal plus signs.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let url = components.url else {
             throw AgentDesktopLauncherError.invalidDestination
+        }
+        if prompt != nil, url.absoluteString.utf8.count > configuration.maximumNewTaskURLBytes {
+            throw AgentDesktopLauncherError.promptTooLong
         }
         return url
     }
@@ -756,6 +843,61 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
         outputPipe.fileHandleForReading.readabilityHandler = nil
         output.readAvailable(from: descriptor)
         return CommandResult(status: process.terminationStatus, output: output.text, timedOut: false)
+    }
+}
+
+/// Resolves a native open request exactly once, even if its callback arrives after a timeout.
+private final class AgentDesktopOpenCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var result: Result<Void, Error>?
+    private var tasks: [Task<Void, Never>] = []
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return result != nil
+    }
+
+    /// Attaches the caller, preserving cancellation that arrived before registration.
+    ///
+    /// Args:
+    ///   continuation: Caller waiting for open acceptance, timeout, or cancellation.
+    func install(_ continuation: CheckedContinuation<Void, Error>) {
+        lock.lock()
+        let completed = result
+        if completed == nil { self.continuation = continuation }
+        lock.unlock()
+        if let completed { continuation.resume(with: completed) }
+    }
+
+    /// Registers work for cancellation without extending a completed request's lifetime.
+    ///
+    /// Args:
+    ///   tasks: Native-open waiter and deadline task; neither owns an agent process.
+    func register(_ tasks: [Task<Void, Never>]) {
+        lock.lock()
+        let completed = result != nil
+        if !completed { self.tasks = tasks }
+        lock.unlock()
+        if completed { tasks.forEach { $0.cancel() } }
+    }
+
+    /// Delivers the first result and cancels remaining waiters without blocking on callbacks.
+    ///
+    /// Args:
+    ///   result: First accepted opening result, timeout, or cancellation.
+    func finish(_ result: Result<Void, Error>) {
+        lock.lock()
+        guard self.result == nil else { lock.unlock(); return }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        let tasks = self.tasks
+        self.tasks = []
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(with: result)
     }
 }
 

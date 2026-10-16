@@ -30,13 +30,13 @@ final class AgentIntentClassifierTests: XCTestCase {
     private func response(answerChanges: [String: Any] = [:], model: String = "jev-1.13.0") throws -> Data {
         var answer: [String: Any] = [
             "type": "choice", "choice": "wake", "confidence": 0.85,
-            "probabilities": ["wake": 0.9, "handoff": 0.05, "uncertain": 0.05],
+            "probabilities": ["wake": 0.9, "handoff": 0.04, "create": 0.01, "uncertain": 0.05],
         ]
         answer.merge(answerChanges) { _, replacement in replacement }
         return try JSONSerialization.data(withJSONObject: ["model": model, "answers": ["route": answer]])
     }
 
-    /// Verifies the API receives explicit shortcut context and exactly three supported choices.
+    /// Verifies the API receives explicit shortcut context and all supported choices.
     ///
     /// Raises:
     ///   Error: Request construction or JSON decoding fails.
@@ -57,7 +57,7 @@ final class AgentIntentClassifierTests: XCTestCase {
         XCTAssertEqual(state["entrypoint"] as? String, "agent_hotkey")
         XCTAssertEqual(state["utterance"] as? String, "之前的研究")
         XCTAssertEqual(Set(state.keys), ["entrypoint", "user_explicitly_pressed_agent_hotkey", "utterance"])
-        XCTAssertEqual(Set(criteria.keys), ["wake", "handoff", "uncertain"])
+        XCTAssertEqual(Set(criteria.keys), ["wake", "handoff", "create", "uncertain"])
     }
 
     /// Verifies credentials cannot be sent to changed hosts, paths or insecure transports.
@@ -118,9 +118,20 @@ final class AgentIntentClassifierTests: XCTestCase {
     func testResponsePreservesChoiceAndDistribution() throws {
         let decision = try AgentIntentClassifier.decodeResponse(response(), configuration: configuration())
         XCTAssertEqual(decision.intent, .wake)
-        XCTAssertEqual(decision.probabilities, ["wake": 0.9, "handoff": 0.05, "uncertain": 0.05])
+        XCTAssertEqual(decision.probabilities, ["wake": 0.9, "handoff": 0.04, "create": 0.01, "uncertain": 0.05])
         XCTAssertEqual(decision.model, "jev-1.13.0")
         XCTAssertEqual(decision.confidence, 0.85)
+    }
+
+    /// Checks a validated new-task choice remains distinct from wake and handoff.
+    ///
+    /// Raises:
+    ///   Error: The finite-choice fixture cannot be decoded.
+    func testCreateIsASeparateValidatedRoute() throws {
+        let decision = try AgentIntentClassifier.decodeResponse(response(answerChanges: [
+            "choice": "create", "probabilities": ["wake": 0.02, "handoff": 0.02, "create": 0.95, "uncertain": 0.01],
+        ]), configuration: configuration())
+        XCTAssertEqual(decision.intent, .create)
     }
 
     /// Verifies every malformed label, distribution and answer type fails closed.

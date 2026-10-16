@@ -264,6 +264,206 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
         }
     }
 
+    /// Verifies a new task preserves the complete prompt as query data in each app.
+    ///
+    /// Raises:
+    ///   Error: A correctly encoded draft link could not be built.
+    func testNewTaskDeepLinksPreserveUnicodeReservedCharactersAndNewlines() throws {
+        let projectURL = URL(fileURLWithPath: "/Users/example/中文 + A&B #50%", isDirectory: true)
+        let prompt = "  检查 A+B & C，保留 #1、50% 和 ?\n再看第二行 😀  "
+        for application in AgentDesktopApplication.allCases {
+            let url = try XCTUnwrap(AgentDesktopLauncherService.destinationURL(
+                for: application, projectURL: projectURL, prompt: prompt
+            ))
+            let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+            let pathKey = application == .codex ? "path" : "folder"
+            let promptKey = application == .codex ? "prompt" : "q"
+            XCTAssertEqual(components.queryItems, [
+                URLQueryItem(name: pathKey, value: projectURL.path),
+                URLQueryItem(name: promptKey, value: prompt),
+            ])
+            XCTAssertNil(components.fragment)
+            XCTAssertTrue(url.absoluteString.contains("%2B"))
+            XCTAssertTrue(url.absoluteString.contains("%26"))
+            XCTAssertTrue(url.absoluteString.contains("%0A"))
+        }
+    }
+
+    /// Verifies adding draft text cannot accidentally modify an existing conversation link.
+    func testExistingSessionRejectsPromptForBothApplications() {
+        for application in AgentDesktopApplication.allCases {
+            let sessionID = application == .codex ? "thread-abc" : "local_existing"
+            XCTAssertThrowsError(try AgentDesktopLauncherService.destinationURL(
+                for: application, sessionID: sessionID, prompt: "new work"
+            )) { error in
+                XCTAssertEqual(error as? AgentDesktopLauncherError, .invalidDestination)
+            }
+        }
+    }
+
+    /// Verifies empty and null-containing prompts never produce a new task request.
+    func testNewTaskRejectsInvalidPromptWithoutTrimmingContent() {
+        for application in AgentDesktopApplication.allCases {
+            for prompt in ["", " \n\t ", "first\0second"] {
+                XCTAssertThrowsError(try AgentDesktopLauncherService.destinationURL(
+                    for: application, prompt: prompt
+                )) { error in
+                    XCTAssertEqual(error as? AgentDesktopLauncherError, .invalidPrompt)
+                }
+            }
+        }
+    }
+
+    /// Verifies bounds use UTF-16 units and reject rather than truncate the task.
+    ///
+    /// Raises:
+    ///   Error: The exact-boundary prompt could not be encoded.
+    func testNewTaskPromptAndEncodedURLBoundsFailWithoutTruncating() throws {
+        var configuration = AgentDesktopLauncherService.Configuration()
+        configuration.maximumNewTaskPromptUTF16Units = 4
+        for application in AgentDesktopApplication.allCases {
+            let url = try XCTUnwrap(AgentDesktopLauncherService.destinationURL(
+                for: application, prompt: "😀😀", configuration: configuration
+            ))
+            XCTAssertEqual(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.last?.value, "😀😀")
+            XCTAssertThrowsError(try AgentDesktopLauncherService.destinationURL(
+                for: application, prompt: "😀😀a", configuration: configuration
+            )) { error in
+                XCTAssertEqual(error as? AgentDesktopLauncherError, .promptTooLong)
+            }
+            configuration.maximumNewTaskURLBytes = 20
+            XCTAssertThrowsError(try AgentDesktopLauncherService.destinationURL(
+                for: application, prompt: "😀😀", configuration: configuration
+            )) { error in
+                XCTAssertEqual(error as? AgentDesktopLauncherError, .promptTooLong)
+            }
+            configuration.maximumNewTaskURLBytes = 48_000
+        }
+        configuration.maximumNewTaskPromptUTF16Units = 20_000
+        configuration.maximumNewTaskURLBytes = 100_000
+        XCTAssertThrowsError(try AgentDesktopLauncherService.destinationURL(
+            for: .claudeCode, prompt: String(repeating: "a", count: 14_337), configuration: configuration
+        )) { error in
+            XCTAssertEqual(error as? AgentDesktopLauncherError, .promptTooLong)
+        }
+    }
+
+    /// Verifies a new task opens the native composer directly without a CLI probe or send.
+    ///
+    /// Raises:
+    ///   Error: The isolated application, directory, or draft opening failed.
+    func testOpenNewTaskDirectlyTargetsAppAndSkipsAvailableClaudeCLI() async throws {
+        let projectURL = try makeProject()
+        let recorder = Recorder()
+        let service = makeService(recorder: recorder, executableValidator: { _ in true })
+        for application in AgentDesktopApplication.allCases {
+            let appURL = try makeApplication(
+                named: application == .codex ? "ChatGPT.app" : "Claude.app", application: application
+            )
+            try await service.openNewTask(application: application, projectURL: projectURL, prompt: "检查录音\nA+B")
+            XCTAssertEqual(recorder.opens.last?.0, appURL)
+            let url = try XCTUnwrap(recorder.opens.last?.1)
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+            XCTAssertEqual(query?.last?.value, "检查录音\nA+B")
+            XCTAssertTrue(recorder.commands.isEmpty)
+        }
+        XCTAssertEqual(recorder.opens.count, 2)
+    }
+
+    /// Verifies invalid directories and text fail before dispatching a draft to the app.
+    ///
+    /// Raises:
+    ///   Error: The isolated application fixture could not be created.
+    func testOpenNewTaskValidationHasNoOpeningSideEffects() async throws {
+        _ = try makeApplication(named: "ChatGPT.app", application: .codex)
+        let recorder = Recorder()
+        let service = makeService(recorder: recorder)
+        let missing = rootURL.appendingPathComponent("missing-project")
+        do {
+            try await service.openNewTask(application: .codex, projectURL: missing, prompt: "work")
+            XCTFail("Missing workspace must fail")
+        } catch {
+            XCTAssertEqual(error as? AgentDesktopLauncherError, .invalidProject(missing.path))
+        }
+        let projectURL = try makeProject()
+        do {
+            try await service.openNewTask(application: .codex, projectURL: projectURL, prompt: " ")
+            XCTFail("Empty task must fail")
+        } catch {
+            XCTAssertEqual(error as? AgentDesktopLauncherError, .invalidPrompt)
+        }
+        XCTAssertTrue(recorder.opens.isEmpty)
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
+    /// Verifies a hanging native opening cannot keep the task picker waiting indefinitely.
+    ///
+    /// Raises:
+    ///   Error: The isolated application or project fixture could not be created.
+    func testOpenNewTaskReportsBoundedTimeoutWithoutCLIFallback() async throws {
+        _ = try makeApplication(named: "Claude.app", application: .claudeCode)
+        let projectURL = try makeProject()
+        let recorder = Recorder()
+        var configuration = AgentDesktopLauncherService.Configuration()
+        configuration.commandLaunchTimeout = 0.02
+        let service = makeService(recorder: recorder, configuration: configuration, applicationOpener: { _, _ in
+            try await Task.sleep(for: .seconds(10))
+        })
+        do {
+            try await service.openNewTask(application: .claudeCode, projectURL: projectURL, prompt: "task")
+            XCTFail("Opening must time out")
+        } catch {
+            XCTAssertEqual(error as? AgentDesktopLauncherError, .launchTimedOut(.claudeCode))
+        }
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
+    /// Verifies cancelling the draft prevents a pending opener from reporting success.
+    ///
+    /// Raises:
+    ///   Error: The isolated application or project fixture could not be created.
+    func testOpenNewTaskCancellationIsPreserved() async throws {
+        _ = try makeApplication(named: "ChatGPT.app", application: .codex)
+        let projectURL = try makeProject()
+        let opened = expectation(description: "Draft opener started")
+        let recorder = Recorder()
+        let service = makeService(recorder: recorder, applicationOpener: { _, _ in
+            opened.fulfill()
+            try await Task.sleep(for: .seconds(10))
+        })
+        let task = Task { try await service.openNewTask(application: .codex, projectURL: projectURL, prompt: "task") }
+        await fulfillment(of: [opened], timeout: 1)
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("Cancelled opening must fail")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
+    /// Verifies configured prompt limits apply to the service before any native request.
+    ///
+    /// Raises:
+    ///   Error: The isolated application or project fixture could not be created.
+    func testOpenNewTaskUsesConfiguredPromptLimitBeforeOpening() async throws {
+        _ = try makeApplication(named: "ChatGPT.app", application: .codex)
+        let projectURL = try makeProject()
+        let recorder = Recorder()
+        var configuration = AgentDesktopLauncherService.Configuration()
+        configuration.maximumNewTaskPromptUTF16Units = 4
+        let service = makeService(recorder: recorder, configuration: configuration)
+        do {
+            try await service.openNewTask(application: .codex, projectURL: projectURL, prompt: "😀😀x")
+            XCTFail("Overlong draft must fail")
+        } catch {
+            XCTAssertEqual(error as? AgentDesktopLauncherError, .promptTooLong)
+        }
+        XCTAssertTrue(recorder.opens.isEmpty)
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
     /// Verifies an existing Codex chat uses navigation instead of a new-chat URL.
     ///
     /// Raises:
@@ -637,6 +837,7 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
             .applicationNotInstalled(.codex), .applicationRemoved(.claudeCode),
             .invalidProject("/example/project"), .invalidSessionIdentifier,
             .unsupportedSession(.claudeCode), .invalidDestination,
+            .invalidPrompt, .promptTooLong,
             .launchFailed(.codex), .launchTimedOut(.claudeCode),
         ]
         for error in errors {
@@ -652,6 +853,7 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
     ///
     /// Args:
     ///   recorder: Captures mocked side effects.
+    ///   configuration: Optional bounds for isolated failure and timeout tests.
     ///   applicationLookup: Optional Launch Services result provider.
     ///   executableValidator: Optional command presence provider.
     ///   applicationOpener: Optional opener override for failure tests.
@@ -661,6 +863,7 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
     ///   Launcher restricted to this test's fixture directories.
     private func makeService(
         recorder: Recorder = Recorder(),
+        configuration: AgentDesktopLauncherService.Configuration = .init(),
         applicationLookup: @escaping AgentDesktopLauncherService.ApplicationLookup = { _ in nil },
         executableValidator: @escaping AgentDesktopLauncherService.ExecutableValidator = { _ in false },
         applicationOpener: AgentDesktopLauncherService.ApplicationOpener? = nil,
@@ -669,6 +872,7 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
         AgentDesktopLauncherService(
             homeDirectory: homeURL,
             applicationDirectories: [appsURL, homeURL.appendingPathComponent("Applications", isDirectory: true)],
+            configuration: configuration,
             applicationLookup: applicationLookup,
             executableValidator: executableValidator,
             applicationOpener: applicationOpener ?? { appURL, destinationURL in

@@ -1945,7 +1945,7 @@ final class AppState {
     ///   and failure for other routing outcomes.
     nonisolated static func agentRoutingFeedbackStatus(for result: AgentRouterResult) -> MacActionResultStatus {
         if result.outcome == .matchedPreview || result.outcome == .selectionRequired || result.outcome == .cancelled
-            || result.outcome == .handoffPrepared || result.outcome == .historyIndexUpdating {
+            || result.outcome == .handoffPrepared || result.outcome == .newTaskPrepared || result.outcome == .historyIndexUpdating {
             return .unsure
         }
         return result.handled ? .success : .failure

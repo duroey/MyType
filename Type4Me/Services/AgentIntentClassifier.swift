@@ -6,6 +6,7 @@ import Security
 enum AgentIntent: String, Codable, CaseIterable, Sendable {
     case wake
     case handoff
+    case create
     case uncertain
 }
 

@@ -116,6 +116,7 @@ private struct AgentIntentPickerView: View {
             HStack {
                 Button(language == .zh ? "找回会话" : "Find a conversation") { choose(.wake) }
                 Button(language == .zh ? "交接工作" : "Hand off work") { choose(.handoff) }
+                Button(language == .zh ? "新建 Agent" : "New agent") { choose(.create) }
                 Spacer()
                 Button(language == .zh ? "取消" : "Cancel") { choose(nil) }
                     .keyboardShortcut(.cancelAction)

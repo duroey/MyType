@@ -23,6 +23,7 @@ struct AgentRouterResult: Equatable, Sendable {
         case noPreviousActivity, noPendingSelection, unsupported, cancelled, failed, catalogUnavailable
         case historySearchUnavailable, historyMappingUnavailable, handoffPrepared, handoffBusy
         case historyIndexUpdating
+        case newTaskPrepared, newTaskBusy
     }
 
     let outcome: Outcome
@@ -57,6 +58,8 @@ struct AgentRouterResult: Equatable, Sendable {
         case .selectionRequired: return "agent_selection_required"
         case .handoffPrepared: return "agent_handoff_prepared"
         case .handoffBusy: return "agent_handoff_busy"
+        case .newTaskPrepared: return "agent_new_task_prepared"
+        case .newTaskBusy: return "agent_new_task_busy"
         case .historyIndexUpdating: return "agent_index_updating"
         case .cancelled: return "discarded"
         case .unsupported: return "agent_session_unsupported"
@@ -109,6 +112,10 @@ struct AgentRouterResult: Equatable, Sendable {
             return zh ? "已带入交接要求，请选择来源和接收会话。" : "Handoff request prepared. Choose the source and receiving conversations."
         case .handoffBusy:
             return zh ? "交接窗口正在处理另一项操作，请完成后再试。" : "The handoff window is busy. Finish its current operation and try again."
+        case .newTaskPrepared:
+            return zh ? "请确认新任务的项目。" : "Review the project for the new task."
+        case .newTaskBusy:
+            return zh ? "正在打开另一个新任务，请稍后再试。" : "Another new task is opening. Try again shortly."
         case .historySearchUnavailable:
             return zh ? "历史内容搜索暂不可用，请稍后再试。" : "History search is unavailable. Try again later."
         case .historyIndexUpdating:
