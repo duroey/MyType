@@ -47,7 +47,7 @@ struct AgentInboxSummary {
     }
 }
 
-/// Shared monochrome robot silhouette, drawn once and tinted by the native surface.
+/// Menu bar robot silhouette, drawn once and tinted by the native surface.
 enum AgentInboxIdentity {
     static let symbol: NSImage = {
         let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { _ in
@@ -92,12 +92,7 @@ struct AgentInboxMenuEntry: View {
         let language = AppLanguage(rawValue: languageRaw) ?? .en
         let summary = AgentInboxSummary(items: inbox.items)
         Button(action: onOpen) {
-            Label {
-                Text(summary.menuTitle(language: language))
-            } icon: {
-                Image(nsImage: AgentInboxIdentity.symbol)
-                    .renderingMode(.template)
-            }
+            Text(summary.menuTitle(language: language))
         }
         .help(summary.accessibilityLabel(language: language))
     }

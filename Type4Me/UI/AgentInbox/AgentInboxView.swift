@@ -67,8 +67,6 @@ struct AgentInboxView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: TF.spacingMD) {
             HStack(spacing: TF.spacingSM) {
-                Image(nsImage: AgentInboxIdentity.symbol).renderingMode(.template)
-                    .accessibilityHidden(true)
                 Text(copy(.title)).font(.system(size: 19, weight: .semibold))
                 let summary = AgentInboxSummary(items: store.items)
                 if summary.count > 0 {
