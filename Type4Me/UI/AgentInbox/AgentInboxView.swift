@@ -67,15 +67,17 @@ struct AgentInboxView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: TF.spacingMD) {
             HStack(spacing: TF.spacingSM) {
+                Image(nsImage: AgentInboxIdentity.symbol).renderingMode(.template)
+                    .accessibilityHidden(true)
                 Text(copy(.title)).font(.system(size: 19, weight: .semibold))
-                let unreadCount = store.items.filter(\.isUnread).count
-                if unreadCount > 0 {
-                    Text(String(unreadCount))
+                let summary = AgentInboxSummary(items: store.items)
+                if summary.count > 0 {
+                    Text(summary.countText)
                         .font(.system(size: 11, weight: .semibold)).monospacedDigit()
                         .foregroundStyle(TF.settingsTextSecondary)
                         .padding(.horizontal, TF.spacingSM).padding(.vertical, TF.spacingXS)
                         .background(TF.settingsCardAlt, in: Capsule())
-                        .accessibilityLabel("\(copy(.unread)): \(unreadCount)")
+                        .accessibilityLabel(summary.accessibilityLabel(language: language))
                 }
             }
             Spacer(minLength: 0)

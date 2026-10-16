@@ -2934,7 +2934,7 @@ struct MenuBarContent: View {
     @AppStorage("tf_language") private var language = AppLanguage.systemDefault
 
     var body: some View {
-        Button(L("Agent 消息队列…", "Agent Inbox…")) {
+        AgentInboxMenuEntry(inbox: .shared) {
             AgentInboxPanelController.shared.show()
         }
         Button(L("交接 Agent 会话…", "Hand Off an Agent Conversation…")) {
