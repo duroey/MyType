@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import SQLite3
 
@@ -219,6 +220,7 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
         var maximumTitleCharacters = 512
         var databaseBusyTimeoutMilliseconds: Int32 = 150
         var databaseQueryTimeout: TimeInterval = 1
+        var maximumDatabaseSnapshotBytes = 64 * 1024 * 1024
         var millisecondsPerSecond: Double = 1000
     }
 
@@ -231,6 +233,25 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
     private struct IndexedTitle {
         let title: String?
         let updatedAt: TimeInterval
+    }
+
+    private struct SQLiteReadFailure: Error {
+        let code: Int32
+        let stage: String
+
+        /// Captures a SQLite failure without retaining database or conversation contents.
+        ///
+        /// Args:
+        ///   database: Connection reporting the error, if one was allocated.
+        ///   stage: Static diagnostic label for the failed operation.
+        init(_ database: OpaquePointer?, stage: String) {
+            code = sqlite3_extended_errcode(database)
+            self.stage = stage
+        }
+    }
+
+    private enum SnapshotError: Error {
+        case unavailable
     }
 
     private final class QueryDeadline {
@@ -267,6 +288,7 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
         precondition(configuration.maximumIndexLineBytes > 0 && configuration.maximumIndexRecords > 0)
         precondition(configuration.maximumTitleCharacters > 0 && configuration.databaseQueryTimeout > 0)
         precondition(configuration.databaseBusyTimeoutMilliseconds >= 0 && configuration.millisecondsPerSecond > 0)
+        precondition(configuration.maximumDatabaseSnapshotBytes > 0 && configuration.maximumDatabaseSnapshotBytes < Int.max)
         precondition(configuration.millisecondsPerSecond.isFinite && configuration.databaseQueryTimeout.isFinite)
         self.metadataDirectory = metadataDirectory
         self.configuration = configuration
@@ -297,7 +319,12 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
             }
         }
         if let databaseURL = try newestDatabaseURL() {
-            return try readDatabase(at: databaseURL, indexedTitles: titles)
+            do {
+                return try readAvailableDatabase(at: databaseURL, indexedTitles: titles)
+            } catch let failure as SQLiteReadFailure {
+                DebugFileLogger.log("agent catalog provider=codex sqlite_code=\(failure.code) stage=\(failure.stage)")
+                throw AgentSessionCatalogError.databaseReadFailed
+            }
         }
         guard hasTitleIndex else { throw AgentSessionCatalogError.metadataUnavailable }
         guard !titleIndexFailed else { throw AgentSessionCatalogError.metadataReadFailed }
@@ -384,11 +411,140 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
         return titles
     }
 
+    /// Uses the live WAL when available, or a verified private snapshot of a closed database.
+    ///
+    /// Args:
+    ///   url: Latest state database, which this adapter never opens for writing.
+    ///   indexedTitles: Independent title-only metadata.
+    ///
+    /// Returns:
+    ///   Conversations from a normal SQLite read or a stable offline snapshot.
+    ///
+    /// Raises:
+    ///   Error: Neither bounded read is safe, the schema is incompatible, or routing was cancelled.
+    private func readAvailableDatabase(at url: URL, indexedTitles: [String: IndexedTitle]) throws -> [AgentSessionDescriptor] {
+        do {
+            return try readDatabase(at: url, indexedTitles: indexedTitles)
+        } catch let failure as SQLiteReadFailure where (failure.code & 0xff) == SQLITE_CANTOPEN {
+            DebugFileLogger.log("agent catalog provider=codex sqlite_code=\(failure.code) stage=\(failure.stage) checking_closed_database=true")
+            do {
+                return try readClosedDatabase(at: url, indexedTitles: indexedTitles)
+            } catch SnapshotError.unavailable {
+                // The owning app may have reopened during the copy. Retry its normal WAL-aware
+                // connection once; never declare a changing source immutable.
+                try Task.checkCancellation()
+                return try readDatabase(at: url, indexedTitles: indexedTitles)
+            }
+        }
+    }
+
+    /// Copies a bounded, unchanged database only when no transaction sidecars exist.
+    ///
+    /// Args:
+    ///   url: Original database whose bytes and sidecars remain untouched.
+    ///   indexedTitles: Independent title-only metadata.
+    ///
+    /// Returns:
+    ///   Conversations read from an owned immutable copy, removed before returning.
+    ///
+    /// Raises:
+    ///   SnapshotError: The source is changing, too large, inaccessible, or has sidecars.
+    ///   Error: The snapshot query failed or routing was cancelled.
+    private func readClosedDatabase(at url: URL, indexedTitles: [String: IndexedTitle]) throws -> [AgentSessionDescriptor] {
+        try Task.checkCancellation()
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw SnapshotError.unavailable }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var before = stat()
+        guard fstat(descriptor, &before) == 0, (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_size > 0, before.st_size <= configuration.maximumDatabaseSnapshotBytes,
+              sourceMatches(url, fingerprint: before), transactionSidecarsAreAbsent(at: url) else {
+            throw SnapshotError.unavailable
+        }
+        let data: Data
+        do {
+            data = try handle.read(upToCount: configuration.maximumDatabaseSnapshotBytes + 1) ?? Data()
+        } catch {
+            throw SnapshotError.unavailable
+        }
+        try Task.checkCancellation()
+        var after = stat()
+        guard data.count == before.st_size, fstat(descriptor, &after) == 0,
+              sameFile(before, after), sourceMatches(url, fingerprint: before),
+              transactionSidecarsAreAbsent(at: url) else { throw SnapshotError.unavailable }
+
+        let directory = fileManager.temporaryDirectory.appendingPathComponent("mytype-codex-metadata-\(UUID().uuidString)")
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        } catch {
+            throw SnapshotError.unavailable
+        }
+        defer {
+            do { try fileManager.removeItem(at: directory) }
+            catch { DebugFileLogger.log("agent catalog provider=codex snapshot_cleanup_failed=true") }
+        }
+        let snapshotURL = directory.appendingPathComponent("metadata.sqlite")
+        do {
+            try data.write(to: snapshotURL, options: .withoutOverwriting)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: snapshotURL.path)
+        } catch {
+            throw SnapshotError.unavailable
+        }
+        // immutable is safe only for this private copy. Using it on the live source would
+        // silently omit transactions committed to WAL by a running Codex app.
+        let sessions = try readDatabase(at: snapshotURL, indexedTitles: indexedTitles, immutableSnapshot: true)
+        DebugFileLogger.log("agent catalog provider=codex closed_database_snapshot=true sessions=\(sessions.count)")
+        return sessions
+    }
+
+    /// Checks sidecar absence without treating inaccessible files or dangling links as absent.
+    ///
+    /// Args:
+    ///   url: Source database.
+    ///
+    /// Returns:
+    ///   True only when both WAL and rollback journal paths report ENOENT.
+    private func transactionSidecarsAreAbsent(at url: URL) -> Bool {
+        ["-wal", "-journal"].allSatisfy { suffix in
+            var metadata = stat()
+            return lstat(url.path + suffix, &metadata) == -1 && errno == ENOENT
+        }
+    }
+
+    /// Verifies the path still names the same regular file inspected through its open descriptor.
+    ///
+    /// Args:
+    ///   url: Original source path.
+    ///   fingerprint: Descriptor metadata captured before copying.
+    ///
+    /// Returns:
+    ///   True when identity, size and nanosecond timestamps are unchanged.
+    private func sourceMatches(_ url: URL, fingerprint: stat) -> Bool {
+        var current = stat()
+        return lstat(url.path, &current) == 0 && (current.st_mode & S_IFMT) == S_IFREG && sameFile(fingerprint, current)
+    }
+
+    /// Compares file identity and metadata that change on replacement, writes or truncation.
+    ///
+    /// Args:
+    ///   lhs: Metadata before reading.
+    ///   rhs: Metadata after reading.
+    ///
+    /// Returns:
+    ///   True if the snapshots describe an unchanged file.
+    private func sameFile(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev && lhs.st_ino == rhs.st_ino && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
     /// Projects identity, mode-specific display titles, workspace and time from a read-only connection.
     ///
     /// Args:
     ///   url: Latest known state database.
     ///   indexedTitles: Independent UI names used according to the persisted history contract.
+    ///   immutableSnapshot: True only for this adapter's private, verified offline copy.
     ///
     /// Returns:
     ///   Non-archived conversations. Missing titles do not invalidate native session identities.
@@ -397,12 +553,17 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
     /// Raises:
     ///   AgentSessionCatalogError: SQLite cannot safely read the expected metadata schema.
     ///   CancellationError: The routing task was cancelled.
-    private func readDatabase(at url: URL, indexedTitles: [String: IndexedTitle]) throws -> [AgentSessionDescriptor] {
+    private func readDatabase(
+        at url: URL, indexedTitles: [String: IndexedTitle], immutableSnapshot: Bool = false
+    ) throws -> [AgentSessionDescriptor] {
         var database: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+        let location = immutableSnapshot ? url.absoluteString + "?mode=ro&immutable=1" : url.path
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | (immutableSnapshot ? SQLITE_OPEN_URI : 0)
+        guard sqlite3_open_v2(location, &database, flags, nil) == SQLITE_OK,
               let database else {
+            let failure = SQLiteReadFailure(database, stage: "open")
             if let database { sqlite3_close(database) }
-            throw AgentSessionCatalogError.databaseReadFailed
+            throw failure
         }
         defer { sqlite3_close(database) }
         sqlite3_busy_timeout(database, configuration.databaseBusyTimeoutMilliseconds)
@@ -440,7 +601,7 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
             """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw AgentSessionCatalogError.databaseReadFailed
+            throw SQLiteReadFailure(database, stage: "query_prepare")
         }
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int(statement, 1, Int32(clamping: configuration.maximumDatabaseRows))
@@ -449,7 +610,7 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
             try Task.checkCancellation()
             let status = sqlite3_step(statement)
             if status == SQLITE_DONE { break }
-            guard status == SQLITE_ROW else { throw AgentSessionCatalogError.databaseReadFailed }
+            guard status == SQLITE_ROW else { throw SQLiteReadFailure(database, stage: "query_step") }
             guard let id = textColumn(statement, index: 0), AgentSessionMetadataValidation.isValidIdentifier(id) else { continue }
             let databaseName = AgentSessionMetadataValidation.title(textColumn(statement, index: 1), maximumCharacters: configuration.maximumTitleCharacters)
             let indexedTitle = indexedTitles[id]?.title
@@ -487,14 +648,14 @@ final class CodexMetadataSessionCatalog: @unchecked Sendable {
     private func databaseColumns(_ database: OpaquePointer) throws -> Set<String> {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "PRAGMA table_info(threads);", -1, &statement, nil) == SQLITE_OK else {
-            throw AgentSessionCatalogError.databaseReadFailed
+            throw SQLiteReadFailure(database, stage: "schema_prepare")
         }
         defer { sqlite3_finalize(statement) }
         var columns: Set<String> = []
         while true {
             let status = sqlite3_step(statement)
             if status == SQLITE_DONE { break }
-            guard status == SQLITE_ROW else { throw AgentSessionCatalogError.databaseReadFailed }
+            guard status == SQLITE_ROW else { throw SQLiteReadFailure(database, stage: "schema_step") }
             if let column = textColumn(statement, index: 1) { columns.insert(column) }
         }
         return columns

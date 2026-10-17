@@ -6,6 +6,100 @@ import XCTest
 final class AgentSessionCatalogTests: XCTestCase {
     private var rootURL: URL!
 
+    /// Reads a closed WAL database without recreating sidecars or changing its contents.
+    ///
+    /// Raises:
+    ///   Error: The isolated database could not be written or read.
+    func testClosedWALDatabaseRemainsReadableWithoutSourceChanges() throws {
+        try writeClosedWALDatabase()
+        let url = rootURL.appendingPathComponent("state_5.sqlite")
+        let original = try Data(contentsOf: url)
+        let modified = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+
+        let sessions = try CodexMetadataSessionCatalog(metadataDirectory: rootURL).loadSessions()
+
+        XCTAssertEqual(sessions.map(\.sessionID), ["closed_thread"])
+        XCTAssertEqual(sessions.first?.title, "Closed conversation")
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date, modified)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: rootURL.path), ["state_5.sqlite"])
+    }
+
+    /// Includes committed WAL-only rows while the owning app keeps its connection open.
+    ///
+    /// Raises:
+    ///   Error: The live synthetic connection could not be created or read.
+    func testLiveWALDatabaseIncludesUncheckpointedConversations() throws {
+        try writeClosedWALDatabase()
+        let url = rootURL.appendingPathComponent("state_5.sqlite")
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &database), SQLITE_OK)
+        defer { sqlite3_close(database) }
+        XCTAssertEqual(sqlite3_exec(database, """
+            PRAGMA wal_autocheckpoint=0;
+            INSERT INTO threads VALUES('new_thread', 'New conversation', '/workspace', 200, 0);
+            """, nil, nil, nil), SQLITE_OK)
+        let mainBefore = try Data(contentsOf: url)
+        let walURL = URL(fileURLWithPath: url.path + "-wal")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: walURL.path))
+        let walBefore = try Data(contentsOf: walURL)
+
+        let sessions = try CodexMetadataSessionCatalog(metadataDirectory: rootURL).loadSessions()
+
+        XCTAssertEqual(sessions.map(\.sessionID), ["new_thread", "closed_thread"])
+        XCTAssertEqual(try Data(contentsOf: url), mainBefore)
+        XCTAssertEqual(try Data(contentsOf: walURL), walBefore)
+    }
+
+    /// Refuses an offline copy outside the configured memory and disk bound.
+    ///
+    /// Raises:
+    ///   Error: The isolated database could not be prepared.
+    func testClosedWALSnapshotHonorsSizeLimit() throws {
+        try writeClosedWALDatabase()
+        var configuration = CodexMetadataSessionCatalog.Configuration()
+        configuration.maximumDatabaseSnapshotBytes = 1
+
+        XCTAssertThrowsError(try CodexMetadataSessionCatalog(metadataDirectory: rootURL, configuration: configuration).loadSessions()) { error in
+            XCTAssertEqual(error as? AgentSessionCatalogError, .databaseReadFailed)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: rootURL.path), ["state_5.sqlite"])
+    }
+
+    /// Does not misinterpret a dangling transaction-sidecar link as an absent sidecar.
+    ///
+    /// Raises:
+    ///   Error: The isolated database and link could not be prepared.
+    func testClosedWALSnapshotRejectsDanglingJournalLink() throws {
+        try writeClosedWALDatabase()
+        let journal = rootURL.appendingPathComponent("state_5.sqlite-journal")
+        try FileManager.default.createSymbolicLink(atPath: journal.path, withDestinationPath: rootURL.appendingPathComponent("missing-journal").path)
+
+        XCTAssertThrowsError(try CodexMetadataSessionCatalog(metadataDirectory: rootURL).loadSessions()) { error in
+            XCTAssertEqual(error as? AgentSessionCatalogError, .databaseReadFailed)
+        }
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: journal.path), rootURL.appendingPathComponent("missing-journal").path)
+    }
+
+    /// Creates a checkpointed WAL fixture with the sidecars removed, as after app shutdown.
+    ///
+    /// Raises:
+    ///   Error: Only this test's synthetic database could not be prepared.
+    private func writeClosedWALDatabase() throws {
+        try writeDatabase("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE threads(id TEXT, name TEXT, cwd TEXT, updated_at INTEGER, archived INTEGER);
+            INSERT INTO threads VALUES('closed_thread', 'Closed conversation', '/workspace', 100, 0);
+            PRAGMA wal_checkpoint(TRUNCATE);
+            """)
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = rootURL.appendingPathComponent("state_5.sqlite" + suffix)
+            if FileManager.default.fileExists(atPath: sidecar.path) {
+                try FileManager.default.removeItem(at: sidecar)
+            }
+        }
+    }
+
     /// Keeps an unnamed paginated conversation available for a content-search match.
     ///
     /// Raises:
