@@ -10,25 +10,32 @@ struct MenuBarStatusLabel: View {
         let summary = AgentInboxSummary(items: inbox.items)
         let currentLanguage = AppLanguage(rawValue: language) ?? .en
         if appState.quietCalibrationSecondsRemaining > 0 {
-            Text(L("安静 \(appState.quietCalibrationSecondsRemaining)秒",
-                   "Quiet \(appState.quietCalibrationSecondsRemaining)s"))
+            Label {
+                Text(L("安静 \(appState.quietCalibrationSecondsRemaining)秒",
+                       "Quiet \(appState.quietCalibrationSecondsRemaining)s"))
+            } icon: {
+                statusIcon
+            }
+            .labelStyle(.titleAndIcon)
         } else if summary.count > 0 {
             Label {
                 Text(summary.countText).monospacedDigit()
             } icon: {
-                if appState.barPhase == .recording {
-                    Image(systemName: "mic.fill").symbolRenderingMode(.monochrome)
-                } else {
-                    Image(nsImage: AgentInboxIdentity.symbol).renderingMode(.template)
-                }
+                statusIcon
             }
             .labelStyle(.titleAndIcon)
             .font(.system(.callout, weight: .medium))
             .accessibilityLabel(summary.accessibilityLabel(language: currentLanguage))
             .help(summary.accessibilityLabel(language: currentLanguage))
         } else {
-            Image(systemName: appState.barPhase == .hidden ? "mic" : "mic.fill")
+            statusIcon
                 .accessibilityLabel("MyType")
         }
+    }
+
+    /// Selects the icon from queue membership, independently of recording state or badge count.
+    private var statusIcon: Image {
+        (inbox.items.isEmpty ? Image(systemName: "mic") : Image(nsImage: AgentInboxIdentity.symbol))
+            .renderingMode(.template)
     }
 }

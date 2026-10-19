@@ -151,14 +151,17 @@ cp "$PROJECT_DIR/Type4Me/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Re
 mkdir -p "$APP_PATH/Contents/Resources/Assets"
 cp "$PROJECT_DIR/Type4Me/Resources/Assets/"*.svg "$APP_PATH/Contents/Resources/Assets/"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentsViewSearchConfig.json" "$APP_PATH/Contents/Resources/AgentsViewSearchConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/AgentSearchQueryConfig.json" "$APP_PATH/Contents/Resources/AgentSearchQueryConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentHandoffConfig.json" "$APP_PATH/Contents/Resources/AgentHandoffConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentHandoffSuggestionConfig.json" "$APP_PATH/Contents/Resources/AgentHandoffSuggestionConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentIntentConfig.json" "$APP_PATH/Contents/Resources/AgentIntentConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentNewTaskConfig.json" "$APP_PATH/Contents/Resources/AgentNewTaskConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/CodexNativeNoFolderConfig.json" "$APP_PATH/Contents/Resources/CodexNativeNoFolderConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentIndexConfig.json" "$APP_PATH/Contents/Resources/AgentIndexConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentNotificationConfig.json" "$APP_PATH/Contents/Resources/AgentNotificationConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/AgentEmbeddingConfig.json" "$APP_PATH/Contents/Resources/AgentEmbeddingConfig.json"
 cp "$PROJECT_DIR/Type4Me/Resources/TextDeliveryConfig.json" "$APP_PATH/Contents/Resources/TextDeliveryConfig.json"
+cp "$PROJECT_DIR/Type4Me/Resources/BoyaButtonConfig.json" "$APP_PATH/Contents/Resources/BoyaButtonConfig.json"
 # Embed the explicitly selected backend; never pick up an unrelated PATH binary.
 if [ -n "${AGENTSVIEW_BINARY:-}" ]; then
     if [ ! -x "$AGENTSVIEW_BINARY" ] || [ ! -f "${AGENTSVIEW_LICENSE:-}" ]; then

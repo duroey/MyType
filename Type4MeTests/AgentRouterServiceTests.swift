@@ -33,7 +33,10 @@ final class AgentRouterServiceTests: XCTestCase {
         /// Returns:
         ///   Metadata and provider limitations configured for this fixture.
         func snapshot() -> AgentSessionCatalogSnapshot {
-            .init(sessions: sessions, unavailableApplications: unavailableApplications)
+            .init(sessions: sessions, unavailableApplications: unavailableApplications,
+                  absentApplications: unavailableApplications.filter { app in
+                      !sessions.contains { $0.application == app }
+                  })
         }
 
         /// Replaces metadata during a pending selection.

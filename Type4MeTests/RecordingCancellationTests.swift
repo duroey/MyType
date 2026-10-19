@@ -188,6 +188,96 @@ final class RecordingTeardownRecoveryTests: XCTestCase {
 
 }
 
+/// Full-audio replay must drain all packets, not use the realtime tail's one-second budget.
+final class BufferedReplayDrainTests: XCTestCase {
+    func testReplayWaitsForTailBeyondOneSecondBeforeEndingASR() async throws {
+        let tailSent = OSAllocatedUnfairLock(initialState: false)
+        let tailPresentAtEnd = OSAllocatedUnfairLock(initialState: false)
+        let sender = Task<Void, Never> {
+            do { try await Task.sleep(for: .milliseconds(1400)) } catch { return }
+            tailSent.withLock { $0 = true }
+        }
+        defer { sender.cancel() }
+        let retries = OSAllocatedUnfairLock(initialState: 0)
+        let client = FinishingASRStub(finalText: "完整录音", onEndAudio: {
+            tailPresentAtEnd.withLock { $0 = tailSent.withLock { $0 } }
+        })
+        let session = try await makeSession(client: client, retryCount: retries, audioSender: sender)
+        await session.prepareReplayDrainForTesting()
+        await session.stopRecording()
+        XCTAssertTrue(tailPresentAtEnd.withLock { $0 })
+        XCTAssertEqual(retries.withLock { $0 }, 0)
+        let result = await session.stoppedTextForTesting()
+        XCTAssertEqual(result, "完整录音")
+    }
+
+    func testShortReplayWithoutPartialWaitsForFinalAfterEndAudio() async throws {
+        let retries = OSAllocatedUnfairLock(initialState: 0)
+        let session = try await makeSession(
+            client: FinishingASRStub(finalText: "第二句短话", finalDelay: .milliseconds(100)), retryCount: retries
+        )
+        await session.prepareReplayDrainForTesting(audioDuration: 2)
+        await session.stopRecording()
+        let result = await session.stoppedTextForTesting()
+        XCTAssertEqual(result, "第二句短话")
+        XCTAssertEqual(retries.withLock { $0 }, 0)
+    }
+
+    func testShortReplayUploadTimeoutWithoutPartialStillRetriesAllAudio() async throws {
+        let sender = Task<Void, Never> { try? await Task.sleep(for: .seconds(5)) }
+        defer { sender.cancel() }
+        let retries = OSAllocatedUnfairLock(initialState: 0)
+        let session = try await makeSession(
+            client: FinishingASRStub(), retryCount: retries,
+            audioSender: sender, retryResult: "恢复完整短录音"
+        )
+        await session.prepareReplayDrainForTesting(timeout: .milliseconds(20), audioDuration: 2)
+        await session.stopRecording()
+        let result = await session.stoppedTextForTesting()
+        XCTAssertEqual(result, "恢复完整短录音")
+        XCTAssertEqual(retries.withLock { $0 }, 1)
+    }
+
+    func testReplayUploadTimeoutRetriesWholeAudioDespiteConfirmedPrefix() async throws {
+        let sender = Task<Void, Never> { try? await Task.sleep(for: .seconds(5)) }
+        defer { sender.cancel() }
+        let retries = OSAllocatedUnfairLock(initialState: 0)
+        let session = try await makeSession(
+            client: FinishingASRStub(finalText: "只有前半段"), retryCount: retries,
+            audioSender: sender, retryResult: "包含后半段的完整结果"
+        )
+        await session.prepareReplayDrainForTesting(timeout: .milliseconds(20))
+        await session.ingestASREventForTesting(.transcript(RecognitionTranscript(
+            confirmedSegments: ["只有前半段"], partialText: "", authoritativeText: "", isFinal: false
+        )))
+        await session.stopRecording()
+        XCTAssertEqual(retries.withLock { $0 }, 1)
+        let result = await session.stoppedTextForTesting()
+        XCTAssertEqual(result, "包含后半段的完整结果")
+    }
+
+    func testFailedFullReplayNeverPresentsPrefixAsSuccessfulInput() async throws {
+        let sender = Task<Void, Never> { try? await Task.sleep(for: .seconds(5)) }
+        defer { sender.cancel() }
+        let retries = OSAllocatedUnfairLock(initialState: 0)
+        let errorShown = expectation(description: "incomplete replay reported")
+        let session = try await makeSession(
+            client: FinishingASRStub(finalText: "只有前半段"), retryCount: retries, audioSender: sender
+        )
+        await session.prepareReplayDrainForTesting(timeout: .milliseconds(20))
+        await session.setOnASREvent { event in
+            if case .error = event { errorShown.fulfill() }
+        }
+        await session.stopRecording()
+        await fulfillment(of: [errorShown], timeout: 1)
+        let result = await session.stoppedTextForTesting()
+        let state = await session.state
+        XCTAssertNil(result)
+        XCTAssertEqual(state, .idle)
+        XCTAssertEqual(retries.withLock { $0 }, 1)
+    }
+}
+
 /// Creates an isolated stop fixture without microphone, network, or text injection.
 private func makeSession(
         client: FinishingASRStub,

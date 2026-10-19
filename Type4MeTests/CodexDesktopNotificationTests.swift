@@ -386,13 +386,16 @@ final class CodexDesktopNotificationTests: XCTestCase {
         XCTAssertNil(removed.nativeHasUnreadTurn)
     }
 
-    /// Treats local read broadcasts as refresh hints, excluding remote, malformed and unread events.
+    /// Refreshes both native read transitions, excluding remote and malformed events.
     func testReadRefreshHintValidation() {
         let params: [String: Any] = ["hostId": "local", "conversationId": sessionID, "hasUnreadTurn": false]
         let packet: [String: Any] = ["type": "broadcast", "method": "thread-read-state-changed", "version": 3, "params": params]
         XCTAssertEqual(CodexInboxStateReducer.readStateRefreshSessionID(packet: packet), sessionID)
+        var unreadPacket = packet
+        var unreadParams = params; unreadParams["hasUnreadTurn"] = true; unreadPacket["params"] = unreadParams
+        XCTAssertEqual(CodexInboxStateReducer.readStateRefreshSessionID(packet: unreadPacket), sessionID)
         for (key, value) in [("hostId", "remote" as Any), ("conversationId", "invalid" as Any),
-                             ("hasUnreadTurn", true as Any), ("hasUnreadTurn", 0 as Any)] {
+                             ("hasUnreadTurn", 0 as Any)] {
             var bad = packet
             var changed = params; changed[key] = value; bad["params"] = changed
             XCTAssertNil(CodexInboxStateReducer.readStateRefreshSessionID(packet: bad))
@@ -763,6 +766,135 @@ final class CodexDesktopNotificationTests: XCTestCase {
         XCTAssertEqual(reducer.revision, 1)
     }
 
+    /// A native image-bearing history must fit the configured frame budget without changing the total budget.
+    func testNativeImageHistoryFitsFrameBudget() throws {
+        let configuration = try AgentNotificationConfiguration.bundled()
+        XCTAssertGreaterThanOrEqual(configuration.maximumFrameBytes, 29_325_010)
+        XCTAssertEqual(configuration.maximumCodexStateBytes, 67_108_864)
+    }
+
+    /// Notification state keeps turn identity and visible progress but never retains generated image bytes.
+    func testGeneratedImagesDoNotConsumeNotificationStateBudget() throws {
+        var configuration = AgentNotificationConfiguration()
+        configuration.maximumCodexStateBytes = 2_048
+        var reducer = CodexInboxStateReducer(configuration: configuration)
+        let image: [String: Any] = ["type": "imageGeneration", "id": "image-1", "status": "inProgress",
+                                    "result": String(repeating: "base64", count: 8_192)]
+        let initial = snapshot(turns: [turn(status: "inProgress", items: [image,
+            ["type": "agentMessage", "id": "visible", "text": "Working"]])], active: true)
+        let first = try reducer.accept(packet: initial, ownerID: ownerID, session: session())
+        XCTAssertEqual(first.status, .running)
+        XCTAssertEqual(first.preview, "Working")
+        XCTAssertLessThan(reducer.estimatedBytes, 2_048)
+        let progress = envelope(["type": "patches", "baseRevision": 1, "revision": 2, "patches": [
+            ["op": "replace", "path": ["turns", 0, "items", 0, "result"],
+             "value": String(repeating: "new-image", count: 8_192)],
+            ["op": "replace", "path": ["turns", 0, "status"], "value": "completed"],
+        ]])
+        let completed = try reducer.accept(packet: progress, ownerID: ownerID, session: session())
+        XCTAssertEqual(completed.status, .completed)
+        XCTAssertEqual(completed.completionID, "turn-1")
+        XCTAssertLessThan(reducer.estimatedBytes, 2_048)
+    }
+
+    /// Removing an image item must preserve array indices for a subsequent visible question.
+    func testGeneratedImageRemovalPreservesFollowingQuestionPatch() throws {
+        var configuration = AgentNotificationConfiguration()
+        configuration.maximumCodexStateBytes = 2_048
+        var reducer = CodexInboxStateReducer(configuration: configuration)
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress", items: [
+            ["type": "imageGeneration", "id": "image-1", "result": String(repeating: "x", count: 8_192)],
+            ["type": "agentMessage", "id": "visible", "text": "Working"],
+        ])], active: true), ownerID: ownerID, session: session())
+        let packet = envelope(["type": "patches", "baseRevision": 1, "revision": 2, "patches": [
+            ["op": "remove", "path": ["turns", 0, "items", 0]],
+            ["op": "add", "path": ["turns", 0, "items", 1], "value": asyncQuestion()],
+        ]])
+        let update = try reducer.accept(packet: packet, ownerID: ownerID, session: session())
+        XCTAssertEqual(update.pendingRequests?.map(\.id), ["async:question-1:0"])
+        XCTAssertEqual(update.preview, "Choose options")
+    }
+
+    /// Canonical history and whole-subtree replacements apply the same image minimization as live turns.
+    func testCanonicalImageSubtreeReplacementsStayWithinBudget() throws {
+        let image: [String: Any] = ["type": "imageGeneration", "id": "image", "result": String(repeating: "x", count: 8_192)]
+        let imageTurn = turn(status: "inProgress", items: [image])
+        let base: [Any] = ["turnHistory", "history", "entitiesByKey", "turn-1"]
+        for (path, replacement) in [(base, imageTurn as Any), (base + ["items"], [image] as Any),
+                                    (base + ["items", 0], image as Any)] {
+            var configuration = AgentNotificationConfiguration()
+            configuration.maximumCodexStateBytes = 2_048
+            var reducer = CodexInboxStateReducer(configuration: configuration)
+            _ = try reducer.accept(packet: overlappingSnapshot(live: turn(status: "inProgress"), canonical: imageTurn),
+                                   ownerID: ownerID, session: session())
+            let update = try reducer.accept(packet: patches(base: 1, next: 2, values: [
+                ["op": "replace", "path": path, "value": replacement],
+                ["op": "add", "path": base + ["items", 1], "value": asyncQuestion()],
+            ]), ownerID: ownerID, session: session())
+            XCTAssertEqual(update.status, .running)
+            XCTAssertEqual(update.pendingRequests?.count, 1)
+            XCTAssertLessThan(reducer.estimatedBytes, 2_048)
+        }
+    }
+
+    /// An opaque nested image update cannot disrupt a later completion in the same patch batch.
+    func testNestedImageResultPatchStillAdvancesCompletion() throws {
+        var reducer = CodexInboxStateReducer()
+        _ = try reducer.accept(packet: snapshot(turns: [turn(status: "inProgress", items: [
+            ["type": "imageGeneration", "id": "image", "result": ["data": "opaque"]],
+        ])], active: true), ownerID: ownerID, session: session())
+        let update = try reducer.accept(packet: patches(base: 1, next: 2, values: [
+            ["op": "replace", "path": ["turns", 0, "items", 0, "result", "data"], "value": "ignored"],
+            ["op": "replace", "path": ["turns", 0, "status"], "value": "completed"],
+        ]), ownerID: ownerID, session: session())
+        XCTAssertEqual(reducer.revision, 2)
+        XCTAssertEqual(update.status, .completed)
+        XCTAssertEqual(update.completionID, "turn-1")
+    }
+
+    /// An oversized fragmented frame cannot disconnect or consume the following healthy session's packet.
+    func testOversizedFrameDrainsAcrossReadsAndPreservesHealthyFrame() throws {
+        var buffer = Data([0, 8, 0, 0])
+        var remaining = 0
+        XCTAssertNil(try CodexInboxSocket.decodeFrame(from: &buffer, maximumBytes: 1_024,
+                                                     discardRemainingBytes: &remaining))
+        XCTAssertTrue(buffer.isEmpty)
+        XCTAssertEqual(remaining, 2_048)
+        buffer.append(Data(repeating: 120, count: 1_024))
+        XCTAssertNil(try CodexInboxSocket.decodeFrame(from: &buffer, maximumBytes: 1_024,
+                                                     discardRemainingBytes: &remaining))
+        XCTAssertTrue(buffer.isEmpty)
+        XCTAssertEqual(remaining, 1_024)
+        let healthy = Data("{\"id\":1}".utf8)
+        buffer.append(Data(repeating: 120, count: 1_024))
+        buffer.append(contentsOf: [UInt8(healthy.count), 0, 0, 0])
+        buffer.append(healthy)
+        XCTAssertEqual(try CodexInboxSocket.decodeFrame(from: &buffer, maximumBytes: 1_024,
+                                                      discardRemainingBytes: &remaining)?["id"] as? Int, 1)
+        XCTAssertEqual(remaining, 0)
+        XCTAssertTrue(buffer.isEmpty)
+    }
+
+    /// Consecutive rejected payloads are drained without allocating their declared lengths.
+    func testOversizedFramesPreservePartialFollowingHeader() throws {
+        var buffer = Data([1, 4, 0, 0]) + Data(repeating: 120, count: 1_025)
+        buffer.append(contentsOf: [2, 4, 0, 0])
+        buffer.append(Data(repeating: 120, count: 1_026))
+        buffer.append(contentsOf: [8, 0])
+        var remaining = 0
+        XCTAssertNil(try CodexInboxSocket.decodeFrame(from: &buffer, maximumBytes: 1_024,
+                                                     discardRemainingBytes: &remaining))
+        XCTAssertEqual(buffer, Data([8, 0]))
+        XCTAssertEqual(remaining, 0)
+        buffer.append(contentsOf: [0, 0])
+        buffer.append(Data("{\"id\":2}".utf8))
+        XCTAssertEqual(try CodexInboxSocket.decodeFrame(from: &buffer, maximumBytes: 1_024,
+                                                      discardRemainingBytes: &remaining)?["id"] as? Int, 2)
+        buffer = Data([0, 0, 0, 0])
+        XCTAssertThrowsError(try CodexInboxSocket.decodeFrame(from: &buffer, maximumBytes: 1_024,
+                                                             discardRemainingBytes: &remaining))
+    }
+
     /// Replays an explicitly supplied private trace without checking dialogue into the repository.
     func testOptInRecordedDesktopTrace() throws {
         guard let tracePath = ProcessInfo.processInfo.environment["MYTYPE_CODEX_TRACE_PATH"] else {
@@ -842,6 +974,35 @@ final class CodexDesktopNotificationTests: XCTestCase {
             }
         }
         await fulfillment(of: [received], timeout: 15)
+        task.cancel()
+        await task.value
+    }
+
+    /// Keeps the real all-session observer alive across rediscovery and checks an explicitly selected active thread.
+    @MainActor
+    func testOptInStableDesktopInboxWithImageHistory() async throws {
+        guard let id = ProcessInfo.processInfo.environment["MYTYPE_CODEX_EXPECT_STABLE_SESSION_ID"],
+              UUID(uuidString: id) != nil else {
+            throw XCTSkip("Stable passive inbox verification requires an explicit active desktop session")
+        }
+        let inbox = AgentInboxStore()
+        let source = CodexDesktopNotificationSource()
+        var unavailableCount = 0
+        let task = Task {
+            await source.run { update in
+                await MainActor.run {
+                    inbox.apply(update)
+                    if update.session.sessionID == id, update.status == .unknown { unavailableCount += 1 }
+                }
+            }
+        }
+        defer { task.cancel() }
+        try await Task.sleep(for: .seconds(35))
+        let current = inbox.items.first { $0.session.sessionID == id }
+        XCTAssertEqual(current?.status, .running)
+        XCTAssertEqual(unavailableCount, 0)
+        print("PASSIVE_INBOX_STABILITY duration=35 status=\(current?.status.rawValue ?? "missing") "
+            + "unavailable=\(unavailableCount) items=\(inbox.items.count)")
         task.cancel()
         await task.value
     }

@@ -75,6 +75,7 @@ enum AgentsViewSearchError: LocalizedError, Equatable, Sendable {
     case responseTooLarge
     case networkFailure(code: Int)
     case indexUpdating
+    case messageTimeFilterUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -98,6 +99,8 @@ enum AgentsViewSearchError: LocalizedError, Equatable, Sendable {
             return L("本地会话搜索连接失败（\(code)）。", "The local session-search connection failed (\(code)).")
         case .indexUpdating:
             return L("会话索引尚未确认完整，部分内容可能还未加入，请查看索引状态。", "Index coverage is not yet confirmed. Some content may be missing; check the index status.")
+        case .messageTimeFilterUnavailable:
+            return L("当前搜索服务暂不支持按对话时间查找。", "The current search service cannot filter by conversation time.")
         }
     }
 }
@@ -112,6 +115,8 @@ actor AgentsViewSearchService {
         var maximumResponseBytes = 262_144
         var maximumQueryCharacters = 512
         var maximumResults = 20
+        var maximumWakeSearchHits = 120
+        var maximumWakeResponseBytes = 1_048_576
         var maximumSnippetCharacters = 400
         var maximumSessionIdentifierCharacters = 256
         var maximumOrdinalRangeEntries = 32
@@ -156,6 +161,7 @@ actor AgentsViewSearchService {
                   resourceTimeoutSeconds.isFinite, resourceTimeoutSeconds >= requestTimeoutSeconds,
                   resourceTimeoutSeconds <= Self.maximumTimeoutSeconds,
                   maximumResponseBytes > 0, maximumQueryCharacters > 0, maximumResults > 0,
+                  (1...500).contains(maximumWakeSearchHits), (1...4_194_304).contains(maximumWakeResponseBytes),
                   maximumSnippetCharacters > 0, maximumSessionIdentifierCharacters > 0,
                   maximumOrdinalRangeEntries > 0,
                   let url = components.url else { throw AgentsViewSearchError.invalidConfiguration }
@@ -165,6 +171,12 @@ actor AgentsViewSearchService {
 
     private struct Response: Decodable {
         let matches: [AgentsViewSearchHit]
+        let messageTimeFilterApplied: Bool?
+
+        private enum CodingKeys: String, CodingKey {
+            case matches
+            case messageTimeFilterApplied = "message_time_filter_applied"
+        }
     }
 
     static let shared = AgentsViewSearchService()
@@ -200,6 +212,24 @@ actor AgentsViewSearchService {
         return try await search(query, agent: nil, configuration: settings.get())
     }
 
+    /// Searches an already resolved topic with independent source and message-time constraints.
+    ///
+    /// Args:
+    ///   query: Topic and metadata resolved by the wake router, including any explicit refinement.
+    ///
+    /// Returns:
+    ///   Distinct conversations with evidence satisfying every explicit constraint.
+    ///
+    /// Raises:
+    ///   Error: Transport, configuration or unsupported message-time filtering failed.
+    func search(_ query: AgentSearchQuery) async throws -> [AgentsViewSearchHit] {
+        var configuration = try settings.get()
+        configuration.maximumResults = configuration.maximumWakeSearchHits
+        configuration.maximumResponseBytes = configuration.maximumWakeResponseBytes
+        return try await search(query.text, agent: query.agent, configuration: configuration,
+                                messageInterval: query.messageInterval, timezoneIdentifier: query.timezoneIdentifier)
+    }
+
     /// Retrieves a finite wider pool for handoff suggestions without changing normal wake search.
     ///
     /// Args:
@@ -231,6 +261,8 @@ actor AgentsViewSearchService {
     ///   query: Search text, kept on the loopback service.
     ///   agent: Optional validated provider filter.
     ///   configuration: Transport and result bounds.
+    ///   messageInterval: Optional matching-message dates, with an exclusive end.
+    ///   timezoneIdentifier: User time zone used to resolve relative dates.
     ///
     /// Returns:
     ///   Sanitized, session-deduplicated search leads.
@@ -238,13 +270,15 @@ actor AgentsViewSearchService {
     /// Raises:
     ///   Error: Validation, cancellation or transport failure.
     private func search(
-        _ query: String, agent: String?, configuration: Configuration
+        _ query: String, agent: String?, configuration: Configuration,
+        messageInterval: DateInterval? = nil, timezoneIdentifier: String? = nil
     ) async throws -> [AgentsViewSearchHit] {
         try Task.checkCancellation()
         let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return [] }
+        guard !value.isEmpty || messageInterval != nil else { return [] }
         guard value.count <= configuration.maximumQueryCharacters else { throw AgentsViewSearchError.queryTooLong }
-        let request = try Self.request(query: value, configuration: configuration, agent: agent)
+        let request = try Self.request(query: value, configuration: configuration, agent: agent,
+                                       messageInterval: messageInterval, timezoneIdentifier: timezoneIdentifier)
         let transport = URLSessionConfiguration.ephemeral
         transport.connectionProxyDictionary = [:]
         transport.urlCache = nil
@@ -274,7 +308,8 @@ actor AgentsViewSearchService {
                     body.append(byte)
                 }
                 try Task.checkCancellation()
-                return try Self.decodeResponse(Data(body), configuration: configuration)
+                return try Self.decodeResponse(Data(body), configuration: configuration,
+                                                agent: agent, messageInterval: messageInterval)
             } onCancel: {
                 session.invalidateAndCancel()
             }
@@ -296,12 +331,14 @@ actor AgentsViewSearchService {
         }
     }
 
-    /// Builds only the documented local content-search request, without launch instructions.
+    /// Builds a local content-search request, including this fork's message-time extension.
     ///
     /// Args:
     ///   query: Validated user request.
     ///   configuration: Endpoint, deadline and result bounds.
-    ///   agent: Optional provider allowlist constraint for one handoff role.
+    ///   agent: Optional owning-provider constraint for wake or handoff lookup.
+    ///   messageInterval: Optional half-open bounds on the matching message, not the session lifetime.
+    ///   timezoneIdentifier: User timezone retained independently of the UTC request bounds.
     ///
     /// Returns:
     ///   An HTTP GET request with explicit semantic-search consent for the local index.
@@ -309,7 +346,8 @@ actor AgentsViewSearchService {
     /// Raises:
     ///   AgentsViewSearchError: The endpoint is not a numeric loopback root URL.
     nonisolated static func request(
-        query: String, configuration: Configuration, agent: String? = nil
+        query: String, configuration: Configuration, agent: String? = nil,
+        messageInterval: DateInterval? = nil, timezoneIdentifier: String? = nil
     ) throws -> URLRequest {
         let endpoint = try configuration.validatedEndpoint()
         guard query.count <= configuration.maximumQueryCharacters else { throw AgentsViewSearchError.queryTooLong }
@@ -317,15 +355,32 @@ actor AgentsViewSearchService {
             throw AgentsViewSearchError.invalidConfiguration
         }
         components.path = "/api/v1/search/content"
+        let timeOnly = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && messageInterval != nil
         components.queryItems = [
-            URLQueryItem(name: "pattern", value: query), URLQueryItem(name: "mode", value: "hybrid"),
-            URLQueryItem(name: "scope", value: "top"), URLQueryItem(name: "in", value: "messages"),
+            URLQueryItem(name: "pattern", value: timeOnly ? "." : query),
+            URLQueryItem(name: "mode", value: timeOnly ? "regex" : "hybrid"),
+            URLQueryItem(name: "in", value: "messages"),
             URLQueryItem(name: "include_one_shot", value: "true"), URLQueryItem(name: "exclude_system", value: "true"),
             URLQueryItem(name: "limit", value: String(configuration.maximumResults)),
         ]
+        if !timeOnly { components.queryItems?.append(URLQueryItem(name: "scope", value: "top")) }
         if let agent {
             guard ["codex", "claude"].contains(agent) else { throw AgentsViewSearchError.invalidConfiguration }
             components.queryItems?.append(URLQueryItem(name: "agent", value: agent))
+        }
+        if let messageInterval {
+            guard messageInterval.duration > 0, messageInterval.duration.isFinite,
+                  messageInterval.start.timeIntervalSince1970.isFinite,
+                  messageInterval.end.timeIntervalSince1970.isFinite else {
+                throw AgentsViewSearchError.invalidConfiguration
+            }
+            let formatter = ISO8601DateFormatter()
+            components.queryItems?.append(URLQueryItem(name: "message_from", value: formatter.string(from: messageInterval.start)))
+            components.queryItems?.append(URLQueryItem(name: "message_to", value: formatter.string(from: messageInterval.end)))
+        }
+        if let timezoneIdentifier {
+            guard TimeZone(identifier: timezoneIdentifier) != nil else { throw AgentsViewSearchError.invalidConfiguration }
+            components.queryItems?.append(URLQueryItem(name: "timezone", value: timezoneIdentifier))
         }
         // Go's query decoder treats literal plus signs as spaces; preserve the user's text.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
@@ -343,21 +398,33 @@ actor AgentsViewSearchService {
     /// Args:
     ///   data: Bounded backend JSON payload.
     ///   configuration: Result, snippet and identifier bounds.
+    ///   agent: Optional owning-provider restriction, independently rechecked after transport.
+    ///   messageInterval: Optional half-open interval requiring an explicit backend capability receipt.
     ///
     /// Returns:
     ///   At most the configured number of distinct provider-qualified sessions.
     ///
     /// Raises:
     ///   AgentsViewSearchError: The response schema or required evidence is invalid.
-    nonisolated static func decodeResponse(_ data: Data, configuration: Configuration) throws -> [AgentsViewSearchHit] {
+    nonisolated static func decodeResponse(
+        _ data: Data, configuration: Configuration, agent: String? = nil, messageInterval: DateInterval? = nil
+    ) throws -> [AgentsViewSearchHit] {
         _ = try configuration.validatedEndpoint()
         guard data.count <= configuration.maximumResponseBytes else { throw AgentsViewSearchError.responseTooLarge }
         let decoded: Response
         do { decoded = try JSONDecoder().decode(Response.self, from: data) }
         catch { throw AgentsViewSearchError.invalidResponse }
+        if messageInterval != nil, decoded.messageTimeFilterApplied != true {
+            throw AgentsViewSearchError.messageTimeFilterUnavailable
+        }
         var hits: [AgentsViewSearchHit] = []
         var indexes: [String: Int] = [:]
         for hit in decoded.matches {
+            guard agent == nil || hit.agent == agent else { continue }
+            if let messageInterval {
+                guard let timestamp = hit.timestamp, timestamp >= messageInterval.start,
+                      timestamp < messageInterval.end else { continue }
+            }
             guard !hit.sessionID.isEmpty, hit.sessionID.count <= configuration.maximumSessionIdentifierCharacters,
                   !hit.sessionID.contains("\0"), ["codex", "claude"].contains(hit.agent),
                   hit.ordinal.map({ $0 >= 0 }) ?? true,

@@ -504,6 +504,7 @@ struct MenuBarControlCenterView: View {
                         }
                     }
                 }
+                .disabled(appState.barPhase == .processing && !RecognitionSession.supportsBufferedRecording(mode))
             }
             Divider()
             Button(L("管理模式…", "Manage Modes…")) {
@@ -733,7 +734,11 @@ struct MenuBarControlCenterView: View {
     }
 
     private var canStartRecording: Bool {
-        MenuBarPresentation.canStartRecording(in: appState.barPhase)
+        MenuBarPresentation.canStartRecording(
+            in: appState.barPhase,
+            permitsOverlap: appState.activityKind == .standard
+                && RecognitionSession.supportsBufferedRecording(appState.currentMode)
+        )
     }
 
     private var runtimeSettingsLocked: Bool {
@@ -842,7 +847,13 @@ struct MenuBarControlCenterView: View {
 }
 
 enum MenuBarPresentation {
-    static func canStartRecording(in phase: FloatingBarPhase) -> Bool {
+    /// Allows a text capture to overlap processing while exclusive actions remain blocked.
+    ///
+    /// Args:
+    ///   phase: Current floating-bar activity.
+    ///   permitsOverlap: Whether the current mode is eligible for buffered capture.
+    static func canStartRecording(in phase: FloatingBarPhase, permitsOverlap: Bool = false) -> Bool {
+        if phase == .processing { return permitsOverlap }
         switch phase {
         case .focusWaiting, .hidden, .done, .error:
             return true

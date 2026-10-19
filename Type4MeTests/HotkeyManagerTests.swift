@@ -261,6 +261,22 @@ final class HotkeyManagerTests: XCTestCase {
         XCTAssertFalse(passedThrough)
     }
 
+    /// Verifies an admitted ordinary recording can start while earlier text is processing.
+    func testProcessingFlagAllowsExplicitlyAdmittedTextCapture() {
+        let manager = makeManager()
+        let modeId = UUID()
+        let recorder = CallbackRecorder()
+        manager.registerBindings([makeBinding(
+            modeId: modeId, keyCode: 18, modifiers: .maskCommand,
+            onStart: { recorder.start(modeId) }, onStop: { recorder.stop(modeId) }
+        )])
+        manager.isProcessing = true
+        manager.canStartDuringProcessing = { $0 == .mode(modeId) }
+        _ = sendKeyDown(to: manager, keyCode: 18, flags: .maskCommand)
+        XCTAssertEqual(recorder.started, [modeId])
+        XCTAssertTrue(manager.isProcessing, "Starting capture must not mark old polishing complete")
+    }
+
     /// Verifies that a menu-started Revise recording stops on its first Revise shortcut press.
     func testExternalReviseOwnerStopsOnFirstMatchingHotkeyPress() {
         let manager = makeManager()

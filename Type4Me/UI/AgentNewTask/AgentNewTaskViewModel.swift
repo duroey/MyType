@@ -22,7 +22,7 @@ enum AgentNewTaskCopy {
         case .title: pair = ("新建 Agent", "New agent")
         case .task: pair = ("让它做什么", "What should it do?")
         case .project: pair = ("在哪个项目", "Project")
-        case .independent: pair = ("独立任务", "Independent task")
+        case .independent: pair = ("无文件夹", "No Folder")
         case .chooseProject: pair = ("请选择项目", "Choose a project")
         case .chooseFolder: pair = ("选择其他项目…", "Choose another project…")
         case .application: pair = ("使用", "Use")
@@ -34,7 +34,7 @@ enum AgentNewTaskCopy {
         case .invalidTask: pair = ("请填写简短的任务要求。", "Enter a short task request.")
         case .failed: pair = ("未能确认打开，请查看对应应用后再试。", "Opening was not confirmed. Check the app before retrying.")
         case .projectHint: pair = ("新会话使用项目文件，发送后开始。", "The new conversation uses this project's files. Send there to begin.")
-        case .independentHint: pair = ("自动安排独立空间，发送后开始。", "A separate workspace will be prepared. Send there to begin.")
+        case .independentHint: pair = ("不关联已有项目，发送后开始。", "No existing project is selected. Send there to begin.")
         case .chooseApplication: pair = ("请选择应用", "Choose an app")
         case .notInstalled: pair = ("未安装", "Not installed")
         }
@@ -46,8 +46,8 @@ enum AgentNewTaskCopy {
 @MainActor
 final class AgentNewTaskViewModel: ObservableObject {
     typealias Preparer = @Sendable (String, AgentNewTaskContext) async throws -> AgentNewTaskPreparation
-    typealias WorkspaceResolver = @Sendable (String, UUID) async throws -> URL
-    typealias Opener = @Sendable (AgentDesktopApplication, URL, String) async throws -> Void
+    typealias WorkspaceResolver = @Sendable (String, UUID) async throws -> AgentNewTaskDestination
+    typealias Opener = @Sendable (AgentDesktopApplication, AgentNewTaskDestination, String) async throws -> Void
 
     @Published var text = ""
     @Published var projectID: String?
@@ -77,7 +77,7 @@ final class AgentNewTaskViewModel: ObservableObject {
         workspace: @escaping WorkspaceResolver = { project, id in
             try await Task.detached { try AgentNewTaskWorkspace().resolve(projectID: project, draftID: id) }.value
         },
-        open: @escaping Opener = { try await AgentDesktopLauncherService.shared.openNewTask(application: $0, projectURL: $1, prompt: $2) },
+        open: @escaping Opener = { try await AgentDesktopLauncherService.shared.openNewTask(application: $0, destination: $1, prompt: $2) },
         maximumPromptUTF16: Int = AgentDesktopLauncherService.Configuration().maximumNewTaskPromptUTF16Units
     ) {
         self.prepare = prepare

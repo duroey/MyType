@@ -32,6 +32,132 @@ final class ClaudeDesktopNotificationTests: XCTestCase {
         XCTAssertNil(cycle.completion(tail: finalTail(), status: "idle"))
     }
 
+    /// Verifies an ordinary final reply completes even when its one-shot idle push was lost.
+    func testOrdinaryEndTurnCompletesWithoutPush() throws {
+        let tail = ClaudeDesktopNotificationSource.visibleTail(
+            data: try transcriptRow(blocks: [["type": "text", "text": "普通回复已结束。"]]),
+            engineID: engineID, maximumCharacters: 1_000)
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        cycle.observe(try registry(status: "busy"))
+        let idle = try registry(status: "idle", timestamp: 103_000)
+        cycle.observe(idle)
+        let update = ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: session, tail: tail, cycle: &cycle)
+        XCTAssertEqual(update.status, .completed)
+        XCTAssertEqual(update.completionID, "answer")
+        XCTAssertEqual(update.preview, "普通回复已结束。")
+        XCTAssertNil(ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: session, tail: tail,
+                                                                     cycle: &cycle).completionID)
+    }
+
+    /// Verifies a delayed transcript can recover unknown state without another busy event or push.
+    func testDelayedOrdinaryReplyRecoversUnknownState() throws {
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        cycle.observe(try registry(status: "busy"))
+        let idle = try registry(status: "idle", timestamp: 103_000)
+        cycle.observe(idle)
+        let unknown = ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: session,
+                                                                       tail: .init(), cycle: &cycle)
+        XCTAssertEqual(unknown.status, .unknown)
+        let tail = ClaudeDesktopNotificationSource.visibleTail(
+            data: try transcriptRow(blocks: [["type": "text", "text": "稍后写入的最终回复"]]),
+            engineID: engineID, maximumCharacters: 1_000)
+        cycle.observe(idle)
+        let recovered = ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: session,
+                                                                         tail: tail, cycle: &cycle)
+        XCTAssertEqual(recovered.status, .completed)
+        XCTAssertEqual(recovered.completionID, "answer")
+    }
+
+    /// Verifies startup history, a different turn and unfinished tool work never become completion.
+    func testOrdinaryEndTurnMustMatchObservedIdleWindow() throws {
+        let tail = ClaudeDesktopNotificationSource.visibleTail(
+            data: try transcriptRow(blocks: [["type": "text", "text": "完成"]]),
+            engineID: engineID, maximumCharacters: 1_000)
+        for (busy, idleTime, status) in [(nil as Double?, 103_000.0, "idle"),
+                                       (104_000, 105_000, "idle"), (100_000, 101_000, "idle"),
+                                       (100_000, 103_000, "waiting"), (100_000, 103_000, "busy")] {
+            var cycle = ClaudeDesktopNotificationSource.Cycle()
+            if let busy { cycle.observe(try registry(status: "busy", timestamp: busy)) }
+            cycle.observe(try registry(status: status, timestamp: idleTime))
+            XCTAssertNil(cycle.completion(tail: tail, status: status))
+        }
+        for blocks: [[String: Any]] in [
+            [["type": "thinking", "thinking": "内部思考"]],
+            [["type": "text", "text": "继续执行"], ["type": "tool_use", "id": "tool", "name": "Bash", "input": [:]]],
+        ] {
+            var cycle = ClaudeDesktopNotificationSource.Cycle()
+            cycle.observe(try registry(status: "busy"))
+            cycle.observe(try registry(status: "idle", timestamp: 103_000))
+            let invalid = ClaudeDesktopNotificationSource.visibleTail(data: try transcriptRow(blocks: blocks),
+                                                                      engineID: engineID, maximumCharacters: 1_000)
+            XCTAssertNil(cycle.completion(tail: invalid, status: "idle"))
+        }
+    }
+
+    /// Verifies an API error cannot masquerade as a successfully finished ordinary reply.
+    func testAPIErrorCannotCompleteOrdinaryTurn() throws {
+        var row = try XCTUnwrap(JSONSerialization.jsonObject(with: transcriptRow(blocks: [["type": "text", "text": "API error"]])) as? [String: Any])
+        row["isApiErrorMessage"] = true
+        let tail = ClaudeDesktopNotificationSource.visibleTail(data: try JSONSerialization.data(withJSONObject: row),
+                                                               engineID: engineID, maximumCharacters: 1_000)
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        cycle.observe(try registry(status: "busy"))
+        cycle.observe(try registry(status: "idle", timestamp: 103_000))
+        XCTAssertNil(cycle.completion(tail: tail, status: "idle"))
+    }
+
+    /// Verifies temporary registry/signature unavailability retains only same-process cycle evidence.
+    func testRegistryReadRecoveryCompletesOnlyOriginalRuntime() throws {
+        let tail = ClaudeDesktopNotificationSource.visibleTail(
+            data: try transcriptRow(blocks: [["type": "text", "text": "完成"]]),
+            engineID: engineID, maximumCharacters: 1_000)
+        let idle = try registry(status: "idle", timestamp: 103_000)
+        for temporarilyUnverified in [false, true] {
+            var item = ClaudeDesktopNotificationSource.Tracked(session: session, inbox: inbox,
+                                                                registryURL: URL(fileURLWithPath: "/unused"))
+            item.cycle.observe(try registry(status: "busy"))
+            item.identityValid = !temporarilyUnverified
+            XCTAssertFalse(item.accepts(nil, processStartSeconds: inbox.processStartSeconds))
+            item.identityValid = true
+            XCTAssertTrue(item.accepts(idle, processStartSeconds: inbox.processStartSeconds))
+            item.cycle.observe(idle)
+            XCTAssertEqual(item.cycle.completion(tail: tail, status: idle.status), "answer")
+        }
+        for changedHost in [false, true] {
+            var item = ClaudeDesktopNotificationSource.Tracked(session: session, inbox: inbox,
+                                                                registryURL: URL(fileURLWithPath: "/unused"))
+            item.cycle.observe(try registry(status: "busy"))
+            let changed = try registry(status: "idle", timestamp: 103_000, host: changedHost ? "another-host" : nil)
+            XCTAssertFalse(item.accepts(changed, processStartSeconds: inbox.processStartSeconds + (changedHost ? 0 : 1)))
+            item.cycle.observe(idle)
+            XCTAssertNil(item.cycle.completion(tail: tail, status: idle.status))
+        }
+    }
+
+    /// Verifies reopening an unchanged transcript after a failed read bypasses the invalid cache.
+    func testUnchangedTranscriptRecoversAfterTemporaryReadFailure() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("transcript.jsonl")
+        let hidden = directory.appendingPathComponent("temporarily-unavailable.jsonl")
+        try transcriptRow(blocks: [["type": "text", "text": "恢复后的回复"]]).write(to: file)
+        let source = ClaudeDesktopNotificationSource()
+        var item = ClaudeDesktopNotificationSource.Tracked(session: session, inbox: inbox, registryURL: directory,
+                                                            transcriptURL: file)
+        source.refreshTail(&item)
+        XCTAssertEqual(item.tail.finalID, "answer")
+        try FileManager.default.moveItem(at: file, to: hidden)
+        source.refreshTail(&item)
+        XCTAssertNil(item.tail.finalID)
+        try FileManager.default.moveItem(at: hidden, to: file)
+        source.refreshTail(&item)
+        XCTAssertEqual(item.tail.finalID, "answer")
+        item.cycle.observe(try registry(status: "busy"))
+        item.cycle.observe(try registry(status: "idle", timestamp: 103_000))
+        XCTAssertEqual(item.cycle.completion(tail: item.tail, status: "idle"), "answer")
+    }
+
     /// Verifies idle alone and an uncorrelated notice cannot turn busy into success.
     func testCompletionRequiresMatchingPushAndNewFinal() throws {
         var cycle = ClaudeDesktopNotificationSource.Cycle()
@@ -56,6 +182,33 @@ final class ClaudeDesktopNotificationTests: XCTestCase {
             cycle.subscriptionID = "current"
             XCTAssertTrue(cycle.receive(try notice(state: state), inbox: inbox))
             XCTAssertNil(cycle.completion(tail: finalTail(), status: "idle"))
+        }
+    }
+
+    /// Verifies subscription unavailability can recover, while an exited runtime cannot revive a turn.
+    func testUnavailableNoticeRecoversOnlyWithRevalidatedCompletion() throws {
+        let tail = ClaudeDesktopNotificationSource.visibleTail(
+            data: try transcriptRow(blocks: [["type": "text", "text": "完成"]]),
+            engineID: engineID, maximumCharacters: 1_000)
+        for state in ["unavailable", "exited"] {
+            var item = ClaudeDesktopNotificationSource.Tracked(session: session, inbox: inbox,
+                                                                registryURL: URL(fileURLWithPath: "/unused"))
+            item.cycle.observe(try registry(status: "busy"))
+            item.cycle.subscriptionID = "current"
+            item.cycle.subscriptionAttempts = 3
+            XCTAssertTrue(item.cycle.receive(try notice(state: state), inbox: inbox))
+            XCTAssertEqual(item.cycle.takeTerminalState(), state == "exited" ? .interrupted : .unknown)
+            XCTAssertEqual(item.cycle.subscriptionAttempts, state == "exited" ? 0 : 3)
+            XCTAssertNil(item.cycle.subscriptionID)
+            XCTAssertNil(item.cycle.takeTerminalState())
+            let idle = try registry(status: "idle", timestamp: 103_000)
+            item.identityValid = false
+            XCTAssertFalse(item.accepts(idle, processStartSeconds: inbox.processStartSeconds))
+            item.identityValid = true
+            XCTAssertTrue(item.accepts(idle, processStartSeconds: inbox.processStartSeconds))
+            item.cycle.observe(idle)
+            XCTAssertNil(item.cycle.completion(tail: .init(), status: idle.status))
+            XCTAssertEqual(item.cycle.completion(tail: tail, status: idle.status), state == "exited" ? nil : "answer")
         }
     }
 
@@ -319,6 +472,74 @@ final class ClaudeDesktopNotificationTests: XCTestCase {
         XCTAssertEqual(store.items.first?.pendingRequests.first?.kind, .input)
         XCTAssertFalse(store.items.first?.pendingRequests.first?.text.isEmpty ?? true)
         XCTAssertNil(update.completionID)
+    }
+
+    /// Replays an observed native busy snapshot and its real reply without sending any agent task.
+    @MainActor
+    func testOptInReadOnlyOrdinaryReplyRecovery() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let busyPath = environment["MYTYPE_CLAUDE_BUSY_SNAPSHOT"],
+              let registryPath = environment["MYTYPE_CLAUDE_REPLY_REGISTRY"] else {
+            throw XCTSkip("Set MYTYPE_CLAUDE_BUSY_SNAPSHOT and MYTYPE_CLAUDE_REPLY_REGISTRY for read-only recovery replay.")
+        }
+        let configuration = AgentNotificationConfiguration()
+        let busy = try XCTUnwrap(ClaudeDesktopNotificationSource.readRegistration(
+            URL(fileURLWithPath: busyPath), maximumBytes: configuration.maximumRegistryFileBytes))
+        let idle = try XCTUnwrap(ClaudeDesktopNotificationSource.readRegistration(
+            URL(fileURLWithPath: registryPath), maximumBytes: configuration.maximumRegistryFileBytes))
+        XCTAssertEqual(busy.status, "busy")
+        XCTAssertEqual(idle.status, "idle", "Wait for the original desktop turn to finish before replaying it.")
+        let target = AgentSessionDescriptor(sessionID: try XCTUnwrap(busy.hostSessionId), application: .claudeCode, title: "",
+                                           workspacePath: busy.cwd, updatedAt: 0, matchTexts: [],
+                                           openCapability: .claudeNativeDeepLink, engineSessionID: busy.sessionId)
+        let app = try XCTUnwrap(AgentDesktopLauncherService.shared.detectInstallation(for: .claudeCode).applicationURL)
+        let verified = try await AgentHandoffDeliveryService.findClaudeInbox(target: target, applicationURL: app,
+                                                                           configuration: .init())
+        XCTAssertTrue(busy.matches(session: target, inbox: verified))
+        XCTAssertTrue(idle.matches(session: target, inbox: verified))
+        let directory = try XCTUnwrap(idle.cwd).replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
+        let transcript = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+            .appendingPathComponent(directory).appendingPathComponent(idle.sessionId + ".jsonl")
+        let handle = try FileHandle(forReadingFrom: transcript)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let offset = size > configuration.maximumTranscriptTailBytes ? size - UInt64(configuration.maximumTranscriptTailBytes) : 0
+        try handle.seek(toOffset: offset)
+        var data = try XCTUnwrap(handle.read(upToCount: configuration.maximumTranscriptTailBytes))
+        if offset > 0, let newline = data.firstIndex(of: 10) { data = Data(data.suffix(from: data.index(after: newline))) }
+        // Replay only records available by the captured idle snapshot, even if the user continued later.
+        let idleDate = Date(timeIntervalSince1970: try XCTUnwrap(idle.statusUpdatedAt) / 1_000)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        data = data.split(separator: 10).filter { line in
+            guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let timestamp = row["timestamp"] as? String,
+                  let date = formatter.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) else { return false }
+            return date <= idleDate
+        }.reduce(into: Data()) { $0.append(contentsOf: $1); $0.append(10) }
+        let tail = ClaudeDesktopNotificationSource.visibleTail(data: data, engineID: idle.sessionId,
+                                                               maximumCharacters: configuration.maximumPreviewCharacters)
+        XCTAssertTrue(tail.ordinaryTurnEnd)
+        var initial = ClaudeDesktopNotificationSource.Cycle()
+        initial.observe(idle)
+        XCTAssertNil(initial.completion(tail: tail, status: idle.status), "Restart must not replay historical completions.")
+        var cycle = ClaudeDesktopNotificationSource.Cycle()
+        cycle.observe(busy)
+        cycle.observe(idle)
+        let unknown = ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: target,
+                                                                       tail: .init(), cycle: &cycle)
+        XCTAssertEqual(unknown.status, .unknown)
+        let completed = ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: target,
+                                                                         tail: tail, cycle: &cycle)
+        XCTAssertEqual(completed.status, .completed)
+        XCTAssertNotNil(completed.completionID)
+        let store = AgentInboxStore()
+        store.apply(unknown)
+        store.apply(completed)
+        XCTAssertEqual(store.items.first?.status, .completed)
+        XCTAssertEqual(store.items.first?.isUnread, true)
+        XCTAssertNil(ClaudeDesktopNotificationSource.reconciledUpdate(registry: idle, session: target,
+                                                                     tail: tail, cycle: &cycle).completionID)
     }
 
     /// Builds the same tool-call/receipt structure as the native desktop next-step card.

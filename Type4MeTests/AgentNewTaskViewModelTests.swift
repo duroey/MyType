@@ -18,7 +18,7 @@ final class AgentNewTaskViewModelTests: XCTestCase {
         let ready = preparation()
         let model = AgentNewTaskViewModel(prepare: { _, _ in ready }, workspace: { project, id in
             await calls.workspace(project, id: id)
-            return URL(fileURLWithPath: "/fixture/task")
+            return .project(URL(fileURLWithPath: "/fixture/task"))
         }, open: { application, directory, prompt in await calls.open(application, directory: directory, prompt: prompt) })
         XCTAssertTrue(model.begin("新开一个 Agent\n研究 A+B & C"))
         await model.load(context: context)
@@ -36,13 +36,34 @@ final class AgentNewTaskViewModelTests: XCTestCase {
         XCTAssertTrue(model.openingRequested)
     }
 
+    /// Verifies an independent suggestion reaches the launcher as No Folder for either app.
+    func testFolderlessConfirmationPreservesNativeDestinationAndTask() async {
+        for application in AgentDesktopApplication.allCases {
+            let calls = NewTaskCallRecorder()
+            let ready = AgentNewTaskPreparation(
+                projects: [], suggestedProjectID: AgentNewTaskService.independentProjectID,
+                suggestedApplication: application, installedApplications: [application], needsProjectChoice: false
+            )
+            let model = AgentNewTaskViewModel(prepare: { _, _ in ready }, open: { app, destination, text in
+                await calls.open(app, directory: destination, prompt: text)
+            })
+            _ = model.begin("整理这次研究\nA+B & C")
+            await model.load(context: context)
+            let opened = await model.openConfirmedDraft()
+            XCTAssertTrue(opened)
+            let result = await calls.snapshot()
+            XCTAssertEqual(result.destinations, [.nativeNoFolder])
+            XCTAssertEqual(result.prompts, ["整理这次研究\nA+B & C"])
+        }
+    }
+
     /// Verifies a failed opening does not allocate a different workspace on an explicit retry.
     func testRetryUsesSameDraftWorkspace() async {
         let calls = NewTaskCallRecorder()
         let ready = preparation()
         let model = AgentNewTaskViewModel(prepare: { _, _ in ready }, workspace: { project, id in
             await calls.workspace(project, id: id)
-            return URL(fileURLWithPath: "/fixture/task")
+            return .project(URL(fileURLWithPath: "/fixture/task"))
         }, open: { _, _, _ in throw AgentDesktopLauncherError.launchFailed(.codex) })
         _ = model.begin("新建任务")
         await model.load(context: context)
@@ -60,7 +81,7 @@ final class AgentNewTaskViewModelTests: XCTestCase {
         let ready = preparation(application: .claudeCode)
         let model = AgentNewTaskViewModel(prepare: { _, _ in ready }, workspace: { _, _ in
             XCTFail("Must not allocate storage")
-            return URL(fileURLWithPath: "/fixture")
+            return .project(URL(fileURLWithPath: "/fixture"))
         }, open: { _, _, _ in XCTFail("Must not open") }, maximumPromptUTF16: 10)
         _ = model.begin("新建任务")
         await model.load(context: context)
@@ -131,19 +152,25 @@ final class AgentNewTaskViewModelTests: XCTestCase {
 private actor NewTaskCallRecorder {
     private var workspaces: [(String, UUID)] = []
     private var prompts: [String] = []
+    private var destinations: [AgentNewTaskDestination] = []
     /// Records allocation requests without creating directories.
     func workspace(_ project: String, id: UUID) { workspaces.append((project, id)) }
     /// Records native opening arguments without launching applications.
-    func open(_ application: AgentDesktopApplication, directory: URL, prompt: String) { prompts.append(prompt) }
+    func open(_ application: AgentDesktopApplication, directory: AgentNewTaskDestination, prompt: String) {
+        destinations.append(directory)
+        prompts.append(prompt)
+    }
     /// Returns immutable call observations for assertions.
-    func snapshot() -> (workspaces: [(String, UUID)], prompts: [String]) { (workspaces, prompts) }
+    func snapshot() -> (workspaces: [(String, UUID)], prompts: [String], destinations: [AgentNewTaskDestination]) {
+        (workspaces, prompts, destinations)
+    }
 }
 
 private actor NewTaskWorkspaceGate {
-    private var continuation: CheckedContinuation<URL, Never>?
+    private var continuation: CheckedContinuation<AgentNewTaskDestination, Never>?
     private var entry: CheckedContinuation<Void, Never>?
     /// Holds the workspace result so cancellation can be exercised deterministically.
-    func wait() async -> URL {
+    func wait() async -> AgentNewTaskDestination {
         await withCheckedContinuation { continuation in
             self.continuation = continuation
             entry?.resume(); entry = nil
@@ -155,7 +182,7 @@ private actor NewTaskWorkspaceGate {
         await withCheckedContinuation { entry = $0 }
     }
     /// Releases storage preparation without touching the filesystem.
-    func release() { continuation?.resume(returning: URL(fileURLWithPath: "/fixture/task")); continuation = nil }
+    func release() { continuation?.resume(returning: .project(URL(fileURLWithPath: "/fixture/task"))); continuation = nil }
 }
 
 private actor NewTaskPreparationGate {

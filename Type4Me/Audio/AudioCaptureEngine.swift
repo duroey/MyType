@@ -145,6 +145,8 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
     private var buffer = Data()
     private var frameBuffer = Data()
     private var accumulatedAudio = Data()
+    /// Disable before starting when a bounded external queue owns the complete audio.
+    var retainsRecordedAudio = true
     private var converter: AVAudioConverter?
     private let outputQueue = DispatchQueue(label: "com.mytype.audiocapture")
     private let outputQueueKey = DispatchSpecificKey<UInt8>()
@@ -421,7 +423,7 @@ final class AudioCaptureEngine: NSObject, @unchecked Sendable, AVCaptureAudioDat
         let chunk = Data(bytes: mData, count: byteCount)
 
         bufferLock.lock()
-        accumulatedAudio.append(chunk)
+        if retainsRecordedAudio { accumulatedAudio.append(chunk) }
         frameBuffer.append(chunk)
         buffer.append(chunk)
         emitFullFrames()

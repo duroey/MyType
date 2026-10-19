@@ -1,0 +1,16 @@
+{
+  "vendorID": 12037,
+  "productID": 59,
+  "reportID": 6,
+  "pressedReport": [6, 2, 0],
+  "releasedReport": [6, 0, 0],
+  "duplicateWindowSeconds": 0.2,
+  "cooldownSeconds": 0.6,
+  "returnDelaySeconds": 0.15,
+  "refreshSeconds": 2.0,
+  "axTimeoutSeconds": 0.1,
+  "maximumInputReportBytes": 64,
+  "lockFileName": "local.boya.go-button.lock",
+  "text": "Go",
+  "returnKeyCode": 36
+}

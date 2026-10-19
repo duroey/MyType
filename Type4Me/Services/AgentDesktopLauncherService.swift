@@ -50,6 +50,7 @@ enum AgentDesktopLauncherError: LocalizedError, Equatable {
     case promptTooLong
     case launchFailed(AgentDesktopApplication)
     case launchTimedOut(AgentDesktopApplication)
+    case nativeNoFolderUnavailable(AgentDesktopApplication)
 
     var errorDescription: String? { message(language: AppLanguage.current) }
 
@@ -95,6 +96,10 @@ enum AgentDesktopLauncherError: LocalizedError, Equatable {
             return isChinese
                 ? "打开 \(application.displayName) 超时，请检查应用后重试。"
                 : "Opening \(application.displayName) timed out. Check the app and try again."
+        case .nativeNoFolderUnavailable(let application):
+            return isChinese
+                ? "暂时无法在 \(application.displayName) 中打开无文件夹任务，请在该应用中选择 No Folder。"
+                : "Could not open a folderless task in \(application.displayName). Choose No Folder in that app."
         }
     }
 }
@@ -126,6 +131,7 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
     typealias ApplicationValidator = @Sendable (URL, String) -> Bool
     typealias ExecutableValidator = @Sendable (URL) -> Bool
     typealias ApplicationOpener = @Sendable (URL, URL?) async throws -> Void
+    typealias NativeNoFolderOpener = @Sendable (URL, String) async throws -> Void
     typealias CommandRunner = @Sendable (URL, [String], URL?, TimeInterval) async throws -> CommandResult
 
     static let shared = AgentDesktopLauncherService()
@@ -137,6 +143,7 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
     private let applicationValidator: ApplicationValidator
     private let executableValidator: ExecutableValidator
     private let applicationOpener: ApplicationOpener
+    private let nativeNoFolderOpener: NativeNoFolderOpener
     private let commandRunner: CommandRunner
     private let fileManager: FileManager
 
@@ -151,6 +158,7 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
     ///   applicationValidator: Validator for existing apps and their bundle identity.
     ///   executableValidator: Validator for optional command executables.
     ///   applicationOpener: Opener that targets the detected app explicitly.
+    ///   nativeNoFolderOpener: Verified native Codex folderless draft route.
     ///   commandRunner: Optional bounded command runner injected by tests.
     init(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -176,6 +184,9 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
                 destinationURL: destinationURL
             )
         },
+        nativeNoFolderOpener: @escaping NativeNoFolderOpener = {
+            try await CodexNativeNoFolderService.shared.open(applicationURL: $0, prompt: $1)
+        },
         commandRunner: CommandRunner? = nil
     ) {
         self.homeDirectory = homeDirectory.standardizedFileURL
@@ -189,6 +200,7 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
         self.applicationValidator = applicationValidator
         self.executableValidator = executableValidator
         self.applicationOpener = applicationOpener
+        self.nativeNoFolderOpener = nativeNoFolderOpener
         self.commandRunner = commandRunner ?? { executable, arguments, projectURL, timeout in
             await AgentDesktopLauncherService.runCommand(
                 executable: executable,
@@ -321,11 +333,37 @@ final class AgentDesktopLauncherService: @unchecked Sendable {
         try await openApplication(applicationURL, destinationURL: destinationURL, application: application)
     }
 
+    /// Opens an explicit destination without substituting a directory for No Folder.
+    ///
+    /// Args:
+    ///   application: Native desktop application selected by the user.
+    ///   destination: Existing project or the application's own folderless mode.
+    ///   prompt: Exact draft text, never automatically submitted.
+    ///
+    /// Raises:
+    ///   AgentDesktopLauncherError: The requested native destination cannot be opened.
+    func openNewTask(application: AgentDesktopApplication, destination: AgentNewTaskDestination, prompt: String) async throws {
+        switch destination {
+        case .project(let projectURL):
+            try await openNewTask(application: application, projectURL: projectURL, prompt: prompt)
+        case .nativeNoFolder:
+            try Task.checkCancellation()
+            _ = try Self.destinationURL(for: application, prompt: prompt, configuration: configuration)
+            guard let applicationURL = detectInstallation(for: application).applicationURL else {
+                throw AgentDesktopLauncherError.applicationNotInstalled(application)
+            }
+            guard application == .codex else {
+                throw AgentDesktopLauncherError.nativeNoFolderUnavailable(application)
+            }
+            try await nativeNoFolderOpener(applicationURL, prompt)
+        }
+    }
+
     /// Opens a native new-task composer with the exact task and existing workspace.
     ///
     /// Args:
     ///   application: Official desktop app chosen for the new task.
-    ///   projectURL: Existing project or MyType-managed task directory.
+    ///   projectURL: Explicitly selected existing project directory.
     ///   prompt: Complete task text to prefill; it is never trimmed or submitted.
     ///
     /// Returns:

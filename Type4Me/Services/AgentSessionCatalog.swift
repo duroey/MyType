@@ -74,6 +74,20 @@ struct AgentSessionDescriptor: Codable, Equatable, Identifiable, Sendable {
 struct AgentSessionCatalogSnapshot: Equatable, Sendable {
     let sessions: [AgentSessionDescriptor]
     let unavailableApplications: [AgentDesktopApplication]
+    let absentApplications: [AgentDesktopApplication]
+
+    /// Distinguishes an unused provider from a catalog that exists but could not be read.
+    ///
+    /// Args:
+    ///   sessions: Native conversations available for exact identity mapping.
+    ///   unavailableApplications: Providers without a readable catalog or supported opening route.
+    ///   absentApplications: Providers with no local native metadata yet.
+    init(sessions: [AgentSessionDescriptor], unavailableApplications: [AgentDesktopApplication],
+         absentApplications: [AgentDesktopApplication] = []) {
+        self.sessions = sessions
+        self.unavailableApplications = unavailableApplications
+        self.absentApplications = absentApplications
+    }
 }
 
 enum AgentSessionCatalogError: Error, Equatable {
@@ -111,12 +125,17 @@ final class AgentSessionCatalog: @unchecked Sendable {
         try Task.checkCancellation()
         var sessions: [AgentSessionDescriptor] = []
         var unavailable: [AgentDesktopApplication] = []
+        var absent: [AgentDesktopApplication] = []
         do {
             sessions += try codexLoader().filter { $0.application == .codex }
         } catch is CancellationError {
             throw CancellationError()
+        } catch AgentSessionCatalogError.metadataUnavailable {
+            unavailable.append(.codex)
+            absent.append(.codex)
         } catch {
             unavailable.append(.codex)
+            DebugFileLogger.log("agent catalog provider=codex available=false error_code=\((error as NSError).code)")
         }
         try Task.checkCancellation()
         do {
@@ -127,9 +146,13 @@ final class AgentSessionCatalog: @unchecked Sendable {
             }
         } catch is CancellationError {
             throw CancellationError()
+        } catch AgentSessionCatalogError.metadataUnavailable {
+            unavailable.append(.claudeCode)
+            absent.append(.claudeCode)
         } catch {
             // Native metadata is optional; a failed provider must not hide Codex candidates.
             unavailable.append(.claudeCode)
+            DebugFileLogger.log("agent catalog provider=claude available=false error_code=\((error as NSError).code)")
         }
         try Task.checkCancellation()
         var unique: [String: AgentSessionDescriptor] = [:]
@@ -141,7 +164,7 @@ final class AgentSessionCatalog: @unchecked Sendable {
             sessions: unique.values.sorted {
                 $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt
             },
-            unavailableApplications: unavailable
+            unavailableApplications: unavailable, absentApplications: absent
         )
     }
 }

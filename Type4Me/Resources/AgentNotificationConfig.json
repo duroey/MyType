@@ -6,7 +6,7 @@
   "claudeReconcileIntervalSeconds": 2,
   "codexReadReconcileIntervalSeconds": 2,
   "maximumCodexReadRefreshes": 4,
-  "maximumFrameBytes": 16777216,
+  "maximumFrameBytes": 33554432,
   "maximumCodexStateBytes": 67108864,
   "maximumSnapshotRetries": 3,
   "maximumSessions": 256,

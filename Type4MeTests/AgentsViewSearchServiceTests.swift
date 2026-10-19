@@ -6,6 +6,79 @@ final class AgentsViewSearchServiceTests: XCTestCase {
     private let codexID = "11111111-1111-4111-8111-111111111111"
     private let claudeID = "22222222-2222-4222-8222-222222222222"
 
+    /// Sends source and exact message bounds separately from the topic embedding text.
+    ///
+    /// Raises:
+    ///   Error: A deterministic local request could not be constructed.
+    func testMessageTimeAndAgentAreIndependentRequestConstraints() throws {
+        let start = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-14T16:00:00Z"))
+        let end = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-15T16:00:00Z"))
+        let request = try AgentsViewSearchService.request(
+            query: "MyType", configuration: .init(), agent: "codex",
+            messageInterval: DateInterval(start: start, end: end), timezoneIdentifier: "Asia/Shanghai"
+        )
+        let components = try XCTUnwrap(URLComponents(url: XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+        let values = Dictionary((components.queryItems ?? []).map { ($0.name, $0.value ?? "") },
+                                uniquingKeysWith: { first, _ in first })
+        XCTAssertEqual(values["pattern"], "MyType")
+        XCTAssertEqual(values["agent"], "codex")
+        XCTAssertEqual(values["message_from"], "2026-10-14T16:00:00Z")
+        XCTAssertEqual(values["message_to"], "2026-10-15T16:00:00Z")
+        XCTAssertEqual(values["timezone"], "Asia/Shanghai")
+        XCTAssertNil(values["date"], "Session lifetime overlap must not impersonate matched-message time")
+    }
+
+    /// Rejects an old helper that silently ignores unknown message-time parameters.
+    ///
+    /// Raises:
+    ///   Error: Fixture serialization failed.
+    func testMessageTimeRequiresBackendCapabilityReceipt() throws {
+        let interval = DateInterval(start: Date(timeIntervalSince1970: 10), end: Date(timeIntervalSince1970: 20))
+        XCTAssertThrowsError(try AgentsViewSearchService.decodeResponse(
+            payload([]), configuration: .init(), messageInterval: interval
+        )) { error in
+            XCTAssertEqual(error as? AgentsViewSearchError, .messageTimeFilterUnavailable)
+        }
+    }
+
+    /// Filters metadata before collapsing a session so a wrong-day best hit cannot replace valid evidence.
+    ///
+    /// Raises:
+    ///   Error: Fixture dates, serialization or decoding failed.
+    func testMessageTimeAndProviderAreRecheckedBeforeSessionAggregation() throws {
+        let start = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-14T16:00:00Z"))
+        let end = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-15T16:00:00Z"))
+        let data = try payload([
+            ["session_id": "codex:" + codexID, "agent": "codex", "snippet": "old", "timestamp": "2026-10-14T15:59:59Z", "score": 0.9],
+            ["session_id": claudeID, "agent": "claude", "snippet": "other app", "timestamp": "2026-10-15T08:00:00Z"],
+            ["session_id": "codex:" + codexID, "agent": "codex", "snippet": "correct day", "timestamp": "2026-10-14T16:00:00Z", "score": 0.1],
+            ["session_id": "codex:end", "agent": "codex", "snippet": "exclusive end", "timestamp": "2026-10-15T16:00:00Z"],
+            ["session_id": "codex:missing", "agent": "codex", "snippet": "missing time"],
+        ], timeFilterApplied: true)
+        let hits = try AgentsViewSearchService.decodeResponse(
+            data, configuration: .init(), agent: "codex", messageInterval: DateInterval(start: start, end: end)
+        )
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits.first?.snippet, "correct day")
+    }
+
+    /// Browses a specified conversation day without embedding a meaningless filler word.
+    ///
+    /// Raises:
+    ///   Error: Fixture request construction failed.
+    func testTimeOnlyRequestUsesMessageScanWithoutSemanticScope() throws {
+        let request = try AgentsViewSearchService.request(
+            query: "", configuration: .init(), agent: "codex",
+            messageInterval: DateInterval(start: Date(timeIntervalSince1970: 10), end: Date(timeIntervalSince1970: 20))
+        )
+        let components = try XCTUnwrap(URLComponents(url: XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+        let values = Dictionary((components.queryItems ?? []).map { ($0.name, $0.value ?? "") },
+                                uniquingKeysWith: { first, _ in first })
+        XCTAssertEqual(values["mode"], "regex")
+        XCTAssertEqual(values["pattern"], ".")
+        XCTAssertNil(values["scope"])
+    }
+
     /// Verifies the content endpoint uses hybrid mode and never accepts a launch URL.
     ///
     /// Raises:
@@ -171,14 +244,17 @@ final class AgentsViewSearchServiceTests: XCTestCase {
     ///
     /// Args:
     ///   matches: Fixture search matches.
+    ///   timeFilterApplied: Optional receipt indicating that message-date constraints were enforced.
     ///
     /// Returns:
     ///   Encoded backend response JSON.
     ///
     /// Raises:
     ///   Error: Fixture JSON serialization failed.
-    private func payload(_ matches: [[String: Any]]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: ["matches": matches])
+    private func payload(_ matches: [[String: Any]], timeFilterApplied: Bool? = nil) throws -> Data {
+        var body: [String: Any] = ["matches": matches]
+        if let timeFilterApplied { body["message_time_filter_applied"] = timeFilterApplied }
+        return try JSONSerialization.data(withJSONObject: body)
     }
 
     /// Builds a native descriptor isolated from installed applications and history.

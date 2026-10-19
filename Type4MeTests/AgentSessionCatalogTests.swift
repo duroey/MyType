@@ -449,6 +449,7 @@ final class AgentSessionCatalogTests: XCTestCase {
 
         XCTAssertEqual(snapshot.sessions, [candidate])
         XCTAssertEqual(snapshot.unavailableApplications, [.codex, .claudeCode])
+        XCTAssertEqual(snapshot.absentApplications, [.codex])
         XCTAssertFalse(candidate.canOpenExistingConversation)
     }
 
@@ -467,6 +468,7 @@ final class AgentSessionCatalogTests: XCTestCase {
 
         XCTAssertEqual(snapshot.sessions, [codex])
         XCTAssertEqual(snapshot.unavailableApplications, [.claudeCode])
+        XCTAssertTrue(snapshot.absentApplications.isEmpty)
         XCTAssertTrue(codex.canOpenExistingConversation)
     }
 

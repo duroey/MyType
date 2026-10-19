@@ -41,6 +41,8 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         var questionText = ""
         /// True only after a correlated successful desktop wrap-up result ends the turn.
         var nativeTurnEnd = false
+        /// A visible ordinary reply explicitly ended without pending tools or an API error.
+        var ordinaryTurnEnd = false
     }
 
     struct IdleNotice: Decodable, Sendable {
@@ -105,7 +107,25 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
             return true
         }
 
-        /// Requires a current visible result and either a native idle push or durable end-turn receipt.
+        /// Consumes a terminal subscription notice without treating it as completed work.
+        ///
+        /// Returns:
+        ///   The unavailable/interrupted state to emit, or nil for a normal idle receipt.
+        mutating func takeTerminalState() -> AgentInboxStatus? {
+            guard let notice, ["exited", "unavailable"].contains(notice.state) else { return nil }
+            let status: AgentInboxStatus = notice.state == "exited" ? .interrupted : .unknown
+            if status == .interrupted {
+                self = Cycle()
+            } else {
+                // Unavailable is not proof of interruption. Revalidate before using retained turn evidence.
+                self.notice = nil
+                subscriptionID = nil
+                idleAt = nil
+            }
+            return status
+        }
+
+        /// Requires a current visible result and an idle push or durable same-turn end evidence.
         ///
         /// Args:
         ///   tail: Visible evidence from this exact engine session.
@@ -119,7 +139,9 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                   !tail.finalText.isEmpty, id != completedID else { return nil }
             let pushedFinish = notice?.state == "idle" ? notice?.finished_at : nil
             let hasPush = pushedFinish.map { date.timeIntervalSince1970 <= $0 / 1_000 } == true
-            let hasNativeReceipt = tail.nativeTurnEnd && idleAt.map { date <= $0 } == true
+            let hasNativeReceipt = (tail.nativeTurnEnd || tail.ordinaryTurnEnd)
+                && idleAt.map { date <= $0 } == true
+                && notice.map { $0.state == "idle" } != false
             guard hasPush || hasNativeReceipt else { return nil }
             completedID = id
             busySince = nil
@@ -129,7 +151,7 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         }
     }
 
-    private struct Tracked {
+    struct Tracked {
         var session: AgentSessionDescriptor
         let inbox: AgentHandoffDeliveryService.ClaudeInbox
         let registryURL: URL
@@ -139,6 +161,27 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
         var tailRevision: String?
         var nextSubscriptionAttempt: TimeInterval = 0
         var identityValid = true
+
+        /// Validates an observation before allowing it to advance this exact native runtime.
+        ///
+        /// Args:
+        ///   registry: Latest bounded registry read, or nil while temporarily unavailable.
+        ///   processStartSeconds: Current kernel process generation.
+        ///
+        /// Returns:
+        ///   Whether this registry may advance the observed cycle.
+        mutating func accepts(_ registry: Registration?, processStartSeconds: UInt64?) -> Bool {
+            if let processStartSeconds, processStartSeconds != inbox.processStartSeconds {
+                cycle = Cycle()
+                return false
+            }
+            if let registry, !registry.matches(session: session, inbox: inbox) {
+                cycle = Cycle()
+                return false
+            }
+            // A partial write or temporary verification failure is not a new runtime.
+            return identityValid && processStartSeconds == inbox.processStartSeconds && registry != nil
+        }
     }
 
     private let configuration: AgentNotificationConfiguration
@@ -196,17 +239,15 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                 for push in pushes where push.pid == item.inbox.processID && push.start == item.inbox.processStartSeconds {
                     _ = item.cycle.receive(push.notice, inbox: item.inbox)
                 }
-                if let notice = item.cycle.notice, ["exited", "unavailable"].contains(notice.state) {
-                    item.cycle = Cycle()
+                if let terminalState = item.cycle.takeTerminalState() {
+                    item.nextSubscriptionAttempt = now + configuration.reconnectDelaySeconds
                     tracked[key] = item
-                    await emit(AgentInboxUpdate(session: item.session, status: notice.state == "exited" ? .interrupted : .unknown))
+                    await emit(AgentInboxUpdate(session: item.session, status: terminalState))
                     continue
                 }
-                guard item.identityValid,
-                      AgentHandoffDeliveryService.processStartSeconds(processID: item.inbox.processID) == item.inbox.processStartSeconds,
-                      let registry = Self.readRegistration(item.registryURL, maximumBytes: configuration.maximumRegistryFileBytes),
-                      registry.matches(session: item.session, inbox: item.inbox) else {
-                    item.cycle = Cycle()
+                let observedRegistry = Self.readRegistration(item.registryURL, maximumBytes: configuration.maximumRegistryFileBytes)
+                guard item.accepts(observedRegistry, processStartSeconds: AgentHandoffDeliveryService.processStartSeconds(processID: item.inbox.processID)),
+                      let registry = observedRegistry else {
                     tracked[key] = item
                     await emit(AgentInboxUpdate(session: item.session, status: .unknown))
                     continue
@@ -432,25 +473,33 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
     ///
     /// Args:
     ///   item: Verified session binding and cached visible evidence.
-    private func refreshTail(_ item: inout Tracked) {
+    func refreshTail(_ item: inout Tracked) {
+        var cacheValid = false
+        defer {
+            if !cacheValid {
+                item.tail = VisibleTail()
+                item.tailRevision = nil
+            }
+        }
         guard let url = item.transcriptURL, let engine = item.session.engineSessionID else { return }
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { item.tail = VisibleTail(); return }
+        guard fd >= 0 else { return }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_uid == getuid(), info.st_mode & S_IFMT == S_IFREG, info.st_size >= 0 else { return }
         let revision = "\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec)"
-        guard revision != item.tailRevision else { return }
+        guard revision != item.tailRevision else { cacheValid = true; return }
         let offset = max(0, info.st_size - off_t(configuration.maximumTranscriptTailBytes))
         guard (try? handle.seek(toOffset: UInt64(offset))) != nil,
               var data = try? handle.read(upToCount: configuration.maximumTranscriptTailBytes) else { return }
         if offset > 0 {
-            guard let newline = data.firstIndex(of: 10) else { item.tail = VisibleTail(); return }
+            guard let newline = data.firstIndex(of: 10) else { return }
             data = Data(data.suffix(from: data.index(after: newline)))
         }
         item.tail = Self.visibleTail(data: data, engineID: engine, maximumCharacters: configuration.maximumPreviewCharacters)
         item.tailRevision = revision
+        cacheValid = true
     }
 
     /// Projects final text, questions and acknowledged native cards without exposing tool payloads.
@@ -505,11 +554,15 @@ final class ClaudeDesktopNotificationSource: @unchecked Sendable {
                   let message = row["message"] as? [String: Any], message["role"] as? String == "assistant",
                   let blocks = message["content"] as? [[String: Any]], let id = row["uuid"] as? String else { continue }
             result = VisibleTail()
+            guard row["isApiErrorMessage"] as? Bool != true else { continue }
             let text = blocks.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
             if message["stop_reason"] as? String == "end_turn", !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 result.finalID = id
                 result.finalDate = date
                 result.finalText = String(text.prefix(maximumCharacters))
+                result.ordinaryTurnEnd = blocks.allSatisfy {
+                    ["text", "thinking", "redacted_thinking"].contains($0["type"] as? String ?? "")
+                }
             }
             for block in blocks where block["type"] as? String == "tool_use" && block["name"] as? String == "AskUserQuestion" {
                 guard let input = block["input"] as? [String: Any], let questions = input["questions"] as? [[String: Any]] else { continue }

@@ -67,14 +67,67 @@ actor RecognitionSession {
     private(set) var state: SessionState = .idle {
         didSet {
             if state == .idle {
-                Task { [historyStore] in
+                Task { [weak self, historyStore] in
                     await historyStore.shrinkMemory()
+                    await self?.drainBufferedRecordings()
                 }
             }
         }
     }
 
-    var canStartRecording: Bool { state == .idle }
+    var canStartRecording: Bool { state == .idle && !hasBufferedWork }
+
+    private let bufferedRecordings = BoundedRecordingQueue(configuration: .load())
+    private var bufferedAudioEngine: AudioCaptureEngine?
+    private var bufferedDurationTask: Task<Void, Never>?
+    private var bufferedEndGate: BufferedRecordingEndGate?
+    private var replayingRecording: BufferedRecording?
+    private var drainingBufferedRecordings = false
+    private var bufferedRecognizers: [Int: BufferedSpeechRecognition] = [:]
+    private var bufferedAwaitingRecognitionID: Int?
+    private var deliveryTarget: ConcurrentRecordingTarget?
+    private var requiresCapturedDeliveryTarget = false
+    private var workerPresentationID = 0
+    private var visiblePresentationID = 0
+    private var recordingEndTime: Date?
+    private var onPresentationEvent: (@Sendable (RecognitionEvent, Int) -> Void)?
+    private var onCaptureReleased: (@Sendable (Int) -> Void)?
+
+    /// Reports microphone release independently of ASR and polishing completion.
+    ///
+    /// Args:
+    ///   handler: Consumer keyed by the recording whose capture has ended.
+    func setOnCaptureReleased(_ handler: @escaping @Sendable (Int) -> Void) {
+        onCaptureReleased = handler
+    }
+
+    /// Associates UI events with a recording so background completion cannot close a new capture.
+    ///
+    /// Args:
+    ///   handler: Event consumer receiving the immutable presentation owner.
+    func setOnPresentationEvent(_ handler: @escaping @Sendable (RecognitionEvent, Int) -> Void) {
+        onPresentationEvent = handler
+    }
+
+    /// Returns whether a queued event still belongs to the recording shown in the floating bar.
+    ///
+    /// Args:
+    ///   id: Presentation identity captured when the event was emitted.
+    func isCurrentPresentation(_ id: Int) -> Bool { id == visiblePresentationID }
+
+    /// Returns whether a start should use the independent capture buffer.
+    func shouldBufferNextRecording() -> Bool { state != .idle || hasBufferedWork }
+
+    /// Limits overlap to ordinary text input, preserving exclusive action and revise workflows.
+    ///
+    /// Args:
+    ///   mode: Requested next recording mode.
+    nonisolated static func supportsBufferedRecording(_ mode: ProcessingMode) -> Bool {
+        mode.executionKind == .recording
+            && mode.id != ProcessingMode.agentModeId
+            && mode.id != ProcessingMode.agentRouterModeId
+            && mode.id != ProcessingMode.macActionId
+    }
 
     /// Waits until the session reaches idle state.
     ///
@@ -85,9 +138,9 @@ actor RecognitionSession {
     ///   `true` when idle was reached, or `false` on timeout or cancellation.
     func awaitIdle(timeout: Duration = .seconds(3)) async -> Bool {
         guard !Task.isCancelled else { return false }
-        if state == .idle { return true }
+        if state == .idle && !hasBufferedWork { return true }
         let deadline = ContinuousClock.now + timeout
-        while state != .idle {
+        while state != .idle || hasBufferedWork {
             guard !Task.isCancelled else { return false }
             let remaining = deadline - ContinuousClock.now
             guard remaining > .zero else { return false }
@@ -452,6 +505,9 @@ actor RecognitionSession {
             return
         }
         onASREvent?(event)
+        // Replaying buffered audio must not show another recording start or play its sound.
+        if replayingRecording != nil, case .ready = event { return }
+        onPresentationEvent?(event, workerPresentationID)
     }
 
     /// Decides whether an event producer still owns the active session.
@@ -479,6 +535,80 @@ actor RecognitionSession {
     /// a live provider.
     func ingestASREventForTesting(_ event: RecognitionEvent) {
         handleASREvent(event, expectedGeneration: sessionGeneration)
+    }
+
+    private var bypassBufferedHardwareForTesting = false
+    private var replayUploadTimeoutForTesting: Duration?
+
+    /// Marks a scripted ASR as a full-audio replay for upload-drain regression tests.
+    ///
+    /// Args:
+    ///   timeout: Optional short failure deadline; nil exercises the production budget.
+    ///   audioDuration: Captured speech duration, independent of upload or queue waits.
+    func prepareReplayDrainForTesting(timeout: Duration? = nil, audioDuration: TimeInterval = 10) {
+        replayUploadTimeoutForTesting = timeout
+        let bytes = recordedAudioForTesting ?? Data()
+        replayingRecording = BufferedRecording(
+            id: -1, mode: .direct, startedAt: Date().addingTimeInterval(-audioDuration), endedAt: Date(),
+            target: nil, chunks: [bytes], speechDetected: true, byteCount: bytes.count
+        )
+        recordingStartTime = replayingRecording?.startedAt
+        recordingEndTime = replayingRecording?.endedAt
+    }
+    private var bufferedProcessorForTesting: (@Sendable (BufferedRecording) async -> Void)?
+    private var bufferedResultObserverForTesting: (@Sendable (Int, BufferedASRResult?) -> Void)?
+    private var bufferedRecognizerForTesting: (@Sendable () -> (any SpeechRecognizer, any ASRProviderConfig))?
+
+    /// Replaces only the external recognizer while retaining real buffered capture and routing.
+    ///
+    /// Args:
+    ///   factory: Independent scripted recognizer and its frozen provider configuration.
+    func setBufferedRecognizerForTesting(
+        _ factory: @escaping @Sendable () -> (any SpeechRecognizer, any ASRProviderConfig)
+    ) {
+        bufferedRecognizerForTesting = factory
+    }
+
+    /// Installs an isolated worker for buffer ownership tests without microphone, AX or providers.
+    ///
+    /// Args:
+    ///   recognitionObserver: Observes the real recognition/recovery decision before replacing output.
+    ///   processor: Consumer held or released by the test to model asynchronous polishing.
+    func prepareBufferedPipelineForTesting(
+        recognitionObserver: (@Sendable (Int, BufferedASRResult?) -> Void)? = nil,
+        processor: (@Sendable (BufferedRecording) async -> Void)? = nil
+    ) {
+        // Omitting the replacement exercises real speech processing up to the injection boundary.
+        capturesTextOutputForTesting = processor == nil
+        capturedTextOutputForTesting = nil
+        bufferedResultObserverForTesting = recognitionObserver
+        bypassBufferedHardwareForTesting = true
+        bufferedProcessorForTesting = processor
+        sessionGeneration = 1
+        workerPresentationID = 1
+        visiblePresentationID = 1
+        state = .postProcessing
+    }
+
+    /// Feeds deterministic PCM into the same bounded capture queue used in production.
+    ///
+    /// Args:
+    ///   data: Complete PCM16 samples for the active segment.
+    func appendBufferedAudioForTesting(_ data: Data) {
+        guard let id = bufferedRecordings.snapshot().activeID else { return }
+        if case .accepted = bufferedRecordings.append(data, to: id, speechDetected: true) {
+            bufferedRecognizers[id]?.append(data)
+        } else {
+            bufferedRecognizers[id]?.requireReplay()
+        }
+    }
+
+    /// Returns active and pending capture ownership without accessing audio hardware.
+    func bufferedSnapshotForTesting() -> BoundedRecordingQueue.Snapshot { bufferedRecordings.snapshot() }
+
+    /// Emits an old worker completion through the production presentation filter.
+    func emitWorkerCompletionForTesting() {
+        emitRecognitionEvent(.finalized(text: "older result", injection: .inserted, llmFailed: false), ownerGeneration: sessionGeneration)
     }
 
     private var recordedAudioForTesting: Data?
@@ -615,7 +745,7 @@ actor RecognitionSession {
     ///
     /// Args:
     ///   handler: Callback used by the UI layer to switch from recording to processing.
-    func setOnAutoStop(_ handler: @escaping @Sendable () -> Void) {
+    func setOnAutoStop(_ handler: @escaping @Sendable (Int) -> Void) {
         onAutoStop = handler
     }
 
@@ -623,7 +753,7 @@ actor RecognitionSession {
     ///
     /// Args:
     ///   handler: Callback used by the UI layer to hide the recording surface.
-    func setOnAutoCancel(_ handler: @escaping @Sendable () -> Void) {
+    func setOnAutoCancel(_ handler: @escaping @Sendable (Int) -> Void) {
         onAutoCancel = handler
     }
 
@@ -983,11 +1113,12 @@ actor RecognitionSession {
     private var finalTranscriptCont: CheckedContinuation<String?, Never>?
     /// Continuation resumed when first non-empty streaming text arrives (for short-recording wait).
     private var firstStreamingTextCont: CheckedContinuation<Bool, Never>?
-    private var onAutoStop: (@Sendable () -> Void)?
-    private var onAutoCancel: (@Sendable () -> Void)?
+    private var onAutoStop: (@Sendable (Int) -> Void)?
+    private var onAutoCancel: (@Sendable (Int) -> Void)?
     private var autoStopOnSilence = false
     private var autoStopHadSpeech = false
-    private var quietWakeupEndGate: QuietWakeupEndGate?
+    private var quietWakeupEndGate: BufferedRecordingEndGate?
+    private var allowsFalseStartCancellation = false
     private var autoStopSilenceStart: ContinuousClock.Instant?
     private var autoStopRMSWindow: [Float] = []
     private var autoStopEffectiveThreshold: Float = 0
@@ -1069,6 +1200,7 @@ actor RecognitionSession {
     ///   quietWakeup: Whether this externally triggered session uses the quiet-room end gate.
     ///   requestedAt: Time when the user requested recording, used for startup diagnostics.
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
+    ///   allowsFalseStartCancellation: Enables the short false-trigger timeout only for automatic wakeup.
     ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
     ///   autoStopThresholdOverride: RMS threshold used by the trigger that started this recording.
     ///   externalAudioInput: Whether audio frames are supplied by an already-running capture stream.
@@ -1081,6 +1213,7 @@ actor RecognitionSession {
         requestedAt: ContinuousClock.Instant? = nil,
         isAutomation: Bool = false,
         autoStopOnSilence: Bool = false,
+        allowsFalseStartCancellation: Bool = false,
         initialAudioChunks: [Data] = [],
         autoStopThresholdOverride: Float? = nil,
         quietWakeup: Bool = false,
@@ -1093,6 +1226,7 @@ actor RecognitionSession {
             requestedAt: requestedAt,
             isAutomation: isAutomation,
             autoStopOnSilence: autoStopOnSilence,
+            allowsFalseStartCancellation: allowsFalseStartCancellation,
             initialAudioChunks: initialAudioChunks,
             autoStopThresholdOverride: autoStopThresholdOverride,
             quietWakeup: quietWakeup,
@@ -1215,9 +1349,12 @@ actor RecognitionSession {
     ///
     /// Args:
     ///   purpose: Frozen behavior and mode for this recording session.
+    ///   recognitionSetup: Frozen ASR settings for an already captured segment or its recovery.
+    ///   preparedRecognition: Completed speech recognition that must not be uploaded again.
     ///   quietWakeup: Whether this externally triggered session uses the quiet-room end gate.
     ///   requestedAt: Time when the user requested recording, used for startup diagnostics.
     ///   autoStopOnSilence: Whether focus wakeup should stop recording after sustained silence.
+    ///   allowsFalseStartCancellation: Enables the short false-trigger timeout only for automatic wakeup.
     ///   initialAudioChunks: PCM chunks captured before an RMS focus trigger.
     ///   autoStopThresholdOverride: RMS threshold used by the trigger that started this recording.
     ///   externalAudioInput: Whether audio frames are supplied by an already-running capture stream.
@@ -1226,10 +1363,13 @@ actor RecognitionSession {
     ///     external-audio ownership is installed and before the first suspension.
     func startRecording(
         purpose: RecordingPurpose,
+        recognitionSetup: BufferedASRSetup? = nil,
+        preparedRecognition: BufferedASRResult? = nil,
         requestedAt: ContinuousClock.Instant? = nil,
         isAutomation: Bool = false,
         manualInput: Bool = false,
         autoStopOnSilence: Bool = false,
+        allowsFalseStartCancellation: Bool = false,
         initialAudioChunks: [Data] = [],
         autoStopThresholdOverride: Float? = nil,
         quietWakeup: Bool = false,
@@ -1271,6 +1411,11 @@ actor RecognitionSession {
         // reliably observe `.starting` and tear this attempt down.
         sessionGeneration &+= 1
         let myGeneration = sessionGeneration
+        workerPresentationID = replayingRecording?.id ?? myGeneration
+        if replayingRecording == nil { visiblePresentationID = workerPresentationID }
+        deliveryTarget = replayingRecording?.target
+        requiresCapturedDeliveryTarget = replayingRecording != nil
+        recordingEndTime = replayingRecording?.endedAt
         state = .starting
         hasReceivedASRText = false
 
@@ -1300,8 +1445,14 @@ actor RecognitionSession {
         }
         speechDetected = externalAudioInput && !initialAudioChunks.isEmpty
         self.autoStopOnSilence = autoStopOnSilence
-        quietWakeupEndGate = quietWakeup && externalAudioInput
-            ? autoStopThresholdOverride.map { QuietWakeupEndGate(onsetThreshold: $0) } : nil
+        self.allowsFalseStartCancellation = allowsFalseStartCancellation
+        quietWakeupEndGate = quietWakeup ? BufferedRecordingEndGate(
+            policy: .freeze(autoStopEnabled: autoStopOnSilence, acousticMode: .quiet,
+                            calibratedQuietThreshold: autoStopThresholdOverride,
+                            isAutomaticTrigger: externalAudioInput),
+            configuration: .init(silenceSeconds: Self.focusAutoStopSilenceSeconds(), noisyThreshold: 0),
+            hadSpeech: externalAudioInput && !initialAudioChunks.isEmpty
+        ) : nil
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
         autoStopRMSWindow = []
@@ -1346,7 +1497,7 @@ actor RecognitionSession {
         // than reusing a stale one, so we can never re-activate and paste into the
         // wrong application. In that case the natural frontmost app at paste time
         // receives the text, guarded by the frontmost confirmation below.
-        let frontmostApplication = FocusedInputResolver.currentApplication()
+        let frontmostApplication = replayingRecording?.target?.application ?? FocusedInputResolver.currentApplication()
         let isSelf = frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
         if isSelf {
             targetApplication = nil
@@ -1357,9 +1508,13 @@ actor RecognitionSession {
         }
         let provider: ASRProvider
         do {
-            provider = manualInput
-                ? KeychainService.selectedASRProvider
-                : try KeychainService.validatedSelectedASRProvider()
+            if let recognitionSetup {
+                provider = recognitionSetup.provider
+            } else {
+                provider = manualInput
+                    ? KeychainService.selectedASRProvider
+                    : try KeychainService.validatedSelectedASRProvider()
+            }
         } catch {
             emitRecognitionEvent(.error(error), ownerGeneration: myGeneration)
             emitRecognitionEvent(.completed, ownerGeneration: myGeneration)
@@ -1513,10 +1668,28 @@ actor RecognitionSession {
             return
         }
 
-        // Load credentials for selected provider
+        if let preparedRecognition, let recognitionSetup, let recording = replayingRecording {
+            // This remains speech input: snippets, correction learning, usage and history
+            // must follow the same policies as the ordinary recording pipeline.
+            currentTranscript = preparedRecognition.transcript
+            currentConfig = nil
+            uploadFailureFlag = nil
+            recordingStartTime = recording.startedAt
+            recordingEndTime = recording.endedAt
+            speechDetected = recording.speechDetected
+            hasReceivedASRText = !currentTranscript.displayText.isEmpty
+            historyASRDurationSeconds = preparedRecognition.finishingSeconds
+            sessionASRModelLabel = Self.asrModelLabel(for: provider, config: recognitionSetup.config)
+            state = .finishing
+            return
+        }
+
+        // A failed concurrent stream reuses its original provider and request settings.
         let config: any ASRProviderConfig
 
-        if provider.isLocal {
+        if let recognitionSetup {
+            config = recognitionSetup.config
+        } else if provider.isLocal {
             // Local providers: use default model directory if no saved config
             if let savedConfig = KeychainService.loadASRConfig(for: provider) {
                 config = savedConfig
@@ -1669,7 +1842,7 @@ actor RecognitionSession {
         // Load hotwords
         let hotwords = HotwordStorage.loadEffective()
         let biasSettings = ASRBiasSettingsStorage.load()
-        let requestOptions = ASRRequestOptions(
+        let requestOptions = recognitionSetup?.options ?? ASRRequestOptions(
             enablePunc: true,
             hotwords: hotwords,
             boostingTableID: biasSettings.boostingTableID,
@@ -1825,7 +1998,7 @@ actor RecognitionSession {
             hasEmittedReadyForCurrentSession = false
             emitRecognitionEvent(.error(error), ownerGeneration: myGeneration)
             emitRecognitionEvent(.completed, ownerGeneration: myGeneration)
-            SystemVolumeManager.restore()
+            restoreVolumeUnlessBufferedCapture()
             await failClaimedRecordingStart(
                 purpose: purpose,
                 ownerGeneration: myGeneration
@@ -1909,7 +2082,7 @@ actor RecognitionSession {
         let recordingLimit = ASRProviderRegistry.recordingDurationLimit(for: activeProvider, config: currentConfig)
         let stopDelay = ASRProviderRegistry.recordingStopDelay(
             for: activeProvider, config: currentConfig,
-            elapsed: recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            elapsed: recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
         )
         maxDurationTask = Task { [weak self, recordingLimit, stopDelay, expectedGeneration] in
             try? await Task.sleep(for: .seconds(stopDelay))
@@ -1919,7 +2092,7 @@ actor RecognitionSession {
                 expectedGeneration: expectedGeneration
             )
         }
-        if autoStopOnSilence && quietWakeupEndGate == nil {
+        if autoStopOnSilence && allowsFalseStartCancellation && quietWakeupEndGate == nil {
             scheduleAutoStopFalseStart(expectedGeneration: expectedGeneration)
         }
     }
@@ -1959,6 +2132,10 @@ actor RecognitionSession {
     ///   stop a newer recording.
     @discardableResult
     func switchMode(to mode: ProcessingMode) async -> Int {
+        if let id = bufferedRecordings.snapshot().activeID {
+            if Self.supportsBufferedRecording(mode) { bufferedRecordings.switchActiveMode(to: mode) }
+            return id
+        }
         let ownerGeneration = sessionGeneration
         let resolved = ASRProviderRegistry.resolvedMode(for: mode, provider: activeProvider)
         let previousModeID = currentMode.id
@@ -2012,6 +2189,20 @@ actor RecognitionSession {
         _ data: Data,
         expectedGeneration: Int
     ) async {
+        if bufferedRecordings.snapshot().activeID == expectedGeneration {
+            let rms = Self.rms16(data)
+            let outcome = bufferedRecordings.append(data, to: expectedGeneration, speechDetected: rms >= Self.autoStopMinRMSThreshold)
+            if case .accepted = outcome { bufferedRecognizers[expectedGeneration]?.append(data) }
+            if case .stopRequired = outcome { bufferedRecognizers[expectedGeneration]?.requireReplay() }
+            let decibels = 20 * log10(max(rms / Float(Int16.max), 1e-7))
+            onAudioLevel?(max(0, min(1, (decibels + 50) / 50)))
+            if case .stopRequired = outcome {
+                autoStopBufferedCapture(id: expectedGeneration)
+            } else {
+                evaluateBufferedEnd(data, id: expectedGeneration)
+            }
+            return
+        }
         guard expectedGeneration == sessionGeneration,
               usesExternalAudioInput,
               state == .starting || state == .recording,
@@ -2046,12 +2237,13 @@ actor RecognitionSession {
 
     /// Cancel an in-progress recording: tear down all resources without injecting any text.
     func cancelRecording() async {
+        if cancelVisibleBufferedRecording() { return }
         guard state == .recording || state == .starting else {
             logger.warning("cancelRecording called but state is \(String(describing: self.state))")
             return
         }
         DebugFileLogger.log("cancelRecording: discarding session from state=\(state)")
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
         await forceReset()
     }
 
@@ -2061,13 +2253,14 @@ actor RecognitionSession {
     /// intended behavior is to discard the session rather than finish ASR,
     /// clipboard injection, or LLM post-processing.
     func cancelCurrentSession() async {
+        if cancelVisibleBufferedRecording() { return }
         guard state != .idle else {
             DebugFileLogger.log("cancelCurrentSession: ignored because state is idle")
             return
         }
         DebugFileLogger.log("cancelCurrentSession: discarding session from state=\(state)")
         completionIntent = .cancelled
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
         await forceReset()
     }
 
@@ -2078,6 +2271,7 @@ actor RecognitionSession {
     /// Returns:
     ///   Nothing. Records the cancellation intent and cancels the owned routing task.
     func abortInjection() {
+        if cancelVisibleBufferedRecording() { return }
         completionIntent = .cancelled
         agentRouterTask?.cancel()
         DebugFileLogger.log(
@@ -2086,11 +2280,22 @@ actor RecognitionSession {
         )
     }
 
+    /// Cancels the visible input and stops its capture as one actor-owned operation.
+    ///
+    /// Buffered cancellation never falls through to stopping the older replay worker.
+    func abortAndStopRecording() async {
+        if cancelVisibleBufferedRecording() { return }
+        let owner = sessionGeneration
+        abortInjection()
+        await stopRecording(expectedGeneration: owner)
+    }
+
     /// Raw transcript and never-copy cancellation still wait for final ASR,
     /// but they have no LLM phase. The UI can hide the processing indicator
     /// while that non-interactive finalization completes.
     func cancellationHidesProcessingUI() -> Bool {
-        usesClipboardOutputPolicy && !clipboardOutputPolicy.processesCancelledResult
+        if visiblePresentationID != workerPresentationID { return true }
+        return usesClipboardOutputPolicy && !clipboardOutputPolicy.processesCancelledResult
     }
 
     /// Parse a Mac Action LLM reply for a `<tool_call>{...}</tool_call>`, dispatch
@@ -2134,7 +2339,7 @@ actor RecognitionSession {
         myGeneration: Int
     ) async {
         let recordId = UUID().uuidString
-        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
         let historyStatus: String = {
             switch status {
             case .success: return "action_success"
@@ -2176,7 +2381,7 @@ actor RecognitionSession {
             if !isManualInput { warmUpASRConnection() }
         }
         resetSessionLLMState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
     }
 
     private func completeSelectionAsk(
@@ -2347,7 +2552,7 @@ actor RecognitionSession {
             if !isManualInput { warmUpASRConnection() }
         }
         resetSessionLLMState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
     }
 
     private func userFacingLLMError(_ error: Error) -> String {
@@ -2363,6 +2568,7 @@ actor RecognitionSession {
     ///   The active recording generation, or `nil` once the session has moved to
     ///   startup, finishing, processing, recovery, reset, or idle.
     func activeRecordingGenerationForStop() -> Int? {
+        if let id = bufferedRecordings.snapshot().activeID { return id }
         guard state == .recording else { return nil }
         return sessionGeneration
     }
@@ -2373,6 +2579,11 @@ actor RecognitionSession {
     ///   expectedGeneration: Optional generation captured by a delayed producer.
     ///     Passing `nil` preserves the direct user-action behavior.
     func stopRecording(expectedGeneration: Int? = nil) async {
+        if let id = bufferedRecordings.snapshot().activeID,
+           expectedGeneration == nil || expectedGeneration == id {
+            finishBufferedCapture(id: id)
+            return
+        }
         guard !isManualInput else { return }
         let myGeneration = sessionGeneration
         guard expectedGeneration == nil || expectedGeneration == myGeneration else {
@@ -2390,6 +2601,7 @@ actor RecognitionSession {
         // Set state BEFORE any await to prevent a second stop from
         // slipping through the guard during the suspension point.
         state = .finishing
+        recordingEndTime = replayingRecording?.endedAt ?? Date()
         if let translationContext = translationRequestContext,
            currentMode.id == ProcessingMode.translationModeId {
             emitRecognitionEvent(
@@ -2405,8 +2617,8 @@ actor RecognitionSession {
 
         let stopT0 = ContinuousClock.now
         let asrFinishingStartedAt = Date()
-        SystemVolumeManager.restore()
-        SoundFeedback.playStop()
+        restoreVolumeUnlessBufferedCapture()
+        if replayingRecording == nil { SoundFeedback.playStop() }
 
         // Stop only the capture stream owned by this session. Focus wakeup feeds
         // external frames from its long-lived monitor, so stopping here would
@@ -2424,7 +2636,27 @@ actor RecognitionSession {
             audioEngine.stop()
             audioEngine.onAudioChunk = nil
         }
-        let audioUploadDrained = await finishAudioChunkPipeline()
+        if replayingRecording == nil {
+            #if DEBUG
+            if recordedAudioForTesting == nil && !bypassBufferedHardwareForTesting {
+                deliveryTarget = ConcurrentRecordingTarget.capture()
+            }
+            #else
+            deliveryTarget = ConcurrentRecordingTarget.capture()
+            #endif
+        }
+        if replayingRecording == nil, Self.supportsBufferedRecording(currentMode),
+           case .input = recordingPurpose {
+            onCaptureReleased?(workerPresentationID)
+        }
+        var uploadTimeout: Duration = .seconds(1)
+        if let replayingRecording {
+            uploadTimeout = bufferedRecordings.configuration.replayUploadTimeout(audioDuration: replayingRecording.duration)
+        }
+        #if DEBUG
+        if let replayUploadTimeoutForTesting { uploadTimeout = replayUploadTimeoutForTesting }
+        #endif
+        let audioUploadDrained = await finishAudioChunkPipeline(timeout: uploadTimeout)
         DebugFileLogger.log("stop: audio stopped +\(ContinuousClock.now - stopT0)")
         guard sessionGeneration == myGeneration else {
             DebugFileLogger.log("stopRecording: zombie after audio pipeline, bailing")
@@ -2434,7 +2666,7 @@ actor RecognitionSession {
         // Quick bail: if mic level never exceeded speech threshold, skip the
         // full ASR teardown (no speech = nothing to finalize). Saves 2-7s of waiting.
         if !speechDetected {
-            let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
             DebugFileLogger.log("stop: no speech detected (duration=\(String(format: "%.1f", duration))s), fast exit")
             if let client = asrClient {
                 await client.disconnect()
@@ -2464,7 +2696,7 @@ actor RecognitionSession {
             resetSessionLLMState()
             resetAutoStopState()
             clearExternalAudioInputState()
-            SystemVolumeManager.restore()
+            restoreVolumeUnlessBufferedCapture()
             return
         }
 
@@ -2492,10 +2724,11 @@ actor RecognitionSession {
         let provider = activeProvider
         let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider, config: currentConfig).isStreaming
         if providerIsStreaming && !shouldUseStartupAudioFallback {
-            let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
             let hasStreamingText = !currentTranscript.composedText
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            if duration < 5 && !hasStreamingText {
+            // Replayed audio has only just reached the provider; missing a live partial is expected.
+            if replayingRecording == nil && duration < 5 && !hasStreamingText {
                 // Phase 1: wait up to 1s for any streaming text
                 DebugFileLogger.log("stop: short recording (\(String(format: "%.1f", duration))s) with no streaming text, waiting for partial")
                 let gotText = await awaitFirstStreamingText(timeout: .seconds(1))
@@ -2535,7 +2768,7 @@ actor RecognitionSession {
                     resetSessionLLMState()
                     resetAutoStopState()
                     clearExternalAudioInputState()
-                    SystemVolumeManager.restore()
+                    restoreVolumeUnlessBufferedCapture()
                     return
                 }
 
@@ -2679,7 +2912,9 @@ actor RecognitionSession {
         // results. A cancelled stream that never produced text is the exception:
         // after the normal finalization grace, don't replay it solely because the
         // provider omitted its final event. This is not a general silence detector.
-        let uploadFailed = uploadFailureFlag?.failed == true
+        let incompleteReplayUpload = replayingRecording != nil && !audioUploadDrained
+        let uploadFailed = uploadFailureFlag?.failed == true || incompleteReplayUpload
+        var replayUploadRecovered = !incompleteReplayUpload
         let hasUsableStreamingResult = !currentTranscript.confirmedSegments.isEmpty
         let streamingFailed = Self.shouldAttemptBatchFallback(
             uploadFailed: uploadFailed,
@@ -2734,6 +2969,7 @@ actor RecognitionSession {
                         authoritativeText: batchText,
                         isFinal: true
                     )
+                    replayUploadRecovered = true
                     DebugFileLogger.log("stop: batch fallback succeeded, \(batchText.count) chars")
                 } else {
                     guard ownsSession(myGeneration) else { return }
@@ -2741,6 +2977,10 @@ actor RecognitionSession {
                 }
             }
             historyASRDurationSeconds = max(0, Date().timeIntervalSince(asrFinishingStartedAt))
+        }
+        if !replayUploadRecovered {
+            await finishIncompleteReplay(generation: myGeneration)
+            return
         }
         uploadFailureFlag = nil
         lastStreamingError = nil
@@ -2908,7 +3148,7 @@ actor RecognitionSession {
                 emitRecognitionEvent(.completed, ownerGeneration: myGeneration)
 
                 let recordId = UUID().uuidString
-                let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+                let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
                 await historyStore.insert(HistoryRecord(
                     id: recordId,
                     createdAt: Date(),
@@ -2927,7 +3167,7 @@ actor RecognitionSession {
                 resetSessionLLMState()
                 resetAutoStopState()
                 clearExternalAudioInputState()
-                SystemVolumeManager.restore()
+                restoreVolumeUnlessBufferedCapture()
                 state = .idle
                 hasEmittedReadyForCurrentSession = false
                 currentTranscript = .empty
@@ -3363,11 +3603,15 @@ actor RecognitionSession {
                 case .injectIntoCurrentFrontmost:
                     allowInjection = true
                 case .activateAndConfirm:
-                    allowInjection = targetApp.map(RecognitionSession.activateAndConfirmFrontmost) ?? false
+                    allowInjection = requiresCapturedDeliveryTarget
+                        ? deliveryTarget?.isCurrent() == true
+                        : targetApp.map(RecognitionSession.activateAndConfirmFrontmost) ?? false
                 case .failSafeClipboard:
                     allowInjection = false
                 }
-                if allowInjection {
+                let capturedTargetStillFocused = !requiresCapturedDeliveryTarget
+                    || deliveryTarget?.isCurrent() == true
+                if allowInjection && capturedTargetStillFocused {
                     DebugFileLogger.log(injectLog)
                     if shouldTrackInjection {
                         injectionResult = engine.injectTracked(
@@ -3411,7 +3655,7 @@ actor RecognitionSession {
             #endif
 
             // Save to history
-            let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
             let status: String
             if wasCancelled {
                 status = clipboardOutputPolicy.cancelledHistoryStatus
@@ -3528,7 +3772,7 @@ actor RecognitionSession {
             // with a distinct warning presentation instead of a green→red error flash.
         } else {
             // No text recognized: skip history entry (don't save empty records)
-            let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
             DebugFileLogger.log("stop: no text recognized (duration=\(duration)s), skipping history entry")
             if case .revise(let prepared) = recordingPurpose {
                 await ReviseCoordinator.shared.cancel(transactionID: prepared.transactionID)
@@ -3548,7 +3792,7 @@ actor RecognitionSession {
         resetSessionLLMState()
         resetAutoStopState()
         clearExternalAudioInputState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
         state = .idle
         hasEmittedReadyForCurrentSession = false
         currentTranscript = .empty
@@ -3594,7 +3838,7 @@ actor RecognitionSession {
         let myGeneration = sessionGeneration
         let provider = activeProvider
         let config = currentConfig
-        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
         let rawPartialText = currentTranscript.displayText
         let partialText = normalizedRecoveryText(rawPartialText)
         let asrModel = currentASRModelLabel(for: provider)
@@ -3613,14 +3857,16 @@ actor RecognitionSession {
 
         maxDurationTask?.cancel()
         maxDurationTask = nil
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
 
-        audioEngine.stop()
+        if !usesExternalAudioInput { audioEngine.stop() }
         audioEngine.onAudioChunk = nil
         audioEngine.onAudioLevel = nil
         await finishAudioChunkPipeline(timeout: .milliseconds(250))
         guard sessionGeneration == myGeneration, state == .recovering else { return }
-        let fullAudio = audioEngine.getRecordedAudio()
+        let fullAudio = usesExternalAudioInput
+            ? (externalFrameBuffer?.recordedAudio() ?? Data())
+            : audioEngine.getRecordedAudio()
 
         eventConsumptionTask?.cancel()
         eventConsumptionTask = nil
@@ -3732,7 +3978,7 @@ actor RecognitionSession {
         state = .idle
         currentTranscript = .empty
         resetSessionLLMState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
         warmUpASRConnection()
     }
 
@@ -3759,6 +4005,7 @@ actor RecognitionSession {
             )
             return
         }
+        guard !requiresCapturedDeliveryTarget || deliveryTarget?.isCurrent() == true else { return }
         let engine = injectionEngine
         let retainsClipboardResult = clipboardOutputPolicy.retainsNormalResult
         engine.clipboardRetention = retainsClipboardResult
@@ -3856,7 +4103,13 @@ actor RecognitionSession {
             break  // handled above
 
         case .transcript(let transcript):
+            let previousText = currentTranscript.displayText
             currentTranscript = transcript
+            if !transcript.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               transcript.displayText != previousText {
+                autoStopSilenceStart = nil
+                quietWakeupEndGate?.markSpeech()
+            }
             if !transcript.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !transcript.composedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 hasReceivedASRText = true
@@ -4083,7 +4336,7 @@ actor RecognitionSession {
     private func markReadyIfNeeded(ownerGeneration: Int) {
         guard !hasEmittedReadyForCurrentSession else { return }
         hasEmittedReadyForCurrentSession = true
-        recordingStartTime = Date()
+        recordingStartTime = replayingRecording?.startedAt ?? Date()
         DebugFileLogger.log("session emitting ready")
         emitRecognitionEvent(.ready, ownerGeneration: ownerGeneration)
         logger.info("Recording started")
@@ -4269,7 +4522,8 @@ actor RecognitionSession {
         #if DEBUG
         if let targetForTesting { return targetForTesting() }
         #endif
-        let app = FocusedInputResolver.currentApplication()
+        let app = requiresCapturedDeliveryTarget
+            ? deliveryTarget?.application : FocusedInputResolver.currentApplication()
         return TargetApplicationContext(
             processIdentifier: app?.processIdentifier,
             bundleIdentifier: app?.bundleIdentifier,
@@ -4281,6 +4535,15 @@ actor RecognitionSession {
         guard let settings = intelliSenseSettings else { return }
         var target = currentIntelliSenseTarget()
         var snapshot: IntelliSenseContextSnapshot
+        if requiresCapturedDeliveryTarget, deliveryTarget?.isCurrent() != true {
+            // Never inspect the new foreground field on behalf of an older queued segment.
+            snapshot = .appOnly(target)
+            intelliSenseContextTask?.cancel()
+            intelliSenseTarget = target
+            intelliSenseContextTask = Task { snapshot }
+            intelliSenseRequestContext = nil
+            return
+        }
         #if DEBUG
         if let captureContextForTesting {
             snapshot = await captureContextForTesting(target, settings)
@@ -4499,7 +4762,7 @@ actor RecognitionSession {
         myGeneration: Int
     ) async {
         DebugFileLogger.log("translation failed reason=\(String(describing: error))")
-        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let duration = recordingStartTime.map { (recordingEndTime ?? Date()).timeIntervalSince($0) } ?? 0
         await historyStore.insert(HistoryRecord(
             id: UUID().uuidString,
             createdAt: Date(),
@@ -4530,7 +4793,7 @@ actor RecognitionSession {
             hasEmittedReadyForCurrentSession = false
         }
         resetSessionLLMState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
         if !isManualInput { warmUpASRConnection() }
     }
 
@@ -4585,6 +4848,7 @@ actor RecognitionSession {
     /// Clears state used by focus wakeup silence auto-stop.
     private func resetAutoStopState() {
         quietWakeupEndGate = nil
+        allowsFalseStartCancellation = false
         autoStopOnSilence = false
         autoStopHadSpeech = false
         autoStopSilenceStart = nil
@@ -4636,13 +4900,13 @@ actor RecognitionSession {
                 "focus wakeup: startup timeout after speech; finalizing buffered audio"
             )
             autoStopOnSilence = false
-            onAutoStop?()
+            onAutoStop?(workerPresentationID)
             await stopRecording(expectedGeneration: expectedGeneration)
             return
         }
         DebugFileLogger.log("focus wakeup: false start cancelled after \(timeout)s without ASR text")
         autoStopOnSilence = false
-        onAutoCancel?()
+        onAutoCancel?(workerPresentationID)
         await cancelRecording()
     }
 
@@ -4660,13 +4924,14 @@ actor RecognitionSession {
 
         let rms = Self.rms16(data)
         if var gate = quietWakeupEndGate {
-            let ended = gate.consume(rms)
+            let ended = gate.consume(data)
             quietWakeupEndGate = gate
+            if gate.hasDetectedSpeech { markSpeechDetected() }
             guard ended else { return }
             // A triggered quiet session owns real buffered audio. Finish normally,
             // even when partial ASR text has not arrived, rather than learning noise.
             autoStopOnSilence = false
-            onAutoStop?()
+            onAutoStop?(workerPresentationID)
             await stopRecording(expectedGeneration: expectedGeneration)
             return
         }
@@ -4738,7 +5003,7 @@ actor RecognitionSession {
 
         DebugFileLogger.log("focus wakeup: auto stop silence avg=\(Int(avg)) threshold=\(Int(autoStopEffectiveThreshold)) timeout=\(timeout)s")
         autoStopOnSilence = false
-        onAutoStop?()
+        onAutoStop?(workerPresentationID)
         await stopRecording(expectedGeneration: expectedGeneration)
     }
 
@@ -5213,7 +5478,7 @@ actor RecognitionSession {
         uploadFailureFlag = nil
         lastStreamingError = nil
         clearRecoveryState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
     }
 
     // MARK: - Revise Implementation
@@ -5480,7 +5745,398 @@ actor RecognitionSession {
         recordingPurpose = .input(.direct)
         warmUpASRConnection()
         resetSessionLLMState()
-        SystemVolumeManager.restore()
+        restoreVolumeUnlessBufferedCapture()
     }
 
+}
+
+
+extension RecognitionSession {
+    private var hasBufferedWork: Bool {
+        let snapshot = bufferedRecordings.snapshot()
+        return snapshot.activeID != nil || !snapshot.pendingIDs.isEmpty || drainingBufferedRecordings
+    }
+
+    /// Starts independent capture while the existing recognizer and polisher retain their state.
+    ///
+    /// Args:
+    ///   mode: Frozen text-processing mode for the new segment.
+    ///   initialAudioChunks: Pre-trigger audio owned by this new segment.
+    ///   externalAudioInput: Reuses the Focus microphone instead of opening another device stream.
+    ///   stopPolicy: Frozen acoustic policy shared with normal recording.
+    ///   autoStopThresholdOverride: Trigger threshold for the noisy-mode end gate.
+    ///   onClaimed: Synchronous ownership notification before accepting subsequent frames.
+    /// Returns:
+    ///   True when microphone capture has started; false when another capture or action owns it.
+    func startBufferedRecording(
+        mode: ProcessingMode, initialAudioChunks: [Data] = [], externalAudioInput: Bool = false,
+        stopPolicy: RecordingStopPolicy? = nil, autoStopThresholdOverride: Float? = nil,
+        onClaimed: (@Sendable (Int) -> Void)? = nil
+    ) async -> Bool {
+        guard !Task.isCancelled, Self.supportsBufferedRecording(mode), !isManualInput,
+              case .input = recordingPurpose,
+              Self.supportsBufferedRecording(currentMode),
+              state == .idle || state == .finishing || state == .postProcessing
+                || state == .injecting
+                || (replayingRecording != nil && (state == .starting || state == .recording)) else { return false }
+        let target: ConcurrentRecordingTarget?
+        #if DEBUG
+        target = bypassBufferedHardwareForTesting ? nil : ConcurrentRecordingTarget.capture()
+        #else
+        target = ConcurrentRecordingTarget.capture()
+        #endif
+        guard case .success(let id) = bufferedRecordings.start(mode: mode, target: target) else { return false }
+        // An older result must no longer follow focus into the new segment's destination.
+        requiresCapturedDeliveryTarget = true
+        visiblePresentationID = id
+        if let stopPolicy, stopPolicy.enabled {
+            bufferedEndGate = BufferedRecordingEndGate(
+                policy: stopPolicy,
+                configuration: .init(
+                    silenceSeconds: Self.focusAutoStopSilenceSeconds(),
+                    noisyThreshold: Self.autoStopEffectiveThreshold(triggerThreshold: autoStopThresholdOverride),
+                    noisyWindowFrames: (UserDefaults.standard.object(forKey: "tf_focusAutoStopRMSWindowFrames") as? Int)
+                        ?? BufferedRecordingEndGate.Configuration.defaultNoisyWindowFrames
+                ), hadSpeech: externalAudioInput && !initialAudioChunks.isEmpty
+            )
+        } else {
+            bufferedEndGate = nil
+        }
+        for chunk in initialAudioChunks {
+            guard case .accepted = bufferedRecordings.append(chunk, to: id, speechDetected: true) else {
+                bufferedRecordings.cancel(id: id)
+                bufferedEndGate = nil
+                return false
+            }
+        }
+        let recognizer = makeBufferedRecognizer(id: id)
+        if let recognizer {
+            bufferedRecognizers[id] = recognizer
+            for chunk in initialAudioChunks { recognizer.append(chunk) }
+        }
+        if externalAudioInput {
+            onClaimed?(id)
+            publishBufferedCaptureReady(id: id)
+            return true
+        }
+        #if DEBUG
+        if bypassBufferedHardwareForTesting {
+            onClaimed?(id)
+            onPresentationEvent?(.ready, id)
+            return true
+        }
+        #endif
+        let engine = AudioCaptureEngine()
+        engine.retainsRecordedAudio = false
+        switch AudioInputDevicePreferenceStore.cachedCaptureResolution() {
+        case .explicitDevice(let uid): engine.selectedDeviceUID = uid
+        case .systemDefault: engine.selectedDeviceUID = nil
+        case .unavailable:
+            bufferedRecordings.cancel(id: id)
+            bufferedRecognizers.removeValue(forKey: id)?.cancel()
+            return false
+        }
+        let queue = bufferedRecordings
+        let levelHandler = onAudioLevel
+        let threshold = Self.speechLevelThreshold
+        let speechGraceEnd = ContinuousClock.now + .milliseconds(SoundFeedback.startSoundDurationMs())
+        engine.onAudioLevel = { level in
+            if ContinuousClock.now >= speechGraceEnd, level > threshold { queue.markSpeech(for: id) }
+            levelHandler?(level)
+        }
+        engine.onAudioChunk = { [weak self] data in
+            switch queue.append(data, to: id) {
+            case .accepted: recognizer?.append(data)
+            case .stopRequired:
+                recognizer?.requireReplay()
+                Task { await self?.autoStopBufferedCapture(id: id) }
+            default: break
+            }
+        }
+        engine.onAudioFrame = { [weak self] data in
+            Task { await self?.evaluateBufferedEnd(data, id: id) }
+        }
+        bufferedAudioEngine = engine
+        do {
+            try engine.start()
+            guard !Task.isCancelled else {
+                _ = cancelVisibleBufferedRecording()
+                return false
+            }
+        } catch {
+            engine.stop()
+            bufferedAudioEngine = nil
+            bufferedRecordings.cancel(id: id)
+            bufferedRecognizers.removeValue(forKey: id)?.cancel()
+            DebugFileLogger.log("buffered recording start failed: \(error)")
+            return false
+        }
+        onClaimed?(id)
+        publishBufferedCaptureReady(id: id)
+        return true
+    }
+
+    /// Creates a private streaming connection without changing the older worker's recognizer.
+    ///
+    /// Args:
+    ///   id: Capture identity used to reject late captions after cancellation or replacement.
+    /// Returns:
+    ///   An independent recognizer, or nil for modes that require serial resource ownership.
+    private func makeBufferedRecognizer(id: Int) -> BufferedSpeechRecognition? {
+        let setup: BufferedASRSetup
+        let client: any SpeechRecognizer
+        #if DEBUG
+        if let factory = bufferedRecognizerForTesting {
+            let (scriptedClient, config) = factory()
+            setup = BufferedASRSetup(provider: type(of: config).provider, config: config, options: .init())
+            client = scriptedClient
+        } else if bypassBufferedHardwareForTesting {
+            return nil
+        } else {
+            guard let loaded = loadBufferedASRSetup(),
+                  let created = ASRProviderRegistry.createClient(for: loaded.provider, config: loaded.config) else { return nil }
+            setup = loaded
+            client = created
+        }
+        #else
+        guard let loaded = loadBufferedASRSetup(),
+              let created = ASRProviderRegistry.createClient(for: loaded.provider, config: loaded.config) else { return nil }
+        setup = loaded
+        client = created
+        #endif
+        let queue = bufferedRecordings
+        return BufferedSpeechRecognition(
+            setup: setup, client: client,
+            configuration: .init(maximumBytes: queue.configuration.maximumSegmentBytes)
+        ) { [weak self] transcript in
+            if !transcript.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                queue.markSpeech(for: id)
+            }
+            Task { await self?.receiveBufferedTranscript(transcript, id: id) }
+        }
+    }
+
+    /// Freezes settings for the provider with a verified session-level final receipt.
+    ///
+    /// Other adapters can report utterance-final or socket-close as completion. They retain
+    /// serial recognition until their terminal receipts and resource ownership are verified.
+    private func loadBufferedASRSetup() -> BufferedASRSetup? {
+        do {
+            let provider = try KeychainService.validatedSelectedASRProvider()
+            guard provider == .volcano,
+                  let config = try KeychainService.loadASRConfigCheckingKeychain(for: provider),
+                  ASRProviderRegistry.capabilities(for: provider, config: config).isStreaming else { return nil }
+            return BufferedASRSetup(
+                provider: provider, config: config,
+                options: ASRRequestOptions(enablePunc: true, hotwords: HotwordStorage.loadEffective(),
+                    boostingTableID: ASRBiasSettingsStorage.load().boostingTableID,
+                    bypassProxy: ProxyBypassMode.current.bypassASR)
+            )
+        } catch {
+            DebugFileLogger.log("buffered ASR settings unavailable; retained audio will use the ordered recovery path")
+            return nil
+        }
+    }
+
+    /// Updates only the current live capture's captions; finalization never drives recording UI.
+    ///
+    /// Args:
+    ///   transcript: Latest words from this segment's independent recognizer.
+    ///   id: Capture that owns these words.
+    private func receiveBufferedTranscript(_ transcript: RecognitionTranscript, id: Int) {
+        guard bufferedRecognizers[id] != nil,
+              bufferedRecordings.snapshot().activeID == id, visiblePresentationID == id else { return }
+        if !transcript.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            bufferedEndGate?.markSpeech()
+        }
+        onPresentationEvent?(.transcript(transcript), id)
+    }
+
+    /// Publishes new capture ownership and bounds its lifetime for either audio source.
+    ///
+    /// Args:
+    ///   id: New capture identity; the existing worker keeps its own identity.
+    private func publishBufferedCaptureReady(id: Int) {
+        onPresentationEvent?(.ready, id)
+        let limit = bufferedRecordings.configuration.maximumDuration
+        bufferedDurationTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(limit)) } catch { return }
+            await self?.autoStopBufferedCapture(id: id)
+        }
+        DebugFileLogger.log("buffered recording started owner=\(id)")
+    }
+
+    /// Evaluates only the active segment's frozen silence detector.
+    ///
+    /// Args:
+    ///   data: Live PCM frames, never replayed historical audio.
+    ///   id: Capture that owns these frames.
+    private func evaluateBufferedEnd(_ data: Data, id: Int) {
+        guard bufferedRecordings.snapshot().activeID == id, var gate = bufferedEndGate else { return }
+        let ended = gate.consume(data)
+        bufferedEndGate = gate
+        if gate.hasDetectedSpeech { bufferedRecordings.markSpeech(for: id) }
+        if ended { autoStopBufferedCapture(id: id) }
+    }
+
+    /// Stops only the buffer whose timer or byte limit fired.
+    ///
+    /// Args:
+    ///   id: Capture owner at the time the callback was installed.
+    private func autoStopBufferedCapture(id: Int) {
+        guard bufferedRecordings.snapshot().activeID == id else { return }
+        onPresentationEvent?(.completed, id)
+        finishBufferedCapture(id: id)
+    }
+
+    /// Seals audio, including the final short chunk, and queues it behind earlier output.
+    ///
+    /// Args:
+    ///   id: Active capture identity, never the background worker's generation.
+    private func finishBufferedCapture(id: Int) {
+        guard bufferedRecordings.snapshot().activeID == id else { return }
+        bufferedDurationTask?.cancel()
+        bufferedDurationTask = nil
+        bufferedAudioEngine?.stop()
+        bufferedAudioEngine = nil
+        bufferedEndGate = nil
+        let recording = bufferedRecordings.finish(id: id)
+        bufferedRecognizers[id]?.seal()
+        onCaptureReleased?(id)
+        SystemVolumeManager.restore()
+        #if DEBUG
+        if !bypassBufferedHardwareForTesting { SoundFeedback.playStop() }
+        #else
+        SoundFeedback.playStop()
+        #endif
+        if recording?.speechDetected != true || recording?.byteCount == 0 {
+            bufferedRecordings.cancel(id: id)
+            bufferedRecognizers.removeValue(forKey: id)?.cancel()
+            onPresentationEvent?(.processingResult(text: ""), id)
+            onPresentationEvent?(.completed, id)
+        }
+        Task { [weak self] in await self?.drainBufferedRecordings() }
+    }
+
+    /// Cancels the visible buffered segment without cancelling any older polishing work.
+    ///
+    /// Returns:
+    ///   True when a buffered segment was cancelled.
+    private func cancelVisibleBufferedRecording() -> Bool {
+        let snapshot = bufferedRecordings.snapshot()
+        guard snapshot.activeID == visiblePresentationID || snapshot.pendingIDs.contains(visiblePresentationID)
+                || bufferedAwaitingRecognitionID == visiblePresentationID else {
+            return false
+        }
+        if snapshot.activeID == visiblePresentationID {
+            bufferedDurationTask?.cancel()
+            bufferedDurationTask = nil
+            bufferedAudioEngine?.stop()
+            bufferedAudioEngine = nil
+            bufferedEndGate = nil
+            SystemVolumeManager.restore()
+        }
+        let removed = bufferedRecordings.cancel(id: visiblePresentationID)
+        let cancelled = removed || bufferedAwaitingRecognitionID == visiblePresentationID
+        if cancelled {
+            bufferedRecognizers.removeValue(forKey: visiblePresentationID)?.cancel()
+            onPresentationEvent?(.processingResult(text: ""), visiblePresentationID)
+            onPresentationEvent?(.completed, visiblePresentationID)
+        }
+        return cancelled
+    }
+
+    /// Consumes independently recognized segments in capture order through the existing output pipeline.
+    ///
+    /// Shared local models and failed streams retain the full-audio replay path. Successful
+    /// live recognition is reused exactly once; a later segment cannot overtake earlier output.
+    private func drainBufferedRecordings() async {
+        guard state == .idle, !drainingBufferedRecordings else { return }
+        drainingBufferedRecordings = true
+        defer { drainingBufferedRecordings = false }
+        while state == .idle, let recording = bufferedRecordings.dequeue() {
+            replayingRecording = recording
+            defer { replayingRecording = nil; bufferedAwaitingRecognitionID = nil }
+            let recognizer = bufferedRecognizers[recording.id]
+            var recognized: BufferedASRResult?
+            if let recognizer {
+                bufferedAwaitingRecognitionID = recording.id
+                let outcome = await recognizer.result()
+                bufferedAwaitingRecognitionID = nil
+                // Cancellation can remove a dequeued segment while this await is suspended.
+                guard bufferedRecognizers[recording.id] === recognizer else { continue }
+                bufferedRecognizers.removeValue(forKey: recording.id)
+                switch outcome {
+                case .recognized(let result): recognized = result
+                case .replayRequired: DebugFileLogger.log("buffered ASR requires full replay owner=\(recording.id)")
+                case .cancelled: continue
+                }
+            }
+            #if DEBUG
+            if let bufferedProcessorForTesting {
+                bufferedResultObserverForTesting?(recording.id, recognized)
+                workerPresentationID = recording.id
+                state = .postProcessing
+                await bufferedProcessorForTesting(recording)
+                state = .idle
+                continue
+            }
+            #endif
+            await startRecording(
+                purpose: .input(recording.mode),
+                recognitionSetup: recognizer?.setup,
+                preparedRecognition: recognized,
+                initialAudioChunks: recognized == nil ? recording.chunks : [],
+                externalAudioInput: recognized == nil
+            )
+            if recognized != nil, state == .finishing {
+                let text = currentTranscript.displayText
+                await finishTextOutput(
+                    text, generation: sessionGeneration, stopStartedAt: .now,
+                    needsLLM: Self.shouldRunInputModeLLM(recordingPurpose: recordingPurpose, mode: currentMode)
+                )
+            } else if state == .recording {
+                await stopRecording(expectedGeneration: sessionGeneration)
+            }
+            #if DEBUG
+            if capturesTextOutputForTesting, capturedTextOutputForTesting != nil { state = .idle }
+            #endif
+            // Errors use the existing failure/history path. A later segment remains independent.
+        }
+    }
+
+    /// Retains partial recognition after a truncated replay without presenting it as complete input.
+    ///
+    /// Args:
+    ///   generation: Worker that failed both the complete upload and its full-audio retry.
+    private func finishIncompleteReplay(generation: Int) async {
+        guard ownsSession(generation) else { return }
+        let text = currentTranscript.displayText
+        if !text.isEmpty {
+            await historyStore.insert(HistoryRecord(
+                id: UUID().uuidString, createdAt: Date(),
+                durationSeconds: replayingRecording?.duration ?? 0,
+                rawText: text, processingMode: currentMode.name,
+                processedText: nil, finalText: text, status: "stream_partial_saved",
+                characterCount: text.count, asrProvider: activeProvider.displayName,
+                asrModel: sessionASRModelLabel
+            ))
+        }
+        guard ownsSession(generation) else { return }
+        emitRecognitionEvent(.error(NSError(
+            domain: "mytype.recording", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: L(
+                "这段录音未能完整识别，已有文字已存历史",
+                "This recording could not be fully recognized. Available text was saved to History."
+            )]
+        )), ownerGeneration: generation)
+        emitRecognitionEvent(.completed, ownerGeneration: generation)
+        await forceReset()
+    }
+
+    /// Keeps an older worker from restoring the volume lowered by a newer live capture.
+    private func restoreVolumeUnlessBufferedCapture() {
+        guard bufferedRecordings.snapshot().activeID == nil else { return }
+        SystemVolumeManager.restore()
+    }
 }

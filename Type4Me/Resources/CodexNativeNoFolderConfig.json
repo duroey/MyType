@@ -1,0 +1,14 @@
+{
+  "timeoutSeconds": 15,
+  "pollIntervalSeconds": 0.1,
+  "maximumRetainedRequests": 4096,
+  "maximumPromptUTF16Units": 4000,
+  "maximumPromptBytes": 16000,
+  "maximumURLBytes": 48000,
+  "maximumStateBytes": 4194304,
+  "maximumLogBytes": 2097152,
+  "maximumLogFiles": 256,
+  "maximumLogLineBytes": 65536,
+  "logReadChunkBytes": 65536,
+  "logLookbackDays": 2
+}

@@ -1,7 +1,44 @@
 import XCTest
+import os
 @testable import Type4Me
 
 final class FocusWakeupControllerTests: XCTestCase {
+    /// Releasing capture must not cancel the delivery task still finishing ASR or polishing.
+    @MainActor
+    func testCaptureReleaseKeepsFinishingDeliveryWorkerAlive() async {
+        let appState = AppState()
+        let controller = FocusWakeupController(appState: appState, session: RecognitionSession())
+        let entered = expectation(description: "delivery worker is finishing")
+        let resume = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: nil)
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
+        let task = Task {
+            await withCheckedContinuation { continuation in
+                resume.withLock { $0 = continuation }
+                entered.fulfill()
+            }
+            cancelled.withLock { $0 = Task.isCancelled }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        controller.attachExternalAudioDeliveryForTesting(task)
+        controller.sessionDidFinish()
+        resume.withLock { $0?.resume(); $0 = nil }
+        await task.value
+        XCTAssertFalse(cancelled.withLock { $0 }, "Microphone release must not cancel the previous recognition/polishing task")
+    }
+
+    /// Explicit shutdown must still cancel capture delivery instead of retaining a stale worker.
+    @MainActor
+    func testExplicitStopStillCancelsDeliveryWorker() async {
+        let appState = AppState()
+        let controller = FocusWakeupController(appState: appState, session: RecognitionSession())
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
+        let task = Task { cancelled.withLock { $0 = Task.isCancelled } }
+        controller.attachExternalAudioDeliveryForTesting(task)
+        controller.stop()
+        await task.value
+        XCTAssertTrue(cancelled.withLock { $0 })
+    }
+
     func testExternalAudioHandoffCapacityCoversSharedStartWait() {
         let configuredSafetyFrames = 25
         let capacity = FocusExternalAudioHandoffCapacityPolicy.frameCapacity(

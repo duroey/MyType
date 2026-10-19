@@ -142,7 +142,9 @@ private struct AgentNewTaskView: View {
             }
             .disabled(model.isPreparing || model.isOpening)
             if let error = model.failure {
-                Text((error as? AgentDesktopLauncherError)?.message(language: language) ?? copy(.failed))
+                Text((error as? AgentDesktopLauncherError)?.message(language: language)
+                     ?? (error as? CodexNativeNoFolderService.ServiceError)?.errorDescription
+                     ?? copy(.failed))
                     .font(.caption).foregroundStyle(TF.settingsAccentAmber)
                     .fixedSize(horizontal: false, vertical: true)
             } else if !model.isPreparing, model.projectID == nil {

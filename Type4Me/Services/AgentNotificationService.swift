@@ -54,7 +54,15 @@ final class AgentNotificationService {
     ///   token: Lifecycle generation that created the observer.
     private func receive(_ update: AgentInboxUpdate, generation token: UUID) {
         guard generation == token else { return }
-        AgentInboxStore.shared.apply(update)
+        let store = AgentInboxStore.shared
+        let previous = store.items.first { $0.id == update.session.id }
+        store.apply(update)
+        let current = store.items.first { $0.id == update.session.id }
+        if previous?.status != current?.status || previous?.pendingRequests.count != current?.pendingRequests.count {
+            DebugFileLogger.log("[AgentInbox] source=\(update.session.application.rawValue) observed=\(update.status.rawValue) "
+                + "retained=\(current?.status.rawValue ?? "none") items=\(store.items.count) "
+                + "running=\(store.items.filter { $0.status == .running }.count)")
+        }
     }
 
     /// Drops late observer callbacks from an earlier monitoring lifecycle.

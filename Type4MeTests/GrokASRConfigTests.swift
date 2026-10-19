@@ -10,6 +10,7 @@ final class GrokASRConfigTests: XCTestCase {
 
         XCTAssertEqual(config.apiKey, "xai_test_key")
         XCTAssertEqual(config.language, "")
+        XCTAssertEqual(config.recognitionMode, .streaming)
         XCTAssertTrue(config.isValid)
     }
 
@@ -26,9 +27,10 @@ final class GrokASRConfigTests: XCTestCase {
         XCTAssertEqual(config.language, "en")
     }
 
-    func testCredentialFieldsExposeAPIKeyAndLanguage() throws {
+    /// The selectable batch mode adds a mode field while preserving the existing credential order.
+    func testCredentialFieldsExposeRecognitionModeAPIKeyAndLanguage() throws {
         let keys = GrokASRConfig.credentialFields.map(\.key)
-        XCTAssertEqual(keys, ["apiKey", "language"])
+        XCTAssertEqual(keys, ["recognitionMode", "apiKey", "language"])
     }
 
     func testAPIKeyPlaceholderMatchesProviderFormat() {

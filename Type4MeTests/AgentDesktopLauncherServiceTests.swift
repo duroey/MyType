@@ -370,6 +370,44 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
         XCTAssertEqual(recorder.opens.count, 2)
     }
 
+    /// Verifies No Folder reaches the native route without turning into a project deep link.
+    ///
+    /// Raises:
+    ///   Error: The fixture or verified native opening failed.
+    func testCodexNoFolderUsesExplicitNativeRoute() async throws {
+        let appURL = try makeApplication(named: "ChatGPT.app", application: .codex)
+        let recorder = Recorder()
+        let service = makeService(recorder: recorder, nativeNoFolderOpener: { app, prompt in
+            XCTAssertEqual(app, appURL)
+            XCTAssertEqual(prompt, "原生任务\nA+B & C")
+            recorder.recordOpen(app, destinationURL: nil)
+        })
+        try await service.openNewTask(application: .codex, destination: .nativeNoFolder, prompt: "原生任务\nA+B & C")
+        XCTAssertEqual(recorder.opens.count, 1)
+        XCTAssertNil(recorder.opens.first?.1)
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
+    /// Verifies unverified native support cannot fall back to another app or a generated directory.
+    ///
+    /// Raises:
+    ///   Error: The fixture could not be created.
+    func testClaudeNoFolderFailsWithoutOpeningReplacementProject() async throws {
+        _ = try makeApplication(named: "Claude.app", application: .claudeCode)
+        let recorder = Recorder()
+        let service = makeService(recorder: recorder)
+        do {
+            try await service.openNewTask(application: .claudeCode, destination: .nativeNoFolder, prompt: "任务")
+            XCTFail("Unverified No Folder must not fall back")
+        } catch {
+            XCTAssertEqual(error as? AgentDesktopLauncherError, .nativeNoFolderUnavailable(.claudeCode))
+        }
+        XCTAssertTrue(recorder.opens.isEmpty)
+        XCTAssertTrue(recorder.commands.isEmpty)
+        XCTAssertNotEqual(AgentDesktopLauncherError.nativeNoFolderUnavailable(.claudeCode).message(language: .zh),
+                          AgentDesktopLauncherError.nativeNoFolderUnavailable(.claudeCode).message(language: .en))
+    }
+
     /// Verifies invalid directories and text fail before dispatching a draft to the app.
     ///
     /// Raises:
@@ -857,6 +895,7 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
     ///   applicationLookup: Optional Launch Services result provider.
     ///   executableValidator: Optional command presence provider.
     ///   applicationOpener: Optional opener override for failure tests.
+    ///   nativeNoFolderOpener: Folderless route override, isolated from installed apps.
     ///   commandRunner: Optional helper override for version and handoff tests.
     ///
     /// Returns:
@@ -867,6 +906,7 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
         applicationLookup: @escaping AgentDesktopLauncherService.ApplicationLookup = { _ in nil },
         executableValidator: @escaping AgentDesktopLauncherService.ExecutableValidator = { _ in false },
         applicationOpener: AgentDesktopLauncherService.ApplicationOpener? = nil,
+        nativeNoFolderOpener: AgentDesktopLauncherService.NativeNoFolderOpener? = nil,
         commandRunner: AgentDesktopLauncherService.CommandRunner? = nil
     ) -> AgentDesktopLauncherService {
         AgentDesktopLauncherService(
@@ -877,6 +917,10 @@ final class AgentDesktopLauncherServiceTests: XCTestCase {
             executableValidator: executableValidator,
             applicationOpener: applicationOpener ?? { appURL, destinationURL in
                 recorder.recordOpen(appURL, destinationURL: destinationURL)
+            },
+            nativeNoFolderOpener: nativeNoFolderOpener ?? { _, _ in
+                XCTFail("Native No Folder opening was not expected")
+                throw StubError.rejected
             },
             commandRunner: commandRunner ?? { executable, arguments, projectURL, timeout in
                 recorder.recordCommand(.init(executable: executable, arguments: arguments, projectURL: projectURL, timeout: timeout))

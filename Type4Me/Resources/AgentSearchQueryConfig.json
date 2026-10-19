@@ -1,0 +1,49 @@
+{
+  "ambiguousSourcePattern": "(?i)^\\s*(?:在\\s*)?(?:codex|code\\s*x|claude(?:\\s+code)?|cloud(?:\\s+code)?)\\s*(?:和|或(?:者)?|、|/|\\band\\b|\\bor\\b)\\s*(?:codex|code\\s*x|claude(?:\\s+code)?|cloud(?:\\s+code)?)(?![A-Za-z0-9])\\s*(?:里面|里|中|的)",
+  "ambiguousTimePattern": "(?:前天|昨天|今天|本周|这周|上周)\\s*(?:或(?:者)?|和|、|/)?\\s*(?:前天|昨天|今天|本周|这周|上周)\\s*(?:的\\s*)?(?=聊|讨论|谈|交流|提到|说过|那个|这个|会话|对话)",
+  "contextLifetimeSeconds": 300,
+  "dayOffsets": {
+    "day before yesterday": -2,
+    "today": 0,
+    "yesterday": -1,
+    "今天": 0,
+    "前天": -2,
+    "昨天": -1
+  },
+  "emptyTopicPattern": "(?i)^(?:\\s|[，,。.!！?？:：;；]|那个|这个|会话|对话|的|聊的|讨论的|agent|the|one|conversation|session|chat)*$",
+  "maximumInputBytes": 8192,
+  "maximumInputCharacters": 2048,
+  "mondayWeekday": 2,
+  "negatedMetadataPrefixPattern": "(?i)(?:不是|不要|别|并非|非|不在|不想(?:找|要)?|不|\\bnot|\\bexcept|\\bexcluding|\\banything\\s+but)\\s*$",
+  "providerPatterns": {
+    "claude": [
+      "(?i)(?<![A-Za-z0-9])(?:在\\s*)?(?:claude|cloud)(?:\\s+code)?(?![A-Za-z0-9])\\s*(?:里面|里|中)(?:\\s*的)?",
+      "(?i)(?<![A-Za-z0-9])(?:claude|cloud)(?:\\s+code)?(?![A-Za-z0-9])\\s*的\\s*(?=(?:那个|这个|会话|对话|agent)(?:\\s|$|[，,。.!！?？]))",
+      "(?i)\\b(?:in|from|on)\\s+(?:claude|cloud)(?:\\s+code)?\\b"
+    ],
+    "codex": [
+      "(?i)(?<![A-Za-z0-9])(?:在\\s*)?(?:codex|code\\s*x)(?![A-Za-z0-9])\\s*(?:里面|里|中)(?:\\s*的)?",
+      "(?i)(?<![A-Za-z0-9])(?:codex|code\\s*x)(?![A-Za-z0-9])\\s*的\\s*(?=(?:那个|这个|会话|对话|agent)(?:\\s|$|[，,。.!！?？]))",
+      "(?i)\\b(?:in|from|on)\\s+(?:codex|code\\s*x)\\b"
+    ]
+  },
+  "timePatterns": [
+    "(前天|昨天|今天|本周|这周|上周)\\s*(?=(?:我(?:们)?\\s*)?(?:聊(?:过|天)?|讨论(?:过)?|谈(?:过)?|交流(?:过)?|提到(?:过)?|说过))",
+    "(前天|昨天|今天|本周|这周|上周)\\s*(?:的\\s*)?(?=(?:那个|这个|会话|对话)(?:\\s|$|[，,。.!！?？]))",
+    "(?i)\\b(day before yesterday|yesterday|today|this week|last week)\\b(?=\\s+(?:(?:we|i)\\s+)?(?:talked|discussed|chatted|spoke)\\b)",
+    "(?i)\\b(?:the\\s+)?(?:conversation|chat|session)\\s+(?:from|on)\\s+(?:the\\s+)?(day before yesterday|yesterday|today|this week|last week)\\b",
+    "(?i)\\b(?:(?:we|i)\\s+)?(?:discussed|talked|chatted|spoke)\\s+(?:on\\s+)?(day before yesterday|yesterday|today|this week|last week)\\b(?!['’])"
+  ],
+  "topicCleanupPatterns": [
+    "^[\\s,，:：;；]*(?:我(?:们)?\\s*)?(?:聊(?:过|天)?|讨论(?:过)?|谈(?:过)?|交流(?:过)?|提到(?:过)?|说过)(?:的|关于)?\\s*",
+    "(?i)^\\s*(?:(?:we|i)\\s+)?(?:talked|discussed|chatted|spoke)(?:\\s+about)?\\s*"
+  ],
+  "weekOffsets": {
+    "last week": -1,
+    "this week": 0,
+    "上周": -1,
+    "本周": 0,
+    "这周": 0
+  },
+  "whitespacePattern": "\\s+"
+}

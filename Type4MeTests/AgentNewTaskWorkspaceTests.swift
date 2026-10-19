@@ -3,11 +3,24 @@ import XCTest
 @testable import Type4Me
 
 final class AgentNewTaskWorkspaceTests: XCTestCase {
-    /// Checks preparation creates nothing and confirmation gives each task a stable private directory.
+    /// Verifies a folderless request never allocates substitute storage owned by MyType.
+    ///
+    /// Raises:
+    ///   Error: Resolving the independent-task choice unexpectedly fails.
+    func testIndependentChoiceDoesNotAllocateMyTypeDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AgentNewTaskWorkspace(root: root)
+        _ = try store.resolve(projectID: AgentNewTaskService.independentProjectID, draftID: UUID())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path),
+                       "No Folder must not create a MyType-managed workspace")
+    }
+
+    /// Checks repeated folderless choices remain native requests without creating storage.
     ///
     /// Raises:
     ///   Error: The isolated fixture cannot be created or inspected.
-    func testIndependentTasksAreLazyDistinctAndStable() throws {
+    func testIndependentTasksAlwaysResolveToNativeNoFolder() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = AgentNewTaskWorkspace(root: root)
@@ -17,10 +30,9 @@ final class AgentNewTaskWorkspaceTests: XCTestCase {
         let repeated = try store.resolve(projectID: "independent", draftID: firstID)
         let second = try store.resolve(projectID: "independent", draftID: UUID())
         XCTAssertEqual(first, repeated)
-        XCTAssertNotEqual(first, second)
-        XCTAssertEqual(first.deletingLastPathComponent().path, root.path)
-        let attributes = try FileManager.default.attributesOfItem(atPath: first.path)
-        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first, .nativeNoFolder)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
     }
 
     /// Checks an existing project is reused without creating a replacement or changing its files.
@@ -35,18 +47,18 @@ final class AgentNewTaskWorkspaceTests: XCTestCase {
         XCTAssertThrowsError(try store.resolve(projectID: project.path, draftID: UUID()))
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        XCTAssertEqual(try store.resolve(projectID: project.path, draftID: UUID()), project.standardizedFileURL)
+        XCTAssertEqual(try store.resolve(projectID: project.path, draftID: UUID()), .project(project.standardizedFileURL))
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("tasks").path))
         for invalid in ["", "relative/project", "/", "/missing\0/project"] {
             XCTAssertThrowsError(try store.resolve(projectID: invalid, draftID: UUID()))
         }
     }
 
-    /// Checks a managed-directory symlink cannot redirect creation into another project.
+    /// Checks folderless requests do not inspect or follow legacy task-directory links.
     ///
     /// Raises:
     ///   Error: The isolated symlink fixture cannot be created.
-    func testManagedRootAndTaskSymlinksAreRejected() throws {
+    func testLegacyManagedSymlinksRemainUntouched() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -54,9 +66,10 @@ final class AgentNewTaskWorkspaceTests: XCTestCase {
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let link = root.appendingPathComponent("link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
-        XCTAssertThrowsError(try AgentNewTaskWorkspace(root: link).resolve(projectID: "independent", draftID: UUID()))
+        XCTAssertEqual(try AgentNewTaskWorkspace(root: link).resolve(projectID: "independent", draftID: UUID()), .nativeNoFolder)
         let taskID = UUID()
         try FileManager.default.createSymbolicLink(at: root.appendingPathComponent(taskID.uuidString), withDestinationURL: destination)
-        XCTAssertThrowsError(try AgentNewTaskWorkspace(root: root).resolve(projectID: "independent", draftID: taskID))
+        XCTAssertEqual(try AgentNewTaskWorkspace(root: root).resolve(projectID: "independent", draftID: taskID), .nativeNoFolder)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
     }
 }

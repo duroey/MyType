@@ -268,6 +268,17 @@ final class FocusWakeupController {
         appState?.quietCalibrationSecondsRemaining = 0
     }
 
+    /// Returns calibration only for the currently selected microphone and acoustic mode.
+    ///
+    /// Returns:
+    ///   A frozen quiet threshold, or nil when calibration belongs to another device.
+    func calibratedQuietThresholdForRecording() -> Float? {
+        guard acousticMode == .quiet,
+              FocusAcousticMode.resolve(UserDefaults.standard.string(forKey: FocusAcousticMode.storageKey)) == .quiet,
+              quietDeviceUID == AudioInputDevicePreferenceStore.activeCachedInputDevice()?.uid else { return nil }
+        return quietGate.threshold
+    }
+
     /// Invalidates calibration and reopens the quiet monitor after a device change.
     /// Active sessions retain their frozen gate and defer reopening until completion.
     func inputDeviceDidChange() {
@@ -283,6 +294,17 @@ final class FocusWakeupController {
     private var externalAudioDeliveryTask: Task<Void, Never>?
     private var externalAudioDeliveryTaskGeneration: Int?
     private var externalAudioSessionGeneration: Int?
+
+    #if DEBUG
+    /// Attaches a suspended delivery worker without opening a microphone.
+    ///
+    /// Args:
+    ///   task: Worker whose cancellation must match the capture lifecycle.
+    func attachExternalAudioDeliveryForTesting(_ task: Task<Void, Never>) {
+        isFocusRecording = true
+        externalAudioDeliveryTask = task
+    }
+    #endif
 
     nonisolated static let focusWakeupModeIdKey = "tf_focusWakeupModeId"
 
@@ -410,6 +432,9 @@ final class FocusWakeupController {
 
     /// Marks a recording as finished and allows focus wakeup to re-arm.
     func sessionDidFinish() {
+        // Capture release may precede polishing completion. A second completion must not
+        // reset an already rearmed gate or keep extending its cooldown.
+        guard isFocusRecording || isManualRecordingPaused else { return }
         isFocusRecording = false
         isManualRecordingPaused = false
         lastFocusTriggerRMS = nil
@@ -419,7 +444,9 @@ final class FocusWakeupController {
             quietGate = QuietWakeupGate()
             stopAudioMonitoring()
         }
-        resetExternalAudioHandoff()
+        // The delivery pump may be awaiting stopRecording, which also finishes ASR and
+        // polishing. Retire its audio ownership without cancelling that ongoing work.
+        resetExternalAudioHandoff(cancelDelivery: false)
         rearmBlockedUntil = Date().addingTimeInterval(config.rearmDelay)
     }
 
@@ -523,7 +550,7 @@ final class FocusWakeupController {
             return
         }
         monitorStartedAt = Date()
-        appState?.showFocusWaiting()
+        if appState?.barPhase != .processing { appState?.showFocusWaiting() }
         let threshold = resolveStartThreshold()
         let speechLow = threshold.speechLowRMS.map { String(Int($0)) } ?? "nil"
         let falseStartHigh = threshold.falseStartHighRMS.map { String(Int($0)) } ?? "nil"
@@ -716,7 +743,6 @@ final class FocusWakeupController {
         )
         guard onRecordingStartRequested?(mode, initialChunks, triggerThreshold, lastRecordingWasQuiet) == true else {
             DebugFileLogger.log("focus wakeup: shared recording start gate rejected request")
-            isFocusRecording = false
             sessionDidFinish()
             return
         }
@@ -786,9 +812,13 @@ final class FocusWakeupController {
         }
     }
 
-    /// Invalidates the current focus generation and cancels queued delivery work.
-    private func resetExternalAudioHandoff() {
-        externalAudioDeliveryTask?.cancel()
+    /// Invalidates audio ownership, optionally cancelling the task that delivered it.
+    ///
+    /// Args:
+    ///   cancelDelivery: False on normal capture release, because the delivery task may
+    ///     still be finishing recognition and polishing. Owner checks stop it taking new frames.
+    private func resetExternalAudioHandoff(cancelDelivery: Bool = true) {
+        if cancelDelivery { externalAudioDeliveryTask?.cancel() }
         externalAudioDeliveryTask = nil
         externalAudioDeliveryTaskGeneration = nil
         externalAudioSessionGeneration = nil

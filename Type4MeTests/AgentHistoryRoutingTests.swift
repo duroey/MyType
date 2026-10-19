@@ -29,6 +29,34 @@ final class AgentHistoryRoutingTests: XCTestCase {
         private let lock = NSLock()
         private var choices: [AgentActivityCandidate] = []
         private var opened: [AgentSessionDescriptor] = []
+        private var queries: [AgentSearchQuery] = []
+
+        /// Records only synthetic topic strings passed to the search boundary.
+        ///
+        /// Args:
+        ///   query: Test-owned search text.
+        func searched(_ query: AgentSearchQuery) {
+            lock.lock()
+            defer { lock.unlock() }
+            queries.append(query)
+        }
+
+        /// Returns search topics observed by this isolated fixture.
+        ///
+        /// Returns:
+        ///   Topics in request order.
+        func searchTopics() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return queries.map(\.text)
+        }
+
+        /// Returns test-owned structured queries in their observed request order.
+        func searchQueries() -> [AgentSearchQuery] {
+            lock.lock()
+            defer { lock.unlock() }
+            return queries
+        }
 
         /// Captures presented rows without creating a real picker or opening applications.
         ///
@@ -78,6 +106,149 @@ final class AgentHistoryRoutingTests: XCTestCase {
     ///   Error: The temporary directory could not be removed.
     override func tearDownWithError() throws { try FileManager.default.removeItem(at: root) }
 
+    /// Keeps the previous topic when a second utterance only narrows the owning agent.
+    ///
+    /// Raises:
+    ///   Error: Isolated activity persistence failed.
+    func testProviderCorrectionKeepsTopicAndFiltersOtherApp() async throws {
+        let codex = descriptor("target", title: "MyType 开发")
+        let engineID = "22222222-2222-4222-8222-222222222222"
+        let claude = AgentSessionDescriptor(
+            sessionID: "local_other", application: .claudeCode, title: "讨论 Codex 接口", workspacePath: nil,
+            updatedAt: 2, matchTexts: [], openCapability: .claudeNativeDeepLink, engineSessionID: engineID
+        )
+        let hits = [
+            AgentsViewSearchHit(sessionID: engineID, agent: "claude", snippet: "MyType 与 Codex"),
+            AgentsViewSearchHit(sessionID: "codex:target", agent: "codex", snippet: "MyType 开发"),
+        ]
+        let capture = Capture()
+        let router = makeRouter(sessions: [codex, claude], capture: capture) { query in
+            capture.searched(query)
+            return hits
+        }
+        _ = await router.handle("My type 的开发是", launch: false)
+        _ = await offeredRows(capture)
+        // The command classifier cancels the old picker before routing the next utterance.
+        await router.cancelPendingSelection()
+        _ = await router.handle("CoDex 的那个", launch: false)
+        for _ in 0..<100 {
+            if capture.snapshot().0.map(\.application) == [.codex] { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(capture.searchTopics(), ["My type 的开发是", "My type 的开发是"])
+        XCTAssertEqual(capture.snapshot().0.map(\.application), [.codex])
+        XCTAssertTrue(capture.snapshot().1.isEmpty)
+        await router.cancelPendingSelection()
+    }
+
+    /// Carries dates into a source correction, but does not leak constraints into a new topic.
+    func testRefinementRetainsMessageDateAndNewTopicResetsConstraints() async throws {
+        let capture = Capture()
+        let router = makeRouter(sessions: [descriptor("target", title: "MyType")], capture: capture) {
+            capture.searched($0)
+            return []
+        }
+        _ = await router.handle("昨天聊的MyType", launch: false)
+        await router.cancelPendingSelection()
+        _ = await router.handle("Codex 的那个", launch: false)
+        _ = await router.handle("另外一个研究项目", launch: false)
+        let queries = capture.searchQueries()
+        XCTAssertEqual(queries.count, 3)
+        XCTAssertEqual(queries[1].text, "MyType")
+        XCTAssertEqual(queries[1].agent, "codex")
+        XCTAssertEqual(queries[1].messageInterval, queries[0].messageInterval)
+        XCTAssertNotNil(queries[1].messageInterval)
+        XCTAssertNil(queries[2].agent)
+        XCTAssertNil(queries[2].messageInterval)
+        await router.cancelPendingSelection()
+    }
+
+    /// Ensures cancelled or expired topics are not reused by a later source-only utterance.
+    func testCancellationAndExpirationClearRefinementTopic() async throws {
+        let capture = Capture()
+        let clock = FixtureClock()
+        let router = makeRouter(sessions: [descriptor("target", title: "MyType")], capture: capture,
+                                now: { clock.read() }) {
+            capture.searched($0)
+            return []
+        }
+        _ = await router.handle("MyType", launch: false)
+        _ = await router.handle("取消", launch: false)
+        _ = await router.handle("Codex 的那个", launch: false)
+        XCTAssertEqual(capture.searchTopics(), ["MyType"])
+        _ = await router.handle("另一个主题", launch: false)
+        clock.advance(AgentSearchQuery.Configuration().contextLifetimeSeconds + 1)
+        _ = await router.handle("Codex 的那个", launch: false)
+        XCTAssertEqual(capture.searchTopics(), ["MyType", "另一个主题"])
+        await router.cancelPendingSelection()
+    }
+
+    /// Rechecks message dates and does not use a confirmed alias to bypass explicit constraints.
+    func testMessageDateRequiresEligibleEvidenceDespiteConfirmedAlias() async throws {
+        let session = descriptor("target", title: "MyType")
+        let store = AgentActivityStore(fileURL: root.appendingPathComponent("dated.json"))
+        let snapshot = try await store.reconcile(sessions: [session])
+        let activity = try XCTUnwrap(snapshot.activities.first)
+        try await store.markOpened(activityID: activity.id, sessionKey: session.id, queryAlias: "昨天聊的MyType")
+        let capture = Capture()
+        let router = makeRouter(sessions: [session], capture: capture, store: store) { query in
+            capture.searched(query)
+            let interval = try XCTUnwrap(query.messageInterval)
+            return [AgentsViewSearchHit(sessionID: "codex:target", agent: "codex", snippet: "旧消息",
+                                        timestamp: interval.start.addingTimeInterval(-1))]
+        }
+        let result = await router.handle("昨天聊的MyType", launch: false)
+        XCTAssertEqual(result.outcome, .noMatch)
+        XCTAssertEqual(capture.searchTopics(), ["MyType"])
+        XCTAssertTrue(capture.snapshot().0.isEmpty)
+        XCTAssertTrue(capture.snapshot().1.isEmpty)
+        let disabled = makeRouter(sessions: [session], capture: Capture()) { _ in nil }
+        let unavailable = await disabled.handle("昨天聊的MyType", launch: false)
+        XCTAssertEqual(unavailable.outcome, .historyTimeUnavailable)
+        XCTAssertNotEqual(unavailable.message(language: .zh), unavailable.message(language: .en))
+    }
+
+    /// Reports a missing Codex catalog instead of presenting Claude as a complete result.
+    func testUnavailableCatalogCannotSilentlyHideOneProvider() async throws {
+        let engineID = "22222222-2222-4222-8222-222222222222"
+        let claude = AgentSessionDescriptor(
+            sessionID: "local_other", application: .claudeCode, title: "MyType", workspacePath: nil,
+            updatedAt: 2, matchTexts: [], openCapability: .claudeNativeDeepLink, engineSessionID: engineID
+        )
+        let capture = Capture()
+        let router = makeRouter(sessions: [claude], capture: capture, unavailable: [.codex]) {
+            capture.searched($0)
+            return [AgentsViewSearchHit(sessionID: engineID, agent: "claude", snippet: "MyType")]
+        }
+        let incomplete = await router.handle("MyType", launch: false)
+        XCTAssertEqual(incomplete.outcome, .catalogUnavailable)
+        XCTAssertTrue(capture.snapshot().0.isEmpty)
+        let scoped = await router.handle("Claude里聊MyType", launch: false)
+        XCTAssertEqual(scoped.outcome, .selectionRequired)
+        let rows = await offeredRows(capture)
+        XCTAssertEqual(rows.map(\.application), [.claudeCode])
+        await router.cancelPendingSelection()
+    }
+
+    /// Allows an unused provider while rejecting missing native identities in returned Codex hits.
+    func testAbsentProviderDoesNotBlockHealthySearchButMissingCodexMappingIsExplicit() async throws {
+        let capture = Capture()
+        let session = descriptor("target", title: "MyType")
+        let router = makeRouter(sessions: [session], capture: capture,
+                                unavailable: [.claudeCode], absent: [.claudeCode]) { _ in
+            [AgentsViewSearchHit(sessionID: "codex:target", agent: "codex", snippet: "MyType")]
+        }
+        let result = await router.handle("MyType", launch: false)
+        XCTAssertEqual(result.outcome, .selectionRequired)
+        await router.cancelPendingSelection()
+        let missing = makeRouter(sessions: [session], capture: Capture()) { _ in
+            [AgentsViewSearchHit(sessionID: "codex:missing", agent: "codex", snippet: "MyType")]
+        }
+        let unmapped = await missing.handle("MyType", launch: false)
+        XCTAssertEqual(unmapped.outcome, .historyMappingUnavailable)
+        XCTAssertEqual(unmapped.application, .codex)
+    }
+
     /// Verifies an unnamed native session survives history matching and reaches the chooser.
     ///
     /// Raises:
@@ -121,11 +292,21 @@ final class AgentHistoryRoutingTests: XCTestCase {
         let snapshot = try catalog.loadSessions()
         XCTAssertTrue(snapshot.sessions.contains { $0.application == .codex && $0.sessionID == target })
         let capture = Capture()
+        var configuration = AgentsViewSearchService.Configuration()
+        if let endpoint = environment["MYTYPE_LIVE_SEARCH_ENDPOINT"] { configuration.endpoint = endpoint }
+        let search = AgentsViewSearchService(configuration: configuration)
         let router = makeRouter(sessions: snapshot.sessions, capture: capture) {
-            try await AgentsViewSearchService.shared.search($0)
+            try await search.search($0)
         }
         let result = await router.handle(query, launch: false)
         XCTAssertEqual(result.outcome, .selectionRequired)
+        _ = await offeredRows(capture)
+        if let followUp = environment["MYTYPE_LIVE_SEARCH_FOLLOW_UP"] {
+            await router.cancelPendingSelection()
+            capture.offered([])
+            let refined = await router.handle(followUp, launch: false)
+            XCTAssertEqual(refined.outcome, .selectionRequired)
+        }
         let rows = await offeredRows(capture)
         let index = try XCTUnwrap(rows.firstIndex { $0.application == .codex && $0.sessionID == target })
         XCTAssertNotNil(rows[index].evidence)
@@ -280,21 +461,49 @@ final class AgentHistoryRoutingTests: XCTestCase {
     ///   sessions: Native descriptors available to the strict identity join.
     ///   capture: Recorder for choices and launch effects.
     ///   store: Optional prepopulated confirmed associations in this test's directory.
+    ///   unavailable: Providers whose catalog could not be read.
+    ///   absent: Providers without any local native metadata.
+    ///   now: Clock used to expire refinement context deterministically.
     ///   search: Injected history provider that never accesses real transcripts.
     ///
     /// Returns:
     ///   A router backed only by this test's isolated file.
     private func makeRouter(
         sessions: [AgentSessionDescriptor], capture: Capture, store: AgentActivityStore? = nil,
+        unavailable: [AgentDesktopApplication] = [], absent: [AgentDesktopApplication] = [],
+        now: @escaping @Sendable () -> Date = { Date() },
         search: @escaping AgentRouterService.ContentSearchProvider
     ) -> AgentRouterService {
         AgentRouterService(
             store: store ?? AgentActivityStore(fileURL: root.appendingPathComponent("activities.json")),
-            catalogProvider: { .init(sessions: sessions, unavailableApplications: []) },
+            catalogProvider: { .init(sessions: sessions, unavailableApplications: unavailable, absentApplications: absent) },
             opener: { capture.open($0) },
             chooser: { _, rows, _, _ in capture.offered(rows); return nil },
-            resultSink: { _ in }, contentSearchProvider: search
+            resultSink: { _ in }, contentSearchProvider: search, now: now
         )
+    }
+
+    /// Supplies a synchronized clock so expiration checks require no real waiting.
+    private final class FixtureClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Date(timeIntervalSince1970: 1_792_137_600)
+
+        /// Returns the current test time.
+        func read() -> Date {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+
+        /// Advances the clock by the requested fixture interval.
+        ///
+        /// Args:
+        ///   seconds: Elapsed fixture time.
+        func advance(_ seconds: TimeInterval) {
+            lock.lock()
+            defer { lock.unlock() }
+            value.addTimeInterval(seconds)
+        }
     }
 
     /// Creates an inert Codex descriptor whose identifiers need no real application.

@@ -120,7 +120,13 @@ final class CodexDesktopNotificationSource: @unchecked Sendable {
                     if let session = sessions[id] { await emit(.init(session: session, status: .unknown)) }
                     let attempts = retries[id, default: 0] + 1
                     retries[id] = attempts
-                    guard attempts <= configuration.maximumSnapshotRetries else { throw CodexInboxError.timeout }
+                    if attempts > configuration.maximumSnapshotRetries {
+                        try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: false)
+                        owners[id] = nil; reducers[id] = nil; followDeadlines[id] = nil; retries[id] = nil
+                        pendingReadRefreshes.remove(id)
+                        cooldowns[id] = now + configuration.discoveryIntervalSeconds
+                        continue
+                    }
                     try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: false)
                     try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: true)
                     followDeadlines[id] = now + configuration.ioTimeoutSeconds
@@ -235,17 +241,17 @@ final class CodexDesktopNotificationSource: @unchecked Sendable {
                     }
                 } catch {
                     await emit(.init(session: session, status: .unknown))
-                    if error as? CodexInboxError == .capacityExceeded {
+                    let attempts = retries[id, default: 0] + 1
+                    if error as? CodexInboxError == .capacityExceeded || attempts > configuration.maximumSnapshotRetries {
                         // A large conversation must not disconnect healthy streams or trigger an immediate retry loop.
                         try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: false)
                         owners[id] = nil; reducers[id] = nil; followDeadlines[id] = nil; retries[id] = nil
+                        pendingReadRefreshes.remove(id)
                         cooldowns[id] = now + configuration.discoveryIntervalSeconds
                         continue
                     }
                     reducers[id]?.invalidateRevision()
-                    let attempts = retries[id, default: 0] + 1
                     retries[id] = attempts
-                    guard attempts <= configuration.maximumSnapshotRetries else { throw error }
                     try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: false)
                     try socket.follow(clientID: clientID, ownerID: owner, sessionID: id, following: true)
                     followDeadlines[id] = now + configuration.ioTimeoutSeconds
@@ -360,7 +366,6 @@ struct CodexInboxStateReducer {
               packet["version"] as? Int == 3,
               let params = packet["params"] as? [String: Any], params["hostId"] as? String == "local",
               let unread = params["hasUnreadTurn"] as? NSNumber, CFGetTypeID(unread) == CFBooleanGetTypeID(),
-              !unread.boolValue,
               let id = params["conversationId"] as? String, UUID(uuidString: id) != nil else { return nil }
         return id
     }
@@ -406,8 +411,8 @@ struct CodexInboxStateReducer {
         var nextBytes = estimatedBytes
         if isSnapshot {
             guard let snapshot = change["conversationState"] as? [String: Any], revision == nil || nextRevision >= revision! else { throw CodexInboxError.protocolMismatch }
-            next = snapshot
-            nextBytes = try JSONSerialization.data(withJSONObject: snapshot).count
+            next = Self.notificationValue(snapshot) as! [String: Any]
+            nextBytes = try JSONSerialization.data(withJSONObject: next).count
         } else {
             guard change["type"] as? String == "patches", let revision, let state,
                   change["baseRevision"] as? Int == revision, nextRevision > revision,
@@ -415,9 +420,16 @@ struct CodexInboxStateReducer {
             var root: Any = state
             for patch in patches {
                 guard let path = patch["path"] as? [Any], let operation = patch["op"] as? String else { throw CodexInboxError.invalidPatch }
-                root = try Self.patch(root, path: ArraySlice(path), operation: operation, value: patch["value"])
+                guard ["add", "replace", "remove"].contains(operation), path.count <= 128 else {
+                    throw CodexInboxError.invalidPatch
+                }
+                let imageDepth = Self.imageResultDepth(in: root, path: path)
+                // Descendants of an opaque image result have no notification semantics.
+                if let imageDepth, imageDepth < path.count - 1 { continue }
+                let value = patch["value"].map { imageDepth == nil ? Self.notificationValue($0) : NSNull() }
+                root = try Self.patch(root, path: ArraySlice(path), operation: operation, value: value)
                 if path as? [String] == ["hasUnreadTurn"] { hasFreshReadState = true }
-                if let value = patch["value"] {
+                if let value {
                     nextBytes += try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]).count
                 }
             }
@@ -437,6 +449,46 @@ struct CodexInboxStateReducer {
             ? unread?.boolValue : nil
         return project(next, session: session, snapshot: isSnapshot,
                        hasFreshReadState: hasFreshReadState, nativeHasUnreadTurn: nativeHasUnreadTurn)
+    }
+
+    /// Removes generated image bytes while preserving identities and every patch-addressable array position.
+    ///
+    /// Args:
+    ///   value: A native snapshot or replacement subtree, used only in memory.
+    /// Returns:
+    ///   The same JSON structure with opaque image results replaced by null.
+    private static func notificationValue(_ value: Any) -> Any {
+        if var object = value as? [String: Any] {
+            if object["type"] as? String == "imageGeneration", object["result"] != nil {
+                object["result"] = NSNull()
+            }
+            return object.mapValues { notificationValue($0) }
+        }
+        if let array = value as? [Any] { return array.map { notificationValue($0) } }
+        return value
+    }
+
+    /// Locates an image result in an incoming patch, including future nested result formats.
+    ///
+    /// Args:
+    ///   root: Already filtered native state before applying this patch.
+    ///   path: Original native patch path; unrelated invalid paths still fail normal validation.
+    /// Returns:
+    ///   Index of the opaque result component, or nil for notification-relevant fields.
+    private static func imageResultDepth(in root: Any, path: [Any]) -> Int? {
+        var node = root
+        for (depth, component) in path.enumerated() {
+            if let object = node as? [String: Any], let key = component as? String {
+                if object["type"] as? String == "imageGeneration", key == "result" { return depth }
+                guard let child = object[key] else { return nil }
+                node = child
+            } else if let array = node as? [Any], let index = component as? Int,
+                      let number = component as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      array.indices.contains(index) {
+                node = array[index]
+            } else { return nil }
+        }
+        return nil
     }
 
     /// Applies one bounded Immer path with strict array bounds and no partial state mutation.
@@ -782,6 +834,7 @@ final class CodexInboxSocket {
     private var peerPID: Int32 = 0
     private var peerStart: UInt64 = 0
     private var partialFrameStarted: TimeInterval?
+    private var discardRemainingBytes = 0
 
     /// Connects without starting an app and verifies the socket, live process, and signing identity.
     ///
@@ -829,7 +882,10 @@ final class CodexInboxSocket {
     }
 
     /// Closes this observer's connection only; closing never terminates the desktop owner.
-    func close() { if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 }; buffer.removeAll() }
+    func close() {
+        if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 }
+        buffer.removeAll(); discardRemainingBytes = 0; partialFrameStarted = nil
+    }
     deinit { close() }
 
     /// Writes one complete length-prefixed JSON frame against a shared monotonic deadline.
@@ -881,7 +937,7 @@ final class CodexInboxSocket {
         guard !bytes.isEmpty else { throw CodexInboxError.capacityExceeded }
         let count = Darwin.recv(descriptor, &bytes, bytes.count, 0)
         if count > 0 {
-            if buffer.isEmpty { partialFrameStarted = ProcessInfo.processInfo.systemUptime }
+            if partialFrameStarted == nil { partialFrameStarted = ProcessInfo.processInfo.systemUptime }
             buffer.append(contentsOf: bytes.prefix(count)); return try takeFrame()
         }
         if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { return nil }
@@ -912,8 +968,11 @@ final class CodexInboxSocket {
     /// Raises:
     ///   CodexInboxError: Invalid length or root JSON shape.
     private func takeFrame() throws -> [String: Any]? {
-        let result = try Self.decodeFrame(from: &buffer, maximumBytes: configuration.maximumFrameBytes)
-        if result != nil { partialFrameStarted = buffer.isEmpty ? nil : ProcessInfo.processInfo.systemUptime }
+        let result = try Self.decodeFrame(from: &buffer, maximumBytes: configuration.maximumFrameBytes,
+                                         discardRemainingBytes: &discardRemainingBytes)
+        if result != nil || (buffer.isEmpty && discardRemainingBytes == 0) {
+            partialFrameStarted = buffer.isEmpty ? nil : ProcessInfo.processInfo.systemUptime
+        }
         return result
     }
 
@@ -937,6 +996,37 @@ final class CodexInboxSocket {
         guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] else { throw CodexInboxError.protocolMismatch }
         buffer.removeFirst(size + 4)
         return object
+    }
+
+    /// Tracks an oversized payload across socket reads without losing subsequent frame boundaries.
+    ///
+    /// Args:
+    ///   buffer: Bytes received on the authenticated connection.
+    ///   maximumBytes: Largest retained JSON payload.
+    ///   discardRemainingBytes: Number of oversized payload bytes still to drain.
+    /// Returns:
+    ///   The next supported JSON object, or nil while waiting for more bytes.
+    static func decodeFrame(from buffer: inout Data, maximumBytes: Int,
+                            discardRemainingBytes: inout Int) throws -> [String: Any]? {
+        while true {
+            if discardRemainingBytes > 0 {
+                let consumed = min(discardRemainingBytes, buffer.count)
+                buffer.removeFirst(consumed)
+                discardRemainingBytes -= consumed
+                guard discardRemainingBytes == 0 else { return nil }
+            }
+            guard buffer.count >= 4 else { return nil }
+            let size = buffer.prefix(4).enumerated().reduce(0) { $0 | (Int($1.element) << ($1.offset * 8)) }
+            guard size > 0 else { throw CodexInboxError.protocolMismatch }
+            if size > maximumBytes {
+                Logger(subsystem: "com.mytype.app", category: "AgentInbox")
+                    .notice("Draining oversized Codex frame: \(size, privacy: .public) bytes")
+                buffer.removeFirst(4)
+                discardRemainingBytes = size
+                continue
+            }
+            return try decodeFrame(from: &buffer, maximumBytes: maximumBytes)
+        }
     }
 
     /// Polls in cancellation-sized slices while preserving one operation deadline.

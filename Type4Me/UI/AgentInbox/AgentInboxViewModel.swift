@@ -5,6 +5,7 @@ enum AgentInboxCopy {
     enum Label: CaseIterable {
         case title, close, emptyTitle, emptyDetail, unread, open, opening
         case openFailed, cannotOpen, monitoringUnavailable, dismiss, dismissHint, showInbox, entryDetail
+        case acknowledge, acknowledgeHint
         case running, waiting, idle, completed, interrupted, failed, unknown, input, approval
     }
 
@@ -33,6 +34,8 @@ enum AgentInboxCopy {
         case .monitoringUnavailable: values = ("消息监听暂不可用，请检查应用配置。", "Live updates are unavailable. Check the app configuration.")
         case .dismiss: values = ("从队列移除", "Remove from inbox")
         case .dismissHint: values = ("仅隐藏这条消息，不会结束会话或批准操作。", "Hides this update without stopping the conversation or approving anything.")
+        case .acknowledge: values = ("我知道了", "Got it")
+        case .acknowledgeHint: values = ("移除这条完成消息，不打开会话。", "Remove this completed update without opening the conversation.")
         case .running: values = ("正在运行", "Working")
         case .waiting: values = ("等待中", "Waiting")
         case .idle: values = ("空闲", "Idle")
@@ -96,12 +99,13 @@ final class AgentInboxViewModel: ObservableObject {
     private let opener: Opener
     private let markRead: (AgentInboxItem) -> Void
     private var generation = 0
+    var isBusy: Bool { openingID != nil }
 
     /// Creates a queue navigator with replaceable app launching and read receipts.
     ///
     /// Args:
     ///   opener: Opens the exact original conversation; production never substitutes a directory.
-    ///   markRead: Acknowledges only the selected inbox update after opening is accepted.
+    ///   markRead: Acknowledges the selected snapshot after navigation or an explicit Got it action.
     init(
         opener: @escaping Opener = { session in
             try await AgentDesktopLauncherService.shared.open(
@@ -114,6 +118,17 @@ final class AgentInboxViewModel: ObservableObject {
         self.markRead = markRead
     }
 
+    /// Acknowledges a completed report locally without opening or modifying its native conversation.
+    ///
+    /// Args:
+    ///   item: Exact displayed snapshot; the store preserves any newer native update.
+    func acknowledge(_ item: AgentInboxItem) {
+        guard !isBusy, item.canAcknowledge else { return }
+        failedID = nil
+        failure = nil
+        markRead(item)
+    }
+
     /// Opens an exact session when the user selects its queue row.
     ///
     /// Args:
@@ -122,7 +137,7 @@ final class AgentInboxViewModel: ObservableObject {
     /// Returns:
     ///   Nothing. Failed launches retain the unread state and display localized feedback.
     func open(_ item: AgentInboxItem) async {
-        guard openingID == nil else { return }
+        guard !isBusy else { return }
         failure = nil
         failedID = nil
         guard item.session.canOpenExistingConversation else {

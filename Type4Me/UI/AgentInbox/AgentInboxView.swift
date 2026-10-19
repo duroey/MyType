@@ -20,7 +20,7 @@ struct AgentInboxView: View {
             if store.configurationError {
                 Text(copy(.monitoringUnavailable))
                     .font(.system(size: 12)).foregroundStyle(TF.settingsAccentAmber)
-                    .padding(.horizontal, TF.spacingLG).padding(.bottom, TF.spacingMD)
+                    .padding(.horizontal, TF.spacingMD).padding(.bottom, TF.spacingMD)
                     .fixedSize(horizontal: false, vertical: true)
                     .measuringInboxHeight(.warning)
             }
@@ -44,7 +44,7 @@ struct AgentInboxView: View {
                             }
                         }
                     }
-                    .padding(.horizontal, TF.spacingLG)
+                    .padding(.horizontal, TF.spacingMD)
                 }
                 .padding(.bottom, layout.listBottomInset)
                 .scrollBounceBehavior(.basedOnSize)
@@ -88,7 +88,7 @@ struct AgentInboxView: View {
             .focusEffectDisabled()
             .keyboardShortcut(.escape, modifiers: [])
         }
-        .padding(TF.spacingLG)
+        .padding(TF.spacingMD)
     }
 
     private var emptyState: some View {
@@ -118,9 +118,10 @@ struct AgentInboxView: View {
             minimumHeight: layout.minimumRowHeight(itemIDs: store.items.map(\.id), measurements: measurements),
             measured: measured,
             isOpening: model.openingID == item.id,
-            isBusy: model.openingID != nil,
+            isBusy: model.isBusy,
             failure: model.failedID == item.id ? model.failure : nil,
             onOpen: { Task { await model.open(item) } },
+            onAcknowledge: { model.acknowledge(item) },
             onDismiss: { store.dismiss(item.id) }
         )
         .fixedSize(horizontal: false, vertical: true)
@@ -147,59 +148,31 @@ private struct AgentInboxRow: View {
     let isBusy: Bool
     let failure: AgentInboxCopy.Label?
     let onOpen: () -> Void
+    let onAcknowledge: () -> Void
     let onDismiss: () -> Void
     @State private var hovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: TF.spacingSM) {
-            Button(action: onOpen) {
-                VStack(alignment: .leading, spacing: TF.spacingSM) {
-                    HStack(alignment: .firstTextBaseline, spacing: TF.spacingSM) {
-                        if item.isUnread {
-                            Circle().fill(TF.settingsAccentAmber).frame(width: 6, height: 6)
-                                .accessibilityHidden(true)
-                        }
-                        Text(AgentSessionDescriptor.displayTitle(item.session.title, language: language))
-                            .font(.system(size: 14, weight: .semibold)).lineLimit(2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Image(systemName: "arrow.up.right").font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(TF.settingsTextTertiary).accessibilityHidden(true)
+            HStack(alignment: .top, spacing: TF.spacingSM) {
+                navigationButton
+                if item.canAcknowledge {
+                    Button(action: onAcknowledge) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(TF.settingsAccentGreen)
+                            .padding(TF.spacingSM)
+                            .background(TF.settingsAccentGreen.opacity(0.10),
+                                        in: Circle())
+                            .contentShape(Circle())
                     }
-                    HStack(spacing: TF.spacingSM) {
-                        Text(item.session.application.displayName)
-                            .foregroundStyle(TF.settingsTextSecondary)
-                        Spacer(minLength: 0)
-                        Text(item.updatedAt, style: .relative).foregroundStyle(TF.settingsTextTertiary)
-                    }
-                    .font(.system(size: 11))
-                    let statusLayout = item.status == .unknown
-                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: TF.spacingXS))
-                        : AnyLayout(HStackLayout(spacing: TF.spacingSM))
-                    statusLayout {
-                        ForEach(AgentInboxCopy.statusLabels(for: item), id: \.self) { label in
-                            Label(copy(label), systemImage: icon(label))
-                                .font(.system(size: 11, weight: .medium)).foregroundStyle(color(label))
-                        }
-                    }
-                    let detail = item.pendingRequests.first(where: { !$0.text.isEmpty })?.text ?? item.preview
-                    if !detail.isEmpty {
-                        Text(detail).font(.system(size: 13)).lineLimit(3)
-                            .foregroundStyle(TF.settingsTextSecondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    if isOpening {
-                        Text(copy(.opening)).font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
-                    } else if !item.session.canOpenExistingConversation {
-                        Text(copy(.cannotOpen)).font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
-                    }
+                    .buttonStyle(.plain).disabled(isBusy)
+                    .focusEffectDisabled()
+                    .help(copy(.acknowledge))
+                    .accessibilityLabel(copy(.acknowledge))
+                    .accessibilityHint(copy(.acknowledgeHint))
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain).disabled(isBusy || !item.session.canOpenExistingConversation)
-            .help(copy(.open))
-            .accessibilityLabel(AgentInboxCopy.accessibilityLabel(for: item, language: language))
-            .accessibilityHint(copy(.open))
             if let failure {
                 Text(copy(failure)).font(.system(size: 12)).foregroundStyle(TF.settingsAccentRed)
                     .fixedSize(horizontal: false, vertical: true)
@@ -216,6 +189,58 @@ private struct AgentInboxRow: View {
         .contextMenu {
             Button(copy(.dismiss), action: onDismiss).help(copy(.dismissHint))
         }
+    }
+
+    /// Keeps conversation navigation separate from the report's acknowledgement button.
+    private var navigationButton: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: TF.spacingSM) {
+                HStack(alignment: .firstTextBaseline, spacing: TF.spacingSM) {
+                    if item.isUnread {
+                        Circle().fill(TF.settingsAccentAmber).frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
+                    }
+                    Text(AgentSessionDescriptor.displayTitle(item.session.title, language: language))
+                        .font(.system(size: 14, weight: .semibold)).lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "arrow.up.right").font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(TF.settingsTextTertiary).accessibilityHidden(true)
+                }
+                HStack(spacing: TF.spacingSM) {
+                    Text(item.session.application.displayName)
+                        .foregroundStyle(TF.settingsTextSecondary)
+                    Spacer(minLength: 0)
+                    Text(item.updatedAt, style: .relative).foregroundStyle(TF.settingsTextTertiary)
+                }
+                .font(.system(size: 11))
+                let statusLayout = item.status == .unknown
+                    ? AnyLayout(VStackLayout(alignment: .leading, spacing: TF.spacingXS))
+                    : AnyLayout(HStackLayout(spacing: TF.spacingSM))
+                statusLayout {
+                    ForEach(AgentInboxCopy.statusLabels(for: item), id: \.self) { label in
+                        Label(copy(label), systemImage: icon(label))
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(color(label))
+                    }
+                }
+                let detail = item.pendingRequests.first(where: { !$0.text.isEmpty })?.text ?? item.preview
+                if !detail.isEmpty {
+                    Text(detail).font(.system(size: 13)).lineLimit(3)
+                        .foregroundStyle(TF.settingsTextSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if isOpening {
+                    Text(copy(.opening)).font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
+                } else if !item.session.canOpenExistingConversation {
+                    Text(copy(.cannotOpen)).font(.system(size: 11)).foregroundStyle(TF.settingsTextTertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).disabled(isBusy || !item.session.canOpenExistingConversation)
+        .help(copy(.open))
+        .accessibilityLabel(AgentInboxCopy.accessibilityLabel(for: item, language: language))
+        .accessibilityHint(copy(.open))
     }
 
     /// Translates interface copy while preserving the native message body.

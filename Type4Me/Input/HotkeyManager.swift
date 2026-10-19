@@ -433,6 +433,8 @@ final class HotkeyManager: NSObject {
     var passesEscapeToInputMethod: (() -> Bool)?
     /// When true, LLM post-processing is in progress (ESC can also abort this).
     var isProcessing = false
+    /// Allows ordinary text capture to overlap background processing; actions stay exclusive.
+    var canStartDuringProcessing: ((HotkeyOwner) -> Bool)?
 
     /// Reset all active recording/hold state. Called when session ends (completed/error/finalized)
     /// to ensure hotkeys and ESC don't remain stuck.
@@ -1021,7 +1023,7 @@ final class HotkeyManager: NSObject {
             return
         }
 
-        if isProcessing {
+        if isProcessing && canStartDuringProcessing?(binding.owner) != true {
             binding.onBusyConflict?() ?? onBusyConflict?()
             return
         }
@@ -1054,7 +1056,7 @@ final class HotkeyManager: NSObject {
             return
         }
 
-        if isProcessing {
+        if isProcessing && canStartDuringProcessing?(binding.owner) != true {
             binding.onBusyConflict?() ?? onBusyConflict?()
             return
         }

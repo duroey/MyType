@@ -31,6 +31,12 @@ final class MenuBarControlCenterTests: XCTestCase {
         XCTAssertFalse(MenuBarPresentation.canStartRecording(in: .recovering))
     }
 
+    func testProcessingAllowsBufferedTextButNeverAnotherActiveCapture() {
+        XCTAssertTrue(MenuBarPresentation.canStartRecording(in: .processing, permitsOverlap: true))
+        XCTAssertFalse(MenuBarPresentation.canStartRecording(in: .recording, permitsOverlap: true))
+        XCTAssertFalse(MenuBarPresentation.canStartRecording(in: .recovering, permitsOverlap: true))
+    }
+
     func testOnlyCaptureStatesLockNextRecordingSettings() {
         XCTAssertTrue(MenuBarPresentation.locksRuntimeSettings(in: .preparing))
         XCTAssertTrue(MenuBarPresentation.locksRuntimeSettings(in: .recording))

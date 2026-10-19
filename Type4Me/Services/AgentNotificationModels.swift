@@ -22,6 +22,9 @@ struct AgentInboxItem: Codable, Equatable, Identifiable, Sendable {
     var isUnread: Bool
     var id: String { session.id }
 
+    /// Whether this finished report can be acknowledged without visiting its conversation.
+    var canAcknowledge: Bool { status == .completed && pendingRequests.isEmpty }
+
     /// Whether the row still needs attention, independently of its execution state.
     var needsAttention: Bool {
         if !pendingRequests.isEmpty { return true }
@@ -82,7 +85,7 @@ struct AgentNotificationConfiguration: Codable, Equatable, Sendable {
     var maximumClaudeFocusMetadataBytes = 16_777_216
     var maximumClaudeFocusMetadataEntries = 2_048
     var claudeSigningTeamIdentifier = "Q6L2SF6YDW"
-    var maximumFrameBytes = 16_777_216
+    var maximumFrameBytes = 33_554_432
     var maximumCodexStateBytes = 67_108_864
     var maximumSnapshotRetries = 3
     var maximumSubscriptionAttempts = 3

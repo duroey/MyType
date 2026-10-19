@@ -5,6 +5,8 @@
   "maximumResponseBytes": 262144,
   "maximumQueryCharacters": 512,
   "maximumResults": 20,
+  "maximumWakeSearchHits": 120,
+  "maximumWakeResponseBytes": 1048576,
   "maximumSnippetCharacters": 400,
   "maximumSessionIdentifierCharacters": 256,
   "maximumOrdinalRangeEntries": 32

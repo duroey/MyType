@@ -151,7 +151,11 @@ struct RecordingEventSupersessionGate {
 }
 
 private enum RecognitionEventBridgeItem: Sendable {
-    case event(RecognitionEvent)
+    case event(RecognitionEvent, presentationID: Int)
+    case captureReleased(presentationID: Int)
+    case captureStopped(presentationID: Int)
+    case captureCancelled(presentationID: Int)
+    case captureClaimed(token: Int, presentationID: Int, externalAudio: Bool)
     case drain(token: Int, continuation: CheckedContinuation<Bool, Never>)
 }
 
@@ -339,6 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         SoundFeedback.warmUp()
         AudioInputDeviceMonitor.shared.start()
+        BoyaButtonService.shared.start()
         observeEffectiveInputDeviceChanges()
 
         AudioKeepAliveManager.syncState()
@@ -353,40 +358,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appState.audioLevel.current = level
             }
         }
-        Task {
-            await session.setOnAutoStop {
-                Task { @MainActor in
-                    appState.stopRecording()
-                }
-            }
-        }
-        Task {
-            await session.setOnAutoCancel {
-                Task { @MainActor in
-                    appState.showFocusWaiting()
-                    focusWakeupController.sessionDidFalseStart()
-                }
-            }
-        }
-
         let (recognitionEvents, recognitionEventContinuation) =
             AsyncStream<RecognitionEventBridgeItem>.makeStream()
         self.recognitionEventContinuation = recognitionEventContinuation
         Task {
-            await session.setOnASREvent { event in
-                recognitionEventContinuation.yield(.event(event))
+            await session.setOnAutoStop { presentationID in
+                recognitionEventContinuation.yield(.captureStopped(presentationID: presentationID))
+            }
+            await session.setOnAutoCancel { presentationID in
+                recognitionEventContinuation.yield(.captureCancelled(presentationID: presentationID))
+            }
+            await session.setOnCaptureReleased { presentationID in
+                recognitionEventContinuation.yield(.captureReleased(presentationID: presentationID))
+            }
+            await session.setOnPresentationEvent { event, presentationID in
+                recognitionEventContinuation.yield(.event(event, presentationID: presentationID))
             }
         }
         recognitionEventTask = Task { @MainActor [weak self] in
             guard let self else { return }
             for await item in recognitionEvents {
                 switch item {
+                case .captureClaimed(let token, let presentationID, let externalAudio):
+                    guard self.recordingStartGate.allowsStart(token: token),
+                          await session.isCurrentPresentation(presentationID),
+                          self.recordingStartGate.allowsStart(token: token),
+                          self.recordingEventSupersessionGate.finishDraining(token: token) else { continue }
+                    if externalAudio {
+                        self.focusWakeupController?.sessionDidClaimExternalAudioInput(sessionGeneration: presentationID)
+                    }
+
+                case .captureReleased(let presentationID), .captureStopped(let presentationID), .captureCancelled(let presentationID):
+                    let startGeneration = self.recordingStartGate.generation
+                    guard await session.isCurrentPresentation(presentationID),
+                          self.recordingStartGate.generation == startGeneration,
+                          !self.recordingEventSupersessionGate.isSuppressingEvents else { continue }
+                    if case .captureCancelled = item {
+                        appState.showFocusWaiting()
+                        self.focusWakeupController?.sessionDidFalseStart()
+                    } else {
+                        appState.stopRecording()
+                        if case .captureReleased = item {
+                            self.focusWakeupController?.sessionDidFinish()
+                            self.safeResetHotkeyState()
+                        }
+                    }
+
                 case .drain(let token, let continuation):
                     continuation.resume(
                         returning: self.recordingEventSupersessionGate.finishDraining(token: token)
                     )
 
-                case .event(let event):
+                case .event(let event, let presentationID):
+                    let presentationStartGeneration = self.recordingStartGate.generation
+                    guard await session.isCurrentPresentation(presentationID),
+                          self.recordingStartGate.generation == presentationStartGeneration else {
+                        self.handleSupersededRecognitionEvent(event)
+                        continue
+                    }
                     if self.recordingEventSupersessionGate.isSuppressingEvents {
                         self.handleSupersededRecognitionEvent(event)
                         continue
@@ -398,7 +427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         DebugFileLogger.log("ready event received, current barPhase=\(String(describing: appState.barPhase))")
                         appState.markRecordingReady()
                         Task { @MainActor in
-                            guard appState.barPhase == .recording else {
+                            guard await session.isCurrentPresentation(presentationID),
+                                  self.recordingStartGate.generation == presentationStartGeneration,
+                                  appState.barPhase == .recording else {
                                 DebugFileLogger.log("playStart aborted, barPhase=\(String(describing: appState.barPhase))")
                                 return
                             }
@@ -413,7 +444,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 if delayMs > 0 {
                                     try? await Task.sleep(for: .milliseconds(delayMs))
                                 }
-                                guard appState.barPhase == .recording else { return }
+                                guard await session.isCurrentPresentation(presentationID),
+                                      self.recordingStartGate.generation == presentationStartGeneration,
+                                      appState.barPhase == .recording else { return }
                                 SystemVolumeManager.lower(to: Float(targetVolumePercent) / 100.0)
                             }
                         }
@@ -426,7 +459,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     case .completed:
                         self.recordSelectionAskRecordingDidEnd(.finish)
                         let canReleaseSessionGates = appState.stopRecordingForCompletedASREvent()
-                        if await session.stoppedByMaxDuration {
+                        let reachedDurationLimit = await session.stoppedByMaxDuration
+                        guard await session.isCurrentPresentation(presentationID),
+                              self.recordingStartGate.generation == presentationStartGeneration,
+                              !self.recordingEventSupersessionGate.isSuppressingEvents else { continue }
+                        if reachedDurationLimit {
                             appState.processingLabelOverride = L("已达最大时长", "Max duration reached")
                         }
                         if canReleaseSessionGates {
@@ -1363,6 +1400,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch appState.barPhase {
         case .hidden, .focusWaiting, .done, .error:
             break
+        case .processing where appState.activityKind == .standard
+            && RecognitionSession.supportsBufferedRecording(appState.currentMode)
+            && RecognitionSession.supportsBufferedRecording(mode):
+            break
         case .preparing, .recording, .processing, .recovering:
             DebugFileLogger.log("\(source.rawValue) record start blocked phase=\(appState.barPhase)")
             return false
@@ -1381,14 +1422,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let startToken = beginRecordingStartAttempt()
         let recordingRequestedAt = ContinuousClock.now
-        let autoStopOnSilence = autoStopOnSilenceOverride
+        let requestedAutoStop = autoStopOnSilenceOverride
             ?? RMSGatePolicy.usesEndGateForPipelineStart(
                 focusWakeupEnabled: Self.isFocusWakeupEnabledSetting()
             )
+        let acousticMode = source == .focusWakeup
+            ? (quietWakeup ? FocusAcousticMode.quiet : .noisy)
+            : FocusAcousticMode.resolve(UserDefaults.standard.string(forKey: FocusAcousticMode.storageKey))
+        let stopPolicy = RecordingStopPolicy.freeze(
+            autoStopEnabled: requestedAutoStop,
+            acousticMode: acousticMode,
+            calibratedQuietThreshold: source == .focusWakeup
+                ? autoStopThresholdOverride : focusWakeupController?.calibratedQuietThresholdForRecording(),
+            isAutomaticTrigger: source == .focusWakeup
+        )
+        let autoStopOnSilence = stopPolicy.enabled
         NSLog("[Type4Me] >>> %@: Record START (mode: %@)", source.rawValue, effectiveMode.name)
         DebugFileLogger.log(
             "\(source.rawValue) record start mode=\(effectiveMode.name) "
-                + "autoStopOnSilence=\(autoStopOnSilence)"
+                + "autoStopOnSilence=\(autoStopOnSilence) acousticMode=\(acousticMode.rawValue)"
         )
         if source != .focusWakeup {
             focusWakeupController?.resumeStartGateAfterPipelineStart()
@@ -1408,8 +1460,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !externalAudioInput {
                 guard await self.awaitMonitorReleaseBeforeRecording(startToken: startToken) else { return }
             }
-            // Keep the existing session as the only recording owner and wait
-            // for its previous teardown before starting a new capture.
+            let onClaimed: (@Sendable (Int) -> Void)?
+            if source == .focusWakeup {
+                let focusController = self.focusWakeupController
+                onClaimed = { [weak self, weak focusController] generation in
+                    Task { @MainActor [weak self, weak focusController] in
+                        guard self?.recordingStartGate.allowsStart(token: startToken) == true else { return }
+                        focusController?.sessionDidClaimExternalAudioInput(sessionGeneration: generation)
+                    }
+                }
+            } else {
+                onClaimed = nil
+            }
+            if RecognitionSession.supportsBufferedRecording(effectiveMode),
+               await self.session.shouldBufferNextRecording() {
+                // Keep old UI events suppressed until the new capture has actually claimed
+                // its presentation. Draining earlier leaves a gap for an old finalized event.
+                guard !Task.isCancelled,
+                      self.recordingStartGate.allowsStart(token: startToken) else { return }
+                let eventContinuation = self.recognitionEventContinuation
+                let started = await self.session.startBufferedRecording(
+                    mode: effectiveMode, initialAudioChunks: initialAudioChunks,
+                    externalAudioInput: externalAudioInput, stopPolicy: stopPolicy,
+                    autoStopThresholdOverride: autoStopThresholdOverride,
+                    onClaimed: { id in
+                        eventContinuation?.yield(.captureClaimed(
+                            token: startToken, presentationID: id, externalAudio: externalAudioInput
+                        ))
+                    }
+                )
+                guard self.recordingStartGate.allowsStart(token: startToken) else { return }
+                self.finishRecordingStartAttempt(token: startToken)
+                if !started {
+                    self.recordingEventSupersessionGate.cancel(token: startToken)
+                    self.appState.showError(L("暂时无法继续录音，请稍候再试", "Cannot start another recording yet. Try again shortly."))
+                    self.focusWakeupController?.sessionDidFinish()
+                    self.hotkeyManager.isProcessing = false
+                    self.hotkeyManager.resetActiveState()
+                }
+                return
+            }
             let ready = await self.session.awaitIdle()
             guard !Task.isCancelled else {
                 _ = self.cancelRecordingStartAttempt(token: startToken)
@@ -1441,27 +1531,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return
             }
-            let onClaimed: (@Sendable (Int) -> Void)?
-            if source == .focusWakeup {
-                let focusController = self.focusWakeupController
-                onClaimed = { [weak focusController] sessionGeneration in
-                    Task { @MainActor [weak focusController] in
-                        focusController?.sessionDidClaimExternalAudioInput(
-                            sessionGeneration: sessionGeneration
-                        )
-                    }
-                }
-            } else {
-                onClaimed = nil
-            }
             await self.session.startRecording(
                 mode: effectiveMode,
                 requestedAt: recordingRequestedAt,
                 isAutomation: isAutomation,
                 autoStopOnSilence: autoStopOnSilence,
+                allowsFalseStartCancellation: stopPolicy.allowsFalseStartCancellation,
                 initialAudioChunks: initialAudioChunks,
-                autoStopThresholdOverride: autoStopThresholdOverride,
-                quietWakeup: quietWakeup,
+                autoStopThresholdOverride: stopPolicy.quietThreshold ?? autoStopThresholdOverride,
+                quietWakeup: stopPolicy.quietThreshold != nil,
                 externalAudioInput: externalAudioInput,
                 onClaimed: onClaimed
             )
@@ -1725,6 +1803,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func registerHotkeys(for provider: ASRProvider) {
+        hotkeyManager.canStartDuringProcessing = { [weak self] owner in
+            guard let self, case .mode(let id) = owner else { return false }
+            return MainActor.assumeIsolated {
+                self.appState.activityKind == .standard
+                    && RecognitionSession.supportsBufferedRecording(self.appState.currentMode)
+                    && self.appState.availableModes.contains {
+                        $0.id == id && RecognitionSession.supportsBufferedRecording($0)
+                    }
+            }
+        }
         let availableModes = appState.availableModes
         let modes = isEditingManualInput
             ? (manualInputController?.draft.modes ?? availableModes.filter(\.supportsManualInput))
@@ -1814,17 +1902,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
-                // Block new recording while LLM/injection is still in progress.
-                // The current session must finish (paste + history save) before a new one can start.
-                if phase == .processing {
+                // Actions stay exclusive; ordinary text modes may record into the bounded buffer.
+                if phase == .processing && !RecognitionSession.supportsBufferedRecording(capturedMode) {
                     NSLog("[Type4Me] >>> HOTKEY: onStart blocked – still processing")
                     DebugFileLogger.log("hotkey onStart blocked: still processing")
                     MainActor.assumeIsolated { self.hotkeyManager.resetActiveState() }
                     return
                 }
 
-                _ = MainActor.assumeIsolated {
-                    self.requestRecordingStart(mode: capturedMode, source: .hotkey)
+                MainActor.assumeIsolated {
+                    if !self.requestRecordingStart(mode: capturedMode, source: .hotkey) {
+                        self.hotkeyManager.resetActiveState()
+                    }
                 }
             }
             let onStop: @Sendable () -> Void = { [weak self] in
@@ -2053,12 +2142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "hotkey cross-mode finish start=\(startingMode.name) end=\(newMode.name) process=\(processingMode.name)"
             )
 
-            MainActor.assumeIsolated {
-                if allowsModeSwitch {
-                    self.appState.currentMode = processingMode
-                }
-                self.appState.stopRecording()
-            }
+            MainActor.assumeIsolated { self.appState.stopRecording() }
             Task { @MainActor [weak self] in
                 guard let self,
                       self.recordingStartGate.allowsStart(token: recordingStartToken),
@@ -2067,7 +2151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     DebugFileLogger.log("cross-mode finish ignored for stale recording owner")
                     return
                 }
-                if allowsModeSwitch {
+                let canSwitch = allowsModeSwitch && (ownerGeneration >= 0
+                    || RecognitionSession.supportsBufferedRecording(processingMode))
+                if canSwitch {
+                    self.appState.currentMode = processingMode
                     let switchedGeneration = await self.session.switchMode(to: processingMode)
                     guard switchedGeneration == ownerGeneration,
                           self.recordingStartGate.allowsStart(token: recordingStartToken) else {
@@ -2133,8 +2220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             suppressProcessingUI: suppressProcessingUI
                         )
                     }
-                    await self.session.abortInjection()
-                    await self.session.stopRecording()
+                    await self.session.abortAndStopRecording()
                 }
             }
             return true
@@ -2378,8 +2464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await MainActor.run {
                         appState.stopRecording(suppressProcessingUI: suppressProcessingUI)
                     }
-                    await session.abortInjection()
-                    await session.stopRecording()
+                    await session.abortAndStopRecording()
                 }
             }
         }
@@ -2739,6 +2824,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        BoyaButtonService.shared.stop()
         AgentNotificationService.shared.stop()
         AgentInboxStore.shared.onCompletion = nil
         AgentInboxStore.shared.onRequest = nil

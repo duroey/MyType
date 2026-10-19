@@ -30,14 +30,14 @@ enum AgentInboxPresentation: Equatable {
 
 /// Shared sizing configuration for the native panel and its measured SwiftUI content.
 struct AgentInboxPanelLayout {
-    var preferredWidth: CGFloat = 420
+    var preferredWidth: CGFloat = 380
     var maximumVisibleItems = 3
     var estimatedHeaderHeight: CGFloat = 88
     var estimatedRowHeight: CGFloat = 160
     var estimatedEmptyHeight: CGFloat = 144
-    var screenInset: CGFloat = TF.spacingLG
+    var screenInset: CGFloat = 0
     var rowSpacing: CGFloat = TF.spacingSM
-    var listBottomInset: CGFloat = TF.spacingLG
+    var listBottomInset: CGFloat = TF.spacingMD
 
     /// Fits the current content while capping the viewport at the first three rows.
     ///
@@ -216,8 +216,8 @@ final class AgentInboxPanelController: NSObject, NSWindowDelegate {
         )
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
-        // Match the dictation overlay while preserving manual-only keyboard focus.
-        panel.level = .popUpMenu
+        // Float above app windows while leaving the system menu bar and menus unobscured.
+        panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true

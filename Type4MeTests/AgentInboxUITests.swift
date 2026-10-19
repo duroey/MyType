@@ -175,6 +175,60 @@ final class AgentInboxUITests: XCTestCase {
         XCTAssertNil(model.failure)
     }
 
+    /// Both providers' completed reports are consumed locally without native navigation or read sync.
+    @MainActor
+    func testAcknowledgementIsLocalForBothProviders() {
+        for provider in AgentDesktopApplication.allCases {
+            let item = fixture(application: provider, status: .completed)
+            var acknowledged: [AgentInboxItem] = []
+            let model = AgentInboxViewModel(
+                opener: { _ in XCTFail("Acknowledging must not navigate") },
+                markRead: { acknowledged.append($0) }
+            )
+            model.acknowledge(item)
+            XCTAssertEqual(acknowledged, [item])
+            XCTAssertNil(model.failure)
+            XCTAssertFalse(model.isBusy)
+        }
+    }
+
+    /// Acknowledgement copy describes MyType's local action in both supported languages.
+    func testAcknowledgementCopyDoesNotPromiseNativeReadSync() {
+        XCTAssertEqual(AgentInboxCopy.text(.acknowledgeHint, language: .zh),
+                       "移除这条完成消息，不打开会话。")
+        XCTAssertEqual(AgentInboxCopy.text(.acknowledgeHint, language: .en),
+                       "Remove this completed update without opening the conversation.")
+    }
+
+    /// Neither unanswered questions nor an active agent can be acknowledged through a checkmark.
+    @MainActor
+    func testAcknowledgementDoesNotClearRequestsOrActiveWork() {
+        let model = AgentInboxViewModel(markRead: { _ in XCTFail("Must not consume") })
+        model.acknowledge(fixture(status: .running))
+        model.acknowledge(fixture(status: .waiting))
+        model.acknowledge(fixture(status: .completed, pending: [.init(id: "q", kind: .input, text: "Reply")]))
+        model.acknowledge(fixture(status: .completed, pending: [.init(id: "p", kind: .approval, text: "Approve")]))
+    }
+
+    /// A stale visible card cannot consume a newer completion even when its preview is identical.
+    @MainActor
+    func testAcknowledgementDoesNotConsumeNewerCompletion() throws {
+        let store = AgentInboxStore()
+        let session = fixture(status: .completed).session
+        store.apply(.init(session: session, status: .completed, completionID: "turn-one",
+                          observedAt: Date(timeIntervalSince1970: 20)))
+        let selected = try XCTUnwrap(store.items.first)
+        store.apply(.init(session: session, status: .completed, completionID: "turn-two",
+                          observedAt: Date(timeIntervalSince1970: 30)))
+        let model = AgentInboxViewModel(markRead: { store.acknowledgeOpened($0) })
+        model.acknowledge(selected)
+        XCTAssertEqual(store.items.count, 1)
+        XCTAssertEqual(store.items.first?.updatedAt, Date(timeIntervalSince1970: 30))
+        XCTAssertTrue(try XCTUnwrap(store.items.first).isUnread)
+        model.acknowledge(try XCTUnwrap(store.items.first))
+        XCTAssertTrue(store.items.isEmpty)
+    }
+
     /// Quiet automatic panels hide without clearing workers, and fresh attention can reveal them again.
     @MainActor
     func testAutomaticPresentationHidesWhenOnlyBackgroundWorkRemains() async {

@@ -22,7 +22,7 @@ struct AgentRouterResult: Equatable, Sendable {
         case requestedOpen, openedWithoutContinuation, matchedPreview, selectionRequired, noMatch, noSessions
         case noPreviousActivity, noPendingSelection, unsupported, cancelled, failed, catalogUnavailable
         case historySearchUnavailable, historyMappingUnavailable, handoffPrepared, handoffBusy
-        case historyIndexUpdating
+        case historyIndexUpdating, historyTimeUnavailable
         case newTaskPrepared, newTaskBusy
     }
 
@@ -63,7 +63,7 @@ struct AgentRouterResult: Equatable, Sendable {
         case .historyIndexUpdating: return "agent_index_updating"
         case .cancelled: return "discarded"
         case .unsupported: return "agent_session_unsupported"
-        case .failed, .catalogUnavailable, .historySearchUnavailable, .historyMappingUnavailable: return "agent_launch_failed"
+        case .failed, .catalogUnavailable, .historySearchUnavailable, .historyMappingUnavailable, .historyTimeUnavailable: return "agent_launch_failed"
         default: return "agent_no_match"
         }
     }
@@ -118,6 +118,8 @@ struct AgentRouterResult: Equatable, Sendable {
             return zh ? "正在打开另一个新任务，请稍后再试。" : "Another new task is opening. Try again shortly."
         case .historySearchUnavailable:
             return zh ? "历史内容搜索暂不可用，请稍后再试。" : "History search is unavailable. Try again later."
+        case .historyTimeUnavailable:
+            return zh ? "暂时无法按对话时间查找，请稍后再试。" : "Searching by conversation time is unavailable. Try again later."
         case .historyIndexUpdating:
             return zh ? "暂未找到匹配；会话索引尚未确认完整，请查看设置中的索引状态。" : "No match found yet. Index coverage is not confirmed; check its status in Settings."
         case .historyMappingUnavailable:
@@ -182,7 +184,7 @@ actor AgentRouterService {
         String, [AgentActivityCandidate], @escaping RenameHandler, @escaping LinkHandler
     ) async -> AgentActivityCandidate?
     typealias ResultSink = @Sendable (AgentRouterResult) -> Void
-    typealias ContentSearchProvider = @Sendable (String) async throws -> [AgentsViewSearchHit]?
+    typealias ContentSearchProvider = @Sendable (AgentSearchQuery) async throws -> [AgentsViewSearchHit]?
 
     struct Configuration: Sendable {
         var maximumCandidates = 40
@@ -192,6 +194,7 @@ actor AgentRouterService {
     private struct PendingSelection {
         let id: UUID
         let query: String
+        let queryAlias: String?
         var candidates: [AgentActivityCandidate]
         let launch: Bool
     }
@@ -212,6 +215,10 @@ actor AgentRouterService {
     private let matcher: AgentFuzzyMatcher
     private let configuration: Configuration
     private let contentSearchProvider: ContentSearchProvider?
+    private let queryConfiguration: Result<AgentSearchQuery.Configuration, Error>
+    private let now: @Sendable () -> Date
+    private let calendar: Calendar
+    private var lastSearch: (query: AgentSearchQuery, date: Date)?
     private var generation = 0
     private var pendingSelection: PendingSelection?
     private var chooserTask: Task<Void, Never>?
@@ -231,6 +238,9 @@ actor AgentRouterService {
     ///   matcher: Existing similarity scores and confidence limits.
     ///   configuration: Candidate list bound.
     ///   contentSearchProvider: Optional history lookup; nil keeps isolated metadata routing.
+    ///   queryConfiguration: Local ownership/date rules and follow-up lifetime.
+    ///   now: Clock for resolving relative dates and expiring in-memory context.
+    ///   calendar: User calendar and time zone for conversation-date constraints.
     init(
         store: AgentActivityStore = .shared,
         catalogProvider: @escaping CatalogProvider = {
@@ -250,7 +260,9 @@ actor AgentRouterService {
         },
         matcher: AgentFuzzyMatcher = AgentFuzzyMatcher(),
         configuration: Configuration = Configuration(),
-        contentSearchProvider: ContentSearchProvider? = nil
+        contentSearchProvider: ContentSearchProvider? = nil,
+        queryConfiguration: AgentSearchQuery.Configuration? = nil,
+        now: @escaping @Sendable () -> Date = { Date() }, calendar: Calendar = .current
     ) {
         precondition(configuration.maximumCandidates > 0 && configuration.maximumSuggestedCandidates > 0)
         precondition(configuration.maximumRecentSuggestions >= 0)
@@ -262,6 +274,13 @@ actor AgentRouterService {
         self.matcher = matcher
         self.configuration = configuration
         self.contentSearchProvider = contentSearchProvider
+        self.queryConfiguration = Result {
+            let value = try queryConfiguration ?? AgentSearchQuery.Configuration.bundled()
+            try value.validate()
+            return value
+        }
+        self.now = now
+        self.calendar = calendar
     }
 
     /// Searches activities or resolves a frozen pending choice without blocking recording.
@@ -288,12 +307,15 @@ actor AgentRouterService {
                                              application: selected.application)
                 }
                 clearPendingSelection()
-                return await open(selected, launch: launch && pending.launch, owner: owner, queryAlias: pending.query)
+                return await open(selected, launch: launch && pending.launch, owner: owner, queryAlias: pending.queryAlias)
             }
             return AgentRouterResult(outcome: .noPendingSelection)
         }
         clearPendingSelection()
-        if intent == .cancel { return AgentRouterResult(outcome: .cancelled) }
+        if intent == .cancel {
+            lastSearch = nil
+            return AgentRouterResult(outcome: .cancelled)
+        }
         do {
             let catalog = try await catalogProvider()
             guard owns(owner) else { return AgentRouterResult(outcome: .cancelled) }
@@ -308,16 +330,38 @@ actor AgentRouterService {
             let candidates = candidates(snapshot: snapshot, sessions: catalog.sessions)
             switch intent {
             case .browse:
+                lastSearch = nil
                 return presentSelection(query: "", candidates: candidates, launch: launch)
             case .continueLast:
+                lastSearch = nil
                 guard let candidate = candidates.first(where: {
                     $0.activityID == snapshot.lastActivityID && $0.session.id == snapshot.lastSessionKey
                 }) else { return AgentRouterResult(outcome: .noPreviousActivity) }
                 return await open(candidate, launch: launch, owner: owner)
             case .search(let query, let continuing):
                 guard !query.isEmpty else { return AgentRouterResult(outcome: .noMatch) }
+                let search = try resolveSearch(query)
+                let scoped = candidates.filter { matchesSource($0.application, agent: search.agent) }
+                let unavailable = catalog.unavailableApplications.filter { application in
+                    matchesSource(application, agent: search.agent)
+                        && !(search.agent == nil && catalog.absentApplications.contains(application))
+                        && !catalog.sessions.contains { $0.application == application }
+                }
+                let traceID = UUID().uuidString
+                let started = ContinuousClock.now
+                logSearch(traceID, search: search, catalog: catalog)
+                if !unavailable.isEmpty {
+                    return AgentRouterResult(outcome: .catalogUnavailable, unavailableApplications: unavailable)
+                }
+                let rememberQuery = search.agent == nil && search.messageInterval == nil && !search.isRefinement
+                if search.text.isEmpty, search.messageInterval == nil {
+                    return presentSelection(query: query,
+                                            candidates: Array(scoped.prefix(configuration.maximumSuggestedCandidates)),
+                                            launch: launch, rememberQuery: false)
+                }
                 if let contentSearchProvider {
-                    let remembered = rememberedCandidates(query: query, candidates: candidates, snapshot: snapshot)
+                    let remembered = rememberQuery
+                        ? rememberedCandidates(query: search.text, candidates: scoped, snapshot: snapshot) : []
                     if remembered.count == 1, let candidate = remembered.first {
                         return await open(candidate, launch: launch, owner: owner)
                     }
@@ -325,32 +369,50 @@ actor AgentRouterService {
                         return presentSelection(query: query, candidates: remembered, launch: launch)
                     }
                     do {
-                        let hits = try await contentSearchProvider(query)
+                        let hits = try await contentSearchProvider(search)
                         guard owns(owner) else { return AgentRouterResult(outcome: .cancelled) }
                         if let hits {
-                            guard !hits.isEmpty else { return AgentRouterResult(outcome: .noMatch) }
-                            let matched = historyCandidates(hits: hits, candidates: candidates, sessions: catalog.sessions)
+                            let eligible = hits.filter { hit in
+                                guard search.agent == nil || hit.agent == search.agent else { return false }
+                                guard let interval = search.messageInterval else { return true }
+                                guard let timestamp = hit.timestamp else { return false }
+                                return timestamp >= interval.start && timestamp < interval.end
+                            }
+                            let matched = historyCandidates(hits: eligible, candidates: scoped, sessions: catalog.sessions)
+                            let unmapped = eligible.filter { AgentsViewSearchService.nativeSession(for: $0, in: catalog.sessions) == nil }.count
+                            DebugFileLogger.log("agent search trace=\(traceID) hits_codex=\(hits.filter { $0.agent == "codex" }.count) hits_claude=\(hits.filter { $0.agent == "claude" }.count) eligible=\(eligible.count) unmapped=\(unmapped) shown_codex=\(matched.filter { $0.application == .codex }.count) shown_claude=\(matched.filter { $0.application == .claudeCode }.count) elapsed=\(started.duration(to: .now))")
+                            guard !eligible.isEmpty else { return AgentRouterResult(outcome: .noMatch) }
+                            let codexHits = eligible.filter { $0.agent == "codex" }
+                            if !codexHits.isEmpty, !codexHits.contains(where: {
+                                AgentsViewSearchService.nativeSession(for: $0, in: catalog.sessions) != nil
+                            }) {
+                                return AgentRouterResult(outcome: .historyMappingUnavailable, application: .codex)
+                            }
                             guard !matched.isEmpty else {
                                 return AgentRouterResult(outcome: .historyMappingUnavailable)
                             }
                             // Fusion ranks are not confidence: every content match requires a choice.
-                            return presentSelection(query: query, candidates: matched, launch: launch)
+                            return presentSelection(query: query, candidates: matched, launch: launch, rememberQuery: rememberQuery)
                         }
                     } catch is CancellationError {
                         return AgentRouterResult(outcome: .cancelled)
                     } catch AgentsViewSearchError.indexUpdating {
                         return AgentRouterResult(outcome: owns(owner) ? .historyIndexUpdating : .cancelled)
+                    } catch AgentsViewSearchError.messageTimeFilterUnavailable {
+                        return AgentRouterResult(outcome: owns(owner) ? .historyTimeUnavailable : .cancelled)
                     } catch {
                         return AgentRouterResult(outcome: owns(owner) ? .historySearchUnavailable : .cancelled)
                     }
                 }
-                let ranked = rank(query: query, candidates: candidates, snapshot: snapshot)
+                // Session activity time cannot stand in for an eligible conversation message.
+                guard search.messageInterval == nil else { return AgentRouterResult(outcome: .historyTimeUnavailable) }
+                let ranked = rank(query: search.text, candidates: scoped, snapshot: snapshot)
                 guard let best = ranked.first else {
                     return AgentRouterResult(outcome: .noMatch, unavailableApplications: catalog.unavailableApplications)
                 }
                 if best.score < matcher.threshold {
-                    let suggestions = suggestedCandidates(ranked: ranked, recent: candidates)
-                    return presentSelection(query: query, candidates: suggestions, launch: launch)
+                    let suggestions = suggestedCandidates(ranked: ranked, recent: scoped)
+                    return presentSelection(query: query, candidates: suggestions, launch: launch, rememberQuery: rememberQuery)
                 }
                 let secondActivity = ranked.first { $0.activityID != best.activityID }
                 let ambiguous = secondActivity.map { best.score - $0.score < matcher.ambiguityMargin } ?? false
@@ -363,13 +425,67 @@ actor AgentRouterService {
                     }
                 }
                 let relevant = ranked.filter { $0.score >= matcher.threshold }
-                return presentSelection(query: query, candidates: relevant, launch: launch)
+                return presentSelection(query: query, candidates: relevant, launch: launch, rememberQuery: rememberQuery)
             case .ordinal, .cancel:
                 return AgentRouterResult(outcome: .cancelled)
             }
         } catch {
             return AgentRouterResult(outcome: owns(owner) ? .catalogUnavailable : .cancelled)
         }
+    }
+
+    /// Resolves short metadata corrections against the most recent topic in memory.
+    ///
+    /// Args:
+    ///   text: Current utterance without its navigation prefix.
+    ///
+    /// Returns:
+    ///   Independent topic, owning provider and half-open conversation-date constraints.
+    ///
+    /// Raises:
+    ///   AgentSearchQueryError: Parsing settings or relative calendar arithmetic are invalid.
+    private func resolveSearch(_ text: String) throws -> AgentSearchQuery {
+        let settings = try queryConfiguration.get()
+        let date = now()
+        let parsed = try AgentSearchQuery.parse(text, now: date, calendar: calendar, configuration: settings)
+        var resolved = parsed
+        if parsed.isRefinement, let previous = lastSearch,
+           date.timeIntervalSince(previous.date) >= 0,
+           date.timeIntervalSince(previous.date) <= settings.contextLifetimeSeconds {
+            resolved = AgentSearchQuery(
+                text: previous.query.text, agent: parsed.agent ?? previous.query.agent,
+                messageInterval: parsed.messageInterval ?? previous.query.messageInterval,
+                timezoneIdentifier: parsed.timezoneIdentifier, isRefinement: true
+            )
+        }
+        lastSearch = (resolved, date)
+        return resolved
+    }
+
+    /// Compares native application identity with an optional archive provider constraint.
+    ///
+    /// Args:
+    ///   application: Catalog application identity.
+    ///   agent: Explicit archive provider or nil for both supported providers.
+    ///
+    /// Returns:
+    ///   Whether the application belongs to the requested source.
+    private func matchesSource(_ application: AgentDesktopApplication, agent: String?) -> Bool {
+        guard let agent else { return true }
+        return agent == (application == .codex ? "codex" : "claude")
+    }
+
+    /// Records search-stage counts and constraints without transcripts, titles or paths.
+    ///
+    /// Args:
+    ///   traceID: Random identifier joining stages of this lookup.
+    ///   search: Parsed constraints; its topic is deliberately omitted.
+    ///   catalog: Native source availability and counts.
+    private func logSearch(_ traceID: String, search: AgentSearchQuery, catalog: AgentSessionCatalogSnapshot) {
+        let interval = search.messageInterval.map {
+            "\(ISO8601DateFormatter().string(from: $0.start))/\(ISO8601DateFormatter().string(from: $0.end))"
+        } ?? "none"
+        DebugFileLogger.log("agent search trace=\(traceID) source=\(search.agent ?? "all") message_interval=\(interval) timezone=\(search.timezoneIdentifier) refinement=\(search.isRefinement) catalog_codex=\(catalog.sessions.filter { $0.application == .codex }.count) catalog_claude=\(catalog.sessions.filter { $0.application == .claudeCode }.count) unavailable_count=\(catalog.unavailableApplications.count) absent_count=\(catalog.absentApplications.count)")
     }
 
     /// Reuses only exact names the user has explicitly assigned or confirmed by choosing.
@@ -402,7 +518,8 @@ actor AgentRouterService {
     ///   Immediate browser status.
     func browse() async -> AgentRouterResult { await handle("查看事情") }
 
-    /// Cancels only the currently owned chooser; old completion callbacks are ignored.
+    /// Cancels the owned chooser while retaining short-lived follow-up context.
+    /// Explicit spoken cancellation also clears context in handle(_:launch:).
     func cancelPendingSelection() {
         generation += 1
         clearPendingSelection()
@@ -538,10 +655,12 @@ actor AgentRouterService {
     ///   query: Search text shown by the picker.
     ///   candidates: Ranked, stable candidates including unsupported providers.
     ///   launch: Whether a selection may open a desktop conversation.
+    ///   rememberQuery: Whether the phrase can safely become a permanent confirmed alias.
     ///
     /// Returns:
     ///   Selection-required status.
-    private func presentSelection(query: String, candidates: [AgentActivityCandidate], launch: Bool) -> AgentRouterResult {
+    private func presentSelection(query: String, candidates: [AgentActivityCandidate], launch: Bool,
+                                  rememberQuery: Bool = true) -> AgentRouterResult {
         guard !candidates.isEmpty else { return AgentRouterResult(outcome: .noSessions) }
         let requestID = UUID()
         var activityOrder: [UUID] = []
@@ -552,7 +671,8 @@ actor AgentRouterService {
         }
         // Freeze the same group order that the panel renders, so spoken ordinals match visible rows.
         let shown = Array(activityOrder.flatMap { groups[$0] ?? [] }.prefix(configuration.maximumCandidates))
-        pendingSelection = PendingSelection(id: requestID, query: query, candidates: shown, launch: launch)
+        pendingSelection = PendingSelection(id: requestID, query: query, queryAlias: rememberQuery ? query : nil,
+                                            candidates: shown, launch: launch)
         let chooser = chooser
         chooserTask = Task { [weak self] in
             guard let router = self else { return }
@@ -624,7 +744,7 @@ actor AgentRouterService {
         generation += 1
         let owner = generation
         let result = if let candidate {
-            await open(candidate, launch: pending.launch, owner: owner, queryAlias: pending.query)
+            await open(candidate, launch: pending.launch, owner: owner, queryAlias: pending.queryAlias)
         } else { AgentRouterResult(outcome: .cancelled) }
         guard owns(owner) else { return }
         chooserTask = nil
