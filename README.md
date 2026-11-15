@@ -4,112 +4,111 @@
 
 # MyType
 
-本仓库是 [MyType](https://github.com/duroey/MyType)，基于 [Type4Me](https://github.com/joewongjc/type4me) 持续开发。保留语音输入与文字处理能力，并增加桌面 Agent 会话检索、交接和消息队列。
+**让口述接上桌面 Agent 的工作流。**
 
-MyType 使用 `/Applications/MyType.app`、`com.mytype.app` 和 `mytype://`，数据保存在 `~/Library/Application Support/mytype/`。安装与打包请按 [本仓库说明](CONTRIBUTING.md) 操作；下方图示、演示和下载属于上游 Type4Me，不包含 MyType 的 Agent 功能，也不能用来更新 MyType 体验版。
+MyType 是一个以语音为入口的 macOS 个人 Agent 交互项目。我基于 [Type4Me](https://github.com/joewongjc/type4me) 的语音输入与文字处理能力，扩展了桌面 Agent 会话检索、任务路由、上下文交接和统一 Inbox，探索从表达想法到继续推进工作的完整过程。
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/header-dark.svg" />
-    <img src="docs/images/header.svg" width="100%" alt="Type4Me — macOS 语音输入法：说出想法，即刻成文" />
-  </picture>
-</p>
+[了解工作流](#从一句口述到继续一项工作) · [看关键实现](#我做了哪些关键设计) · [从源码使用](#从源码使用)
 
-<p align="center">
-  <a href="https://github.com/joewongjc/type4me/releases/latest"><img src="https://img.shields.io/github/v/release/joewongjc/type4me?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=131313" alt="最新版本" /></a>
-  <a href="https://github.com/joewongjc/type4me/releases"><img src="https://img.shields.io/github/downloads/joewongjc/type4me/total?label=%E4%B8%8B%E8%BD%BD&color=3B6FF0" alt="下载量" /></a>
-  <img src="https://img.shields.io/badge/macOS-14%2B-555" alt="macOS 14+" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Proprietary%20%2B%20OSS-555" alt="专有商业授权，包含开源组件" /></a>
-</p>
+## 为什么做
 
-Type4Me 是一款免费开源的 macOS 语音输入法。按下快捷键说话，文字边说边出现在光标处；同一段话还可以一键润色、翻译、向 AI 提问，或者直接操作 Mac。识别引擎、大模型和 Prompt 都由你选，历史记录存在本机，随时可以导出。
+使用多个桌面 Agent 时，一个想法往往还要经过找旧对话、核对项目、补充背景、交接任务和检查结果，才能继续推进。工作分散在不同窗口和会话里，表达与执行之间有不少手动衔接。
 
-## 上游 Type4Me 下载
+我希望以正在处理的事情为中心组织入口：用户说出事项或下一步要求，系统帮助找回对应工作，准备交接或新任务，再把反馈带回可继续处理的位置。
 
-| 版本 | 说明 | 大小 |
-| --- | --- | --- |
-| ✨ **[云端版（推荐）](https://github.com/joewongjc/type4me/releases/download/v2.10.0/Type4Me-v2.10.0-cloud.dmg)** | Intel 与 Apple Silicon 通用。需要自备语音识别和大模型的 API Key，识别推荐火山引擎（豆包）或 Soniox。[配置指引](https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr) | ~14 MB |
-| **[本地版](https://github.com/joewongjc/type4me/releases/download/v2.10.0/Type4Me-v2.10.0-local-apple-silicon.dmg)** | 仅支持 Apple Silicon。内置 SenseVoice + Qwen3-ASR 离线识别，约占 8 GB 内存，建议 32 GB 以上的机器使用；文本处理仍需 API Key 或本地 Ollama | ~720 MB |
+因此，MyType 保留日常语音输入，同时把开发重点放在输入之后的任务衔接。
 
-需要 macOS 14 (Sonoma) 及以上。两个版本共用一份配置，可以随时互相替换。安装包已通过 Apple 公证，首次打开按引导授予**麦克风**和**辅助功能**权限就能用。
+## 从一句口述到继续一项工作
 
-## 演示
+在 Agent 专用入口中，口述先进入操作意图判断，再进入对应的工作流程：
 
-<video src="https://github.com/user-attachments/assets/d5ad6da9-b924-4fd6-9812-d0d9868563a4" width="720" controls>Type4Me 演示视频</video>
+```text
+口述事项
+  ├─ 找回工作 → 检索候选 → 确认并打开原会话
+  ├─ 新建任务 → 确认项目 → 进入新的 Agent 任务
+  └─ 交接工作 → 选择来源与接收方 → 预览上下文并投递
+                                      ↓
+                           Inbox 汇集反馈与待处理请求
+                                      ↓
+                                回到原会话继续
+```
 
-每个模式可以绑定多个全局快捷键，每个快捷键单独设为「按住说话」或「按一下开关」。
-
-## 内置模式 + 自由定义
-
-| 模式 | 用途 |
+| 用户要做的事 | MyType 怎样承接 |
 | --- | --- |
-| **快速模式** | ⚡️仅做语音识别，速度最快 |
-| **智能感知** | 日常主力模式，支持改口、去掉口头禅，并参考当前 App 和上下文调整措辞 |
-| **翻译模式** | 自动翻译成18 种目标语言中的任意一种 |
-| **随便问** | 选中屏幕上的文字，直接语音提问；支持连续追问，会话会保存下来 |
-| **Mac 操作** | 说一句「打开 Safari」「音量调到 30」「锁屏」就能执行 |
-| **语音润色** | 按固定规则把口语整理成书面文字，输出风格稳定 |
-| **Prompt 优化** | 把一句需求扩写成完整的 Prompt，适合发给 ChatGPT、Claude |
-| **代办模式** | 结合语音、选中文字和剪贴板，直接生成可用的成品 |
+| 找回之前的工作 | 用事项、项目或内容描述检索历史会话，保留应用来源，并定位到桌面原会话。 |
+| 开始一项新任务 | 识别明确的新建意图，先让用户确认项目，再准备新的 Agent 任务。 |
+| 把背景交给另一个 Agent | 选择来源和接收会话，组织可见历史与后续要求，经原生接口交接。 |
+| 处理 Agent 的反馈 | 在统一 Inbox 查看完成反馈、等待输入及待处理请求，回到对应会话继续工作。 |
 
-拿不准用哪个，就用**智能感知**。你也可以新建模式：Prompt 模板里可以用 `{text}`（本次语音）、`{selected}`（选中的文字）、`{clipboard}`（剪贴板）三个变量，把任意文本处理流程绑到一个快捷键上。不方便说话的时候，按手动输入快捷键直接打字，同样可以调用这些模式。
+当前公开实现围绕 **Codex 与 Claude** 两类桌面 Agent 展开。任务由对应 Agent 执行，MyType 负责入口、工作定位、交接与反馈衔接。
 
-各模式的示例和适用场景见 [模式与功能详解](docs/usage/modes.md)。
+## 我做了哪些关键设计
 
-## 功能扩展
+### 1. 先判断用户要怎样推进工作
 
-- **本地、云端语音识别**：下载本地版，可用 SenseVoice + Qwen3-ASR进行识别，完全免费；云端支持火山引擎（豆包）、Soniox、OpenAI 等 15 家服务。
-- **大模型随意换**：豆包、DeepSeek、Kimi、智谱、MiniMax、小米 MiMo、OpenAI、Claude、Gemini、OpenRouter，也可以接 Ollama 或任意 OpenAI 兼容接口。
-- **语音改口**：刚输入的文字有错，按 `Fn` + `R` 说「改成下午 2 点」，只改那一处，可以一键或用语音撤销。
-- **词汇管理**：热词提高专有名词的识别率，片段替换可以把「我的邮箱」换成真实地址。装上 [type4me-vocab-skill](https://github.com/joewongjc/type4me-vocab-skill) 后，对 AI Agent 说一句「Qwen3.5 不要识别成 Queen 3.5」，它会帮你把词库维护好。
-- **菜单栏控制中心**：在菜单栏查看录音状态，切换模式、麦克风、识别引擎、文本处理模型和翻译目标语言。
-- **历史与用量**：保存每次的原始识别和处理结果，支持搜索和导出 CSV；用量看板按模型统计 Token、预估费用和耗时。首页显示输入时长、字数和活跃热力图。
-- **本地备份**：每天自动备份历史、模式、词汇、快捷键和配置，保留最近 7 份。
-- **URL Scheme**：MyType 用 `mytype://toggle` 等命令接入 Stream Deck、快捷指令、Raycast、Alfred 或脚本，后台调用不会抢走焦点。见 [命令参考](docs/usage/url-scheme.md)。
+同一句口述可能是在找旧任务、建立新任务，或要求转交已有上下文。我将这些操作分开处理，使事项描述不会轻易变成新任务，交接也有明确的来源、接收方与确认步骤。
 
-## 界面预览
+实现包括意图分类、事项查询、候选选择、新任务准备及交接窗口。
 
-<table>
-  <tr>
-    <td width="50%"><img src="https://github.com/user-attachments/assets/ed1b714f-fbaf-41ac-92dc-546e0f0e5428" alt="首页：使用概览、活跃热力图和我的模式" /></td>
-    <td width="50%"><img src="docs/screenshots/screenshot-askit.png" alt="随便问：选中内容直接提问" /></td>
-  </tr>
-  <tr>
-    <td><img src="https://github.com/user-attachments/assets/3008f47a-7718-4f83-9961-7a0339568ceb" alt="历史与大模型用量看板" /></td>
-    <td><img src="https://github.com/user-attachments/assets/63e0bd41-3d79-482f-a0e0-e48c6037dbf0" alt="外观设置：录音条实时预览" /></td>
-  </tr>
-</table>
+[意图分类](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentIntentClassifier.swift) · [任务路由](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentRouterService.swift) · [新任务服务](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentNewTaskService.swift)
 
-## 使用建议
+### 2. 找到历史内容之后，还要回到正确的会话
 
-- **识别用云端引擎**：费用很低。作者高强度用了约 5 万字（5 小时），花了 5 块钱左右，火山引擎新用户还送 40 小时。本地模型效果不错，但很吃内存，而且 SenseVoice 识别英文单词偏弱。
-- **大模型选轻量、不带思考的**：整理文字用不上推理。作者自己用 Seed-2.0-lite；关不掉思考的模型（比如 MiniMax M2.7）会慢很多。如果你觉得处理慢，欢迎在 Issue 里告诉我用的是哪家、哪个模型。
-- **装上词库 Skill**：专有名词识别不准，是所有语音输入法的通病。配合 [Skill](https://github.com/joewongjc/type4me-vocab-skill) 用上一两天，常见的错词基本都能纠正过来。
+检索结果需要关联具体的工作现场。我将事项匹配与原生会话目录结合：以 **Qwen3-Embedding** 支持语义匹配，通过 AgentsView 检索历史内容，再将结果映射到 Codex / Claude 的会话身份与导航能力。
 
-## 为什么做 Type4Me
+候选匹配、原会话定位和请求打开分别记录状态；内容命中但无法定位时，也保留明确的反馈。
 
-市面上的语音输入法，至少有下面一个问题：贵（$30/月）、封闭（记录导不出来）、改不了（不能自定义 Prompt）、慢（强制优化加上网络延迟）。
+[会话目录](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentSessionCatalog.swift) · [索引服务](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentIndexService.swift) · [Embedding 服务](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentEmbeddingService.swift)
 
-作为某款最贵识别工具的前粉丝，我的感受一直是：**「它怎么可以这么好用，又这么难用」**。况且，也不是每句话都需要说得工工整整。
+### 3. 让交接和反馈共享同一个任务身份
 
-## 参与贡献
+上下文交接包含所选来源的可见历史、接收会话和用户的下一步要求。MyType 分别接入 **Codex queue** 与 **Claude inbox** 原生路径，并处理接收方不可用、身份歧义及投递失败等状态。
 
-欢迎向本仓库提交 Issue 和 PR。合并上游改动时保留 MyType 的应用身份、数据与凭证隔离、Agent 功能及已有用户设置，并验证相关行为。
+Inbox 延续相同的应用与会话身份，区分完成消息、等待输入和待处理请求，使收到反馈后仍能回到对应工作。投递状态与 Agent 的任务完成反馈分别呈现。
 
-从源码构建、签名和架构说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，设计文档从 [docs/README.md](docs/README.md) 进入。想让 AI Agent 帮你从源码部署，把这个仓库的链接发给它就行。
+[原生交接](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentHandoffDeliveryService.swift) · [消息来源监听](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentNotificationService.swift) · [Inbox 状态](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentInboxStore.swift)
 
-## 致谢
+## 当前结果与迭代方向
 
-[SenseVoice](https://github.com/FunAudioLLM/SenseVoice) · [streaming-sensevoice](https://github.com/pengzhendong/streaming-sensevoice) · [asr-decoder](https://github.com/pengzhendong/asr-decoder) · [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) · [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) · [mlx-qwen3-asr](https://github.com/moona3k/mlx-qwen3-asr)
+公开代码已将语音入口、两类 Agent 的会话检索、任务路由、原生交接、新任务与 Inbox 组织为一套工作流程。
 
-## Star History
+这是一个持续迭代的个人研发项目。当前成果以可查的实现与工作链路为主，端到端体验仍随桌面 Agent 的版本和原生接口持续验证。
 
-<a href="https://star-history.dera.page/#joewongjc/type4me&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&theme=dark&legend=top-left" />
-    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&legend=top-left" />
-  </picture>
-</a>
+本地研发还在探索更多 Agent 接入、连续录音与上下文绑定，以及低打扰的多模态、全双工交互。这些进展与当前公开版本分别管理。
+
+## 从源码使用
+
+1. 准备 **macOS 14 及以上**和 Xcode Command Line Tools。
+2. 按 [CONTRIBUTING.md](CONTRIBUTING.md) 构建与配置 MyType；本地 ASR 的可选依赖也在其中说明。
+3. 配置需要使用的语音识别、大模型或本地模型服务。
+4. Agent 历史检索需要 **AgentsView 后端及相应许可证**；按构建说明配置后，在设置中授权读取本机会话。
+5. 保持对应的 Codex / Claude 环境可用，在 Agent 入口中找回、新建或交接工作。
+
+本仓库当前以源码构建方式提供 MyType。上游 Type4Me 的安装包与演示展示其基础产品，不包含 MyType 的 Agent 扩展。
+
+<details>
+<summary><b>保留的基础语音与文字处理能力</b></summary>
+
+MyType 沿用 Type4Me 的输入基座，包括：
+
+- 本地与云端语音识别，以及识别服务配置。
+- 文字润色、翻译、语音提问、自定义 Prompt 和手动输入。
+- 热词、片段替换、历史记录与用量管理。
+- 可配置快捷键和菜单栏入口。
+
+使用方式见 [模式与功能详解](docs/usage/modes.md) 和 [URL Scheme 命令参考](docs/usage/url-scheme.md)。
+
+</details>
+
+## 项目来源与个人贡献
+
+[Type4Me](https://github.com/joewongjc/type4me) 提供语音识别、文字处理及原有界面基础。我的工作围绕桌面 Agent 的会话检索、任务路由、原生交接、新任务和反馈入口展开，并通过自用问题定位与迭代推进系统衔接。
+
+MyType 保留独立的应用身份、数据与配置边界。上游文档和界面素材保留其来源，不能作为 MyType 新增能力的演示或使用效果。
+
+开发与使用文档：[构建与贡献](CONTRIBUTING.md) · [文档中心](docs/README.md) · [开发指南](AGENTS.md)
+
+感谢 [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)、[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 及其他基础组件；完整来源见[第三方声明](Type4Me/Resources/THIRD_PARTY_LICENSES.txt)。
 
 ## 许可证
 

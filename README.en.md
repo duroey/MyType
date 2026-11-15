@@ -4,112 +4,111 @@
 
 # MyType
 
-This repository is [MyType](https://github.com/duroey/MyType), an independently maintained fork of [Type4Me](https://github.com/joewongjc/type4me). It retains voice input and text processing while adding desktop Agent session search, handoff, and a notification inbox.
+**Connect spoken intent to desktop Agent workflows.**
 
-MyType uses `/Applications/MyType.app`, `com.mytype.app`, and `mytype://`; its data lives in `~/Library/Application Support/mytype/`. Follow [this repository's build instructions](CONTRIBUTING.md) for installation. The artwork, demo, and downloads below belong to upstream Type4Me, do not include MyType's Agent features, and must not be used to update a MyType experience build.
+MyType is a voice-first personal Agent interaction project for macOS. Building on [Type4Me](https://github.com/joewongjc/type4me)'s voice input and text processing, I added desktop Agent session search, task routing, context handoff and a shared Inbox to explore the path from expressing an idea to continuing the work.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/header-en-dark.svg" />
-    <img src="docs/images/header-en.svg" width="100%" alt="Type4Me — voice input for macOS: Say it. Shape it." />
-  </picture>
-</p>
+[Follow the workflow](#from-a-spoken-request-to-continuing-the-work) · [Explore the implementation](#key-design-decisions) · [Build from source](#build-from-source)
 
-<p align="center">
-  <a href="https://github.com/joewongjc/type4me/releases/latest"><img src="https://img.shields.io/github/v/release/joewongjc/type4me?label=release&color=131313" alt="Latest release" /></a>
-  <a href="https://github.com/joewongjc/type4me/releases"><img src="https://img.shields.io/github/downloads/joewongjc/type4me/total?label=downloads&color=3B6FF0" alt="Downloads" /></a>
-  <img src="https://img.shields.io/badge/macOS-14%2B-555" alt="macOS 14+" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Proprietary%20%2B%20OSS-555" alt="Proprietary licensing with open-source components" /></a>
-</p>
+## Why I built it
 
-Type4Me is a free, open-source voice input app for macOS. Hold a hotkey and talk — text streams in at your cursor as you speak. The same hotkey workflow can polish what you said, translate it, ask AI about it, or turn it into a Mac action. You choose the speech engine, the LLM and the prompts; your history stays on your Mac and can be exported anytime.
+When work spans several desktop Agents, an idea often still requires finding an old conversation, checking its project, supplying context, handing work over and checking the result. These manual connections separate expressing a request from advancing the task.
 
-## Upstream Type4Me downloads
+I wanted an entry point organized around the work itself: describe an activity or next step, find its working context, prepare a handoff or new task, and return to the right conversation when feedback arrives.
 
-| Edition | Details | Size |
-| --- | --- | --- |
-| ✨ **[Cloud (recommended)](https://github.com/joewongjc/type4me/releases/download/v2.10.0/Type4Me-v2.10.0-cloud.dmg)** | Intel and Apple Silicon. Bring your own speech and LLM API keys; Volcano Engine (Doubao) or Soniox recommended for recognition. [Setup guide](https://my.feishu.cn/wiki/QdEnwBMfUi0mN4k3ucMcNYhUnXr) | ~14 MB |
-| **[Local](https://github.com/joewongjc/type4me/releases/download/v2.10.0/Type4Me-v2.10.0-local-apple-silicon.dmg)** | Apple Silicon only. Bundles SenseVoice + Qwen3-ASR for offline recognition (~8 GB RAM, 32 GB+ Macs recommended). Text processing still needs an API key or local Ollama | ~720 MB |
+MyType retains everyday voice input while focusing its development on those connections after input.
 
-Requires macOS 14 (Sonoma) or later. Both editions share the same settings, so you can switch anytime. The app is notarized by Apple; on first launch, grant **Microphone** and **Accessibility** access as prompted.
+## From a spoken request to continuing the work
 
-## Demo
+In the dedicated Agent entry point, a spoken request is classified before entering the appropriate workflow:
 
-<video src="https://github.com/user-attachments/assets/d5ad6da9-b924-4fd6-9812-d0d9868563a4" width="720" controls>Type4Me demo video</video>
+```text
+Spoken request
+  ├─ Resume work → Search candidates → Confirm and open the original chat
+  ├─ New task → Confirm the project → Prepare a new Agent task
+  └─ Handoff → Select source and recipient → Review context and deliver
+                                                        ↓
+                                    Inbox collects feedback and requests
+                                                        ↓
+                                      Return to the chat and continue
+```
 
-Each mode can have several global hotkeys, and each hotkey can be hold-to-talk or press-to-toggle.
-
-## Built-in modes + your own
-
-| Mode | What it does |
+| What the user needs | How MyType connects the steps |
 | --- | --- |
-| **Quick Mode** | ⚡️ Speech recognition only — the fastest path |
-| **Intelli Sense** | Your everyday mode: handles self-corrections, drops filler words, and adapts wording to the current app and context |
-| **Translation** | Translates automatically into any of 18 target languages |
-| **Ask Anything** | Select text anywhere and ask about it by voice; follow-ups are kept as conversations |
-| **Mac Actions** | "Open Safari", "Volume to 30", "Lock screen" — said and done |
-| **Voice Polish** | Turns speech into clean written text with a consistent, predictable style |
-| **Prompt Optimization** | Expands a one-line request into a well-structured prompt for ChatGPT or Claude |
-| **Task Delegation** | Combines your voice, the selection and the clipboard to produce a finished result |
+| Find earlier work | Search by activity, project or content; retain the application source and locate the original desktop conversation. |
+| Start a new task | Recognize an explicit request to create work, confirm its project and prepare the new Agent task. |
+| Give another Agent the background | Select the source and recipient, organize visible history and next-step instructions, and deliver through native interfaces. |
+| Respond to Agent feedback | Collect completion feedback, waiting states and pending requests in one Inbox, with a route back to the corresponding conversation. |
 
-Not sure which one to use? Start with **Intelli Sense**. You can also create your own modes: prompt templates accept `{text}` (what you said), `{selected}` (selected text) and `{clipboard}`, so any text workflow can live behind one hotkey. When you can't talk, the manual input hotkey lets you type instead and still run any mode.
+The current public implementation covers **Codex and Claude** desktop conversations. Those Agents perform the tasks; MyType connects the entry point, work discovery, handoff and feedback.
 
-Examples and use cases for each mode: [Modes & Features](docs/usage/modes.en.md).
+## Key design decisions
 
-## Extended features
+### 1. Determine how the user wants to advance the work
 
-- **Local and cloud recognition**: the Local edition runs SenseVoice + Qwen3-ASR on your Mac, completely free; in the cloud, choose from 15 services including Volcano Engine (Doubao), Soniox and OpenAI.
-- **Any LLM**: Doubao, DeepSeek, Kimi, Zhipu, MiniMax, Xiaomi MiMo, OpenAI, Claude, Gemini, OpenRouter, or Ollama and any OpenAI-compatible endpoint.
-- **Voice Revise**: Spotted a mistake? Press `Fn` + `R` and say "make it 2 PM" — only that part changes, and you can undo by button or voice.
-- **Vocabulary**: hotwords improve recognition of names and jargon; snippets expand phrases like "my email" into the real address. With [type4me-vocab-skill](https://github.com/joewongjc/type4me-vocab-skill) installed, tell your AI agent "don't transcribe Qwen3.5 as Queen 3.5" and it maintains your vocabulary for you.
-- **Menu bar control center**: see recording status and switch mode, microphone, speech engine, LLM and translation target from the menu bar.
-- **History & usage**: every raw transcript and processed result is saved, searchable and exportable to CSV; the usage dashboard tracks tokens, estimated cost and latency per model. The home page shows time spoken, word count and an activity heatmap.
-- **Local backups**: history, modes, vocabulary, hotkeys and settings are snapshotted daily; the latest seven are kept.
-- **URL Scheme**: drive MyType recording from Stream Deck, Shortcuts, Raycast, Alfred or scripts with commands like `mytype://toggle`, without stealing focus. See the [command reference](docs/usage/url-scheme.en.md).
+A spoken request may refer to an existing activity, a new task or a transfer of context. I separated these operations so an activity description does not casually become a new task, and a handoff has an explicit source, recipient and confirmation step.
 
-## Screenshots
+The implementation includes intent classification, activity queries, candidate selection, new-task preparation and a handoff window.
 
-<table>
-  <tr>
-    <td width="50%"><img src="https://github.com/user-attachments/assets/ed1b714f-fbaf-41ac-92dc-546e0f0e5428" alt="Home: usage overview, activity heatmap and My Modes" /></td>
-    <td width="50%"><img src="docs/screenshots/screenshot-askit.png" alt="Ask Anything: ask about the selected text" /></td>
-  </tr>
-  <tr>
-    <td><img src="https://github.com/user-attachments/assets/3008f47a-7718-4f83-9961-7a0339568ceb" alt="History and LLM usage dashboard" /></td>
-    <td><img src="https://github.com/user-attachments/assets/63e0bd41-3d79-482f-a0e0-e48c6037dbf0" alt="Appearance settings with a live recording bar preview" /></td>
-  </tr>
-</table>
+[Intent classification](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentIntentClassifier.swift) · [Task routing](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentRouterService.swift) · [New-task service](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentNewTaskService.swift)
 
-## Tips
+### 2. Connect retrieved content to the correct conversation
 
-- **Use a cloud speech engine**: it's cheap. About 50,000 characters (5 hours) of heavy use cost the author roughly ¥5 (~$0.70), and Volcano Engine gives new users 40 free hours. Local models work, but they use a lot of memory and SenseVoice is weak on English words.
-- **Pick a small, non-reasoning LLM**: cleaning up text doesn't need reasoning. The author uses Seed-2.0-lite; models whose thinking can't be turned off (e.g. MiniMax M2.7) are much slower. If processing feels slow, open an Issue with your provider and model.
-- **Install the vocabulary Skill**: every voice input tool struggles with proper nouns. After a day or two with the [Skill](https://github.com/joewongjc/type4me-vocab-skill), your recurring mistakes are fixed for good.
+A search result needs a working destination. I combined activity matching with native session catalogs: **Qwen3-Embedding** supports semantic matching, AgentsView searches historical content, and results are mapped to Codex / Claude session identities and navigation capabilities.
 
-## Why Type4Me
+Candidate matching, original-chat mapping and an open request have separate states. If content is found but its desktop conversation cannot be located, the user receives explicit feedback.
 
-Every voice input tool I tried had at least one of these problems: expensive ($30/month), closed (no history export), rigid (no custom prompts), or slow (forced rewriting plus network latency).
+[Session catalog](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentSessionCatalog.swift) · [Index service](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentIndexService.swift) · [Embedding service](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentEmbeddingService.swift)
 
-As a former fan of the priciest one, my feeling was always: **"How can it be this good and this frustrating at the same time?"** And not everything you say needs to sound polished.
+### 3. Keep handoff and feedback tied to the same task identity
 
-## Contributing
+A handoff contains visible history from the selected source, the receiving conversation and the user's next-step instructions. MyType integrates native **Codex queue** and **Claude inbox** paths, with states for unavailable recipients, ambiguous identities and delivery failures.
 
-Issues and PRs for this fork are welcome. Upstream integrations must preserve MyType's app identity, data and credential isolation, Agent features, and existing user settings, with relevant behavior verified before merging.
+The shared Inbox carries the same application and conversation identities. It separates completion messages, waiting states and pending requests so feedback remains connected to the work. Delivery status and the Agent's task-completion feedback are presented separately.
 
-Building from source, code signing and architecture are covered in [CONTRIBUTING.md](CONTRIBUTING.md); design docs start at [docs/README.md](docs/README.md). To have an AI agent deploy from source, just give it this repository's link.
+[Native handoff](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentHandoffDeliveryService.swift) · [Source observers](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentNotificationService.swift) · [Inbox state](https://github.com/duroey/MyType/blob/main/Type4Me/Services/AgentInboxStore.swift)
 
-## Acknowledgments
+## Current results and iteration
 
-[SenseVoice](https://github.com/FunAudioLLM/SenseVoice) · [streaming-sensevoice](https://github.com/pengzhendong/streaming-sensevoice) · [asr-decoder](https://github.com/pengzhendong/asr-decoder) · [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) · [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) · [mlx-qwen3-asr](https://github.com/moona3k/mlx-qwen3-asr)
+The public code connects voice input, two Agent session catalogs, search, task routing, native handoff, new-task preparation and the Inbox into one workflow.
 
-## Star History
+This is an actively developed personal project. Its current evidence is the inspectable implementation and workflow; end-to-end behavior continues to be validated against desktop Agent versions and native interfaces.
 
-<a href="https://star-history.dera.page/#joewongjc/type4me&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&theme=dark&legend=top-left" />
-    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=joewongjc%2Ftype4me&type=date&legend=top-left" />
-  </picture>
-</a>
+Local development also explores additional Agent integrations, overlapping recording and context binding, and low-interruption multimodal, full-duplex interaction. These developments are tracked separately from the current public version.
+
+## Build from source
+
+1. Prepare **macOS 14 or later** and Xcode Command Line Tools.
+2. Follow [CONTRIBUTING.md](CONTRIBUTING.md) to build and configure MyType, including optional local ASR dependencies.
+3. Configure the speech-recognition, language-model or local-model services you intend to use.
+4. Agent history search requires the **AgentsView backend and its license**. Configure them as described in the build guide, then authorize local conversation access in settings.
+5. Keep the corresponding Codex / Claude environment available, then use the Agent entry point to resume, create or hand off work.
+
+MyType is currently provided through source builds in this repository. Upstream Type4Me packages and demos show the base product and do not include MyType's Agent extensions.
+
+<details>
+<summary><b>Retained voice-input and text-processing capabilities</b></summary>
+
+MyType retains Type4Me's input foundation, including:
+
+- Local and cloud speech recognition and provider configuration.
+- Text polishing, translation, spoken questions, custom prompts and manual input.
+- Hotwords, text replacements, history and usage management.
+- Configurable shortcuts and menu-bar controls.
+
+See [Modes & Features](docs/usage/modes.en.md) and the [URL Scheme reference](docs/usage/url-scheme.en.md).
+
+</details>
+
+## Project origins and my contribution
+
+[Type4Me](https://github.com/joewongjc/type4me) provides the speech-recognition, text-processing and original interface foundation. My work focuses on desktop Agent session search, task routing, native handoff, new tasks and feedback, developed through personal use, problem investigation and iterative implementation.
+
+MyType retains a separate application identity, data and configuration boundary. Upstream documentation and interface assets retain their attribution and do not demonstrate MyType's added Agent capabilities or product outcomes.
+
+Documentation: [Build & contribute](CONTRIBUTING.md) · [Docs index](docs/README.md) · [Development guide](AGENTS.md)
+
+Thanks to [SenseVoice](https://github.com/FunAudioLLM/SenseVoice), [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) and other foundation components. See the complete [third-party notices](Type4Me/Resources/THIRD_PARTY_LICENSES.txt).
 
 ## License
 
